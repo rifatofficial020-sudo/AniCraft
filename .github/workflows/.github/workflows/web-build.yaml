@@ -1,0 +1,86 @@
+
+name: AniCraft WebAssembly Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: anicraft-web-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-web:
+    name: Build AniCraft Web
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-bindgen
+        run: |
+          cargo install wasm-bindgen-cli \
+            --version 0.2.129 \
+            --locked
+
+      - name: Build WebAssembly
+        run: |
+          chmod +x scripts/build-web.sh
+          ./scripts/build-web.sh
+
+      - name: Verify Web Output
+        run: |
+          test -s web/index.html
+          test -s web/anicraft.js
+          test -s web/anicraft_bg.wasm
+          ls -lh web/
+
+      - name: Create ZIP
+        run: |
+          cd web
+          zip -r ../anicraft-web.zip .
+      
+      - name: Upload Web Build
+        uses: actions/upload-artifact@v4
+        with:
+          name: anicraft-web
+          path: anicraft-web.zip
+          retention-days: 30
+
+      - name: Upload Pages Artifact
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+
+  deploy:
+    name: Deploy AniCraft Web
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build-web
+    runs-on: ubuntu-latest
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
