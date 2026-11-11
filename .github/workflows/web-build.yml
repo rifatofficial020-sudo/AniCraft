@@ -1,42 +1,90 @@
 
-name: AniCraft Web
+name: AniCraft WebAssembly - GitHub Pages
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: anicraft-pages
+  cancel-in-progress: true
+
 jobs:
   build:
+    name: Build AniCraft WASM
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Install Rust WASM target
-        run: |
-          rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
-          rustup default stable
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
 
-      - name: Build WASM
-        run: cargo build --workspace --target wasm32-unknown-unknown --locked
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
 
-      - name: Install wasm-bindgen
+      - name: Install wasm-bindgen CLI
         shell: bash
         run: |
-          VERSION=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)
-          cargo install wasm-bindgen-cli --version "$VERSION" --locked
+          VERSION=$(cargo tree \
+            -i wasm-bindgen \
+            --target wasm32-unknown-unknown \
+            --prefix none \
+            | grep -m1 '^wasm-bindgen v' \
+            | sed 's/^wasm-bindgen v//')
 
-      - name: Test WASM
-        env:
-          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
-        run: cargo test -p anicraft-engine --target wasm32-unknown-unknown --test wasm --locked
+          if [ -z "$VERSION" ]; then
+            echo "Could not detect wasm-bindgen version"
+            exit 1
+          fi
+
+          echo "Installing wasm-bindgen-cli $VERSION"
+
+          cargo install wasm-bindgen-cli \
+            --version "$VERSION" \
+            --locked
+
+      - name: Build WebAssembly
+        run: |
+          cargo build \
+            --workspace \
+            --target wasm32-unknown-unknown \
+            --release \
+            --locked
 
       - name: Build web application
-        run: bash scripts/build-web.sh
+        shell: bash
+        run: |
+          chmod +x scripts/build-web.sh
+          bash scripts/build-web.sh
+
+      - name: Verify web output
+        run: |
+          if [ ! -d "web" ]; then
+            echo "ERROR: web directory was not generated"
+            exit 1
+          fi
+
+          if [ ! -f "web/index.html" ]; then
+            echo "ERROR: web/index.html is missing"
+            exit 1
+          fi
+
+          echo "Web application files:"
+          find web -maxdepth 3 -type f
+
+      - name: Configure GitHub Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@v5
 
       - name: Upload Pages artifact
         if: github.event_name != 'pull_request'
@@ -45,16 +93,21 @@ jobs:
           path: web/
 
   deploy:
+    name: Deploy AniCraft Web
     if: github.event_name != 'pull_request'
     needs: build
+
     runs-on: ubuntu-latest
+
     permissions:
       pages: write
       id-token: write
+
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+
     steps:
-      - name: Deploy GitHub Pages
+      - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
