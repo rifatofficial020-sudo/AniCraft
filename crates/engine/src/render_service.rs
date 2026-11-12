@@ -14,6 +14,7 @@
 //! keep its pictures on the GPU ([`Raster::Native`], ADR 0029): the cache then holds them, under
 //! a budget of their own, and only the shell knows what they are.
 
+use crate::editing::Front;
 use crate::history::StateId;
 use crate::onion::OnionSkin;
 use anicraft_doc::{DisplayList, Document, evaluate_scene, evaluate_scene_camera};
@@ -41,6 +42,9 @@ pub struct FrameJob {
     /// Seen through the scene's camera (View › Preview Through Camera, ADR 0027): what the
     /// movie shows, rather than the stage as edited.
     pub camera: bool,
+    /// A symbol open in place, in front of the picture (ADR 0045): onion skin composes its own
+    /// frames (ADR 0051). Set with [`FrameJob::inside`].
+    pub front: Option<Arc<Front>>,
 }
 
 impl FrameJob {
@@ -58,6 +62,81 @@ impl FrameJob {
         }
         self
     }
+
+    /// The same job for a stage picture whose top layer is the open symbol `front` (from
+    /// [`crate::editing::StagePicture::front`]): onion skin and Edit Multiple Frames then compose
+    /// the symbol's frames, not the picture's one frame. Keyed apart from the plain job.
+    pub fn inside(mut self, front: Option<Arc<Front>>) -> FrameJob {
+        if let Some(f) = front {
+            if self.onion.is_some() {
+                let mix = |k: u64| {
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    (k, "front", f.layer.0).hash(&mut h);
+                    h.finish()
+                };
+                self.key = mix(self.key);
+                self.scene = mix(self.scene);
+            }
+            self.front = Some(f);
+        }
+        self
+    }
+
+    /// What the job draws: its frame with what its onion settings add (ADR 0047), on the open
+    /// symbol's own timeline when there is one (ADR 0051).
+    pub fn display_list(&self) -> DisplayList {
+        let onion = self.onion.as_ref().filter(|o| o.shows());
+        match (&self.front, onion) {
+            (Some(front), Some(skin)) => display_list_inside(&self.doc, self.frame, front, skin),
+            _ => display_list_for(&self.doc, self.frame, self.onion.as_ref(), self.camera),
+        }
+    }
+}
+
+/// A stage picture's frame with the open symbol in front composed by `skin`: the timelines around
+/// it as they are, then the symbol's frames, each layer's onion frames under its artwork. With
+/// onion skin on (not Edit Multiple Frames), the timeline the symbol was opened from shows its
+/// own onion frames too, dimmed with it (ADR 0061).
+pub fn display_list_inside(doc: &Document, frame: u32, front: &Front, skin: &OnionSkin) -> DisplayList {
+    let (scene, local) = doc.locate(frame);
+    let tl = &front.timeline;
+    let parent = front.parent.as_ref().filter(|_| skin.ghosts && !skin.edit_multiple);
+    let mut dl = DisplayList::default();
+    // Back to front: the picture's layers from the bottom up, each its own timeline.
+    for l in doc.timeline(scene).layers.iter().rev() {
+        if l.id == front.layer {
+            dl.append(crate::onion::compose_timeline(tl, front.frame, Some(skin), |f| anicraft_doc::evaluate_timeline_at(doc, tl, f, front.at)));
+        } else if let Some(p) = parent.filter(|p| p.layer == l.id) {
+            dl.append(parent_onion(doc, p, front, skin));
+        } else {
+            dl.append(anicraft_doc::evaluate_timeline(doc, &anicraft_doc::Timeline { layers: vec![l.clone()] }, local));
+        }
+    }
+    dl
+}
+
+/// The timeline around an open symbol with its onion frames, all at its dim opacity. Markers that
+/// follow the playhead reach as many frames from the parent's frame; anchored ones (which name
+/// the symbol's frames) as far as they reach from the symbol's playhead.
+fn parent_onion(doc: &Document, p: &crate::editing::Around, front: &Front, skin: &OnionSkin) -> DisplayList {
+    let mut own = *skin;
+    if skin.anchored() {
+        let (first, last) = skin.range(front.frame, front.timeline.frame_count());
+        own.markers = crate::onion::Markers::Relative { before: front.frame.saturating_sub(first), after: last.saturating_sub(front.frame) };
+    }
+    let composed = crate::onion::compose_timeline(&p.timeline, p.frame, Some(&own), |f| anicraft_doc::evaluate_timeline_at(doc, &p.timeline, f, p.at));
+    // It fades as one, as the dimmed instance it replaces does: everything in a group at `dim`.
+    let alpha = if p.dim.is_finite() { p.dim.clamp(0.0, 1.0) } else { 1.0 };
+    let mut dl = DisplayList::default();
+    dl.groups.push(anicraft_doc::Group { parent: None, alpha, blend: Default::default(), filters: Arc::from(Vec::new()), clip: None });
+    dl.append(composed);
+    for g in dl.groups.iter_mut().skip(1) {
+        g.parent = Some(g.parent.unwrap_or(0));
+    }
+    for it in dl.items.iter_mut().filter(|i| i.masks.is_none()) {
+        it.group = Some(it.group.unwrap_or(0));
+    }
+    dl
 }
 
 /// A finished image: premultiplied RGBA8, ready for a texture upload, or (`native`) an image
@@ -128,7 +207,7 @@ pub fn frame_key(state: StateId, frame: u32, view: &View, onion: Option<&OnionSk
 /// A job whose `scene` is derived from the same inputs as its key.
 pub fn make_job(state: StateId, doc: &Document, frame: u32, view: View, onion: Option<&OnionSkin>) -> FrameJob {
     let onion = onion.filter(|o| o.shows()).copied();
-    FrameJob { key: frame_key(state, frame, &view, onion.as_ref()), raster: 0, scene: scene_key(state, frame, onion.as_ref()), doc: doc.clone(), frame, view, onion, camera: false }
+    FrameJob { key: frame_key(state, frame, &view, onion.as_ref()), raster: 0, scene: scene_key(state, frame, onion.as_ref()), doc: doc.clone(), frame, view, onion, camera: false, front: None }
 }
 
 /// A job for rasterizer `raster` (from [`RenderService::raster_id`]; 0 is the CPU oracle, and
@@ -192,7 +271,7 @@ fn render_job_by(job: &FrameJob, dl: &DisplayList, raster: Option<&Rasterizer>) 
 
 /// Renders a job synchronously, evaluating its scene.
 pub fn render_job(job: &FrameJob) -> FrameImage {
-    render_job_with(job, &display_list_for(&job.doc, job.frame, job.onion.as_ref(), job.camera))
+    render_job_with(job, &job.display_list())
 }
 
 /// Renders a batch: one scene evaluation per distinct `scene`, then all images in parallel.
@@ -204,7 +283,7 @@ pub fn render_batch(jobs: &[FrameJob]) -> Vec<FrameImage> {
 fn render_batch_by(jobs: &[FrameJob], slot: &RasterSlot) -> Vec<FrameImage> {
     let mut scenes: HashMap<u64, Arc<DisplayList>> = HashMap::new();
     for j in jobs {
-        scenes.entry(j.scene).or_insert_with(|| Arc::new(display_list_for(&j.doc, j.frame, j.onion.as_ref(), j.camera)));
+        scenes.entry(j.scene).or_insert_with(|| Arc::new(j.display_list()));
     }
     jobs.par_iter()
         .map(|j| {
@@ -212,7 +291,7 @@ fn render_batch_by(jobs: &[FrameJob], slot: &RasterSlot) -> Vec<FrameImage> {
             let raster = slot.raster.as_ref().filter(|_| j.raster != 0 && j.raster == slot.id);
             match scenes.get(&j.scene) {
                 Some(dl) => render_job_by(j, dl, raster),
-                None => render_job_by(j, &display_list_for(&j.doc, j.frame, j.onion.as_ref(), j.camera), raster),
+                None => render_job_by(j, &j.display_list(), raster),
             }
         })
         .collect()

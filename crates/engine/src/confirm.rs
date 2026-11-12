@@ -98,7 +98,37 @@ pub fn confirmation(s: &Session, id: &str, p: &Value) -> Option<Confirmation> {
                 irreversible: true,
             })
         }
-        "file.new" | "file.new_sample" | "file.open" | "file.recover" if s.is_dirty() => Some(Confirmation {
+        "file.save_as_template" => {
+            let path = crate::cmds_template::target(p).ok()?;
+            crate::vfs::exists(&path).then(|| overwrite(&path, "Saving the template"))
+        }
+        "file.delete_template" => {
+            let path = crate::cmds_template::target(p).ok()?;
+            let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            Some(Confirmation {
+                title: "Delete template?".into(),
+                message: format!("The template “{name}” and its picture will be deleted from your templates. This cannot be undone."),
+                action: "Delete Template".into(),
+                irreversible: true,
+            })
+        }
+        // Brushes of your own live in your preferences, outside undo (ADR 0068).
+        "brush.preset_delete" => {
+            let name = p.get("name").and_then(Value::as_str)?;
+            let i = s.brushes.position(name)?;
+            let name = s.brushes.user().get(i)?.name.clone();
+            Some(Confirmation {
+                title: "Delete brush?".into(),
+                message: format!("The brush “{name}” will be deleted from your brushes. This cannot be undone."),
+                action: "Delete Brush".into(),
+                irreversible: true,
+            })
+        }
+        "brush.preset_export" => {
+            let path = Path::new(p.get("path").and_then(Value::as_str)?);
+            crate::vfs::exists(path).then(|| overwrite(path, "Exporting the brushes"))
+        }
+        "file.new" | "file.new_sample" | "file.new_from_template" | "file.open" | "file.open_recent" | "file.recover" if s.is_dirty() => Some(Confirmation {
             title: "Discard unsaved changes?".into(),
             message: format!("“{}” has changes that are not saved. They will be lost, and its undo history is cleared.", doc_name(s)),
             action: "Discard Changes".into(),
@@ -109,9 +139,27 @@ pub fn confirmation(s: &Session, id: &str, p: &Value) -> Option<Confirmation> {
             let same = s.path.as_deref() == Some(path);
             (!same && crate::vfs::exists(path)).then(|| overwrite(path, "Saving"))
         }
-        "file.export_png" | "file.export_gif" | "file.export_svg" | "file.export_video" | "file.export_lottie" | "file.export_html" | "file.export_audio" => {
+        "file.export_png" | "file.export_gif" | "file.export_apng" | "file.export_webp" | "file.export_svg" | "file.export_video" | "file.export_lottie" | "file.export_html" | "file.export_audio" => {
             let path = Path::new(p.get("path").and_then(Value::as_str)?);
             crate::vfs::exists(path).then(|| overwrite(path, "Exporting"))
+        }
+        "file.publish" => {
+            // Publishing replaces what is already there; what this session published itself
+            // it replaces without asking again (ADR 0060).
+            let found = crate::publish::existing(s, &crate::publish::planned(s, p)?);
+            let names: Vec<String> = found.iter().take(3).map(|f| f.display().to_string()).collect();
+            let more = found.len().saturating_sub(names.len());
+            (!found.is_empty()).then(|| Confirmation {
+                title: if found.len() == 1 { "Replace published file?".into() } else { "Replace published files?".into() },
+                message: format!(
+                    "Publishing replaces {} already there: {}{}. This cannot be undone.",
+                    if found.len() == 1 { "a file".to_string() } else { plural(found.len(), "file") },
+                    names.join(", "),
+                    if more > 0 { format!(" and {more} more") } else { String::new() }
+                ),
+                action: "Publish".into(),
+                irreversible: true,
+            })
         }
         "file.export_sprite_sheet" => {
             // The sheet and its frame map: either one already there is replaced.
@@ -141,6 +189,63 @@ pub fn confirmation(s: &Session, id: &str, p: &Value) -> Option<Confirmation> {
                 title: "Delete sound?".into(),
                 message: format!("“{}” plays on {}. It comes off them and out of the library. You can undo this.", snd.name, plural(used, "keyframe")),
                 action: "Delete Sound".into(),
+                irreversible: false,
+            })
+        }
+        "find.replace" => {
+            // Replace All over many places asks first (ADR 0058); one undo step takes it back.
+            let n = crate::find::replace_count(s, p)?;
+            (n > crate::find::REPLACE_ASK).then(|| Confirmation {
+                title: "Replace all?".into(),
+                message: format!("This replaces what was found in {}. You can undo this in one step.", plural(n, "place")),
+                action: "Replace All".into(),
+                irreversible: false,
+            })
+        }
+        "library.delete" => {
+            // Routine when nothing deleted is in use and no folder holds anything (undo is there);
+            // asks when instances go with it or a folder takes its contents (ADR 0050).
+            let list = crate::cmds_library::entries_of(s, p, "items").ok()?;
+            let (items, folders) = crate::cmds_library::deletion(s, &list);
+            let uses = s.doc.library_uses();
+            let used: Vec<&anicraft_doc::LibraryItem> = items.iter().filter(|i| uses.get(i).is_some_and(|n| *n > 0)).collect();
+            let n_uses: usize = used.iter().filter_map(|i| uses.get(*i)).sum();
+            let inside = items.len() + folders.len() - list.len();
+            if used.is_empty() && inside == 0 {
+                return None;
+            }
+            let what = match list.as_slice() {
+                [one] => format!("“{}”", s.doc.entry_name(*one).unwrap_or("")),
+                _ => plural(list.len(), "item"),
+            };
+            let mut parts = Vec::new();
+            if inside > 0 {
+                parts.push(format!("{what} {} {}, deleted with {}.", if list.len() == 1 { "holds" } else { "hold" }, plural(inside, "item"), if list.len() == 1 { "it" } else { "them" }));
+            }
+            if !used.is_empty() {
+                parts.push(format!("{} used {} in the movie; {} go too.", if used.len() == 1 { "One of them is".to_string() } else { format!("{} of them are", used.len()) }, plural(n_uses, "time"), if n_uses == 1 { "that use" } else { "those uses" }));
+            }
+            parts.push("You can undo this.".into());
+            Some(Confirmation {
+                title: if inside > 0 && list.len() == 1 { "Delete folder?".into() } else { "Delete from Library?".into() },
+                message: parts.join(" "),
+                action: "Delete".into(),
+                irreversible: false,
+            })
+        }
+        "library.delete_unused" => {
+            let unused = s.doc.unused_items();
+            let names: Vec<String> = unused.iter().take(5).filter_map(|i| s.doc.item_name(*i)).map(|n| format!("“{n}”")).collect();
+            let more = unused.len().saturating_sub(names.len());
+            (!unused.is_empty()).then(|| Confirmation {
+                title: "Delete unused items?".into(),
+                message: format!(
+                    "Nothing in the movie uses {}: {}{}. They leave the Library. You can undo this.",
+                    if unused.len() == 1 { "this item".to_string() } else { format!("these {} items", unused.len()) },
+                    names.join(", "),
+                    if more > 0 { format!(" and {more} more") } else { String::new() }
+                ),
+                action: "Delete Unused".into(),
                 irreversible: false,
             })
         }

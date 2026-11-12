@@ -201,7 +201,7 @@ impl Entry {
 
 /// Commands the palette can run without extra input (everything optional, or prompted).
 fn runnable(c: &CommandSpec) -> bool {
-    if matches!(c.id, "file.open" | "file.recovery_list" | "file.save_as" | "file.import" | "file.export_png" | "file.export_gif" | "file.export_svg" | "file.export_sprite_sheet" | "file.export_video" | "file.export_lottie" | "file.export_html" | "file.export_png_sequence" | "modify.convert_to_symbol" | "layer.rename" | "scene.rename" | "plugin.install") {
+    if matches!(c.id, "file.open" | "file.recovery_list" | "file.save_as" | "file.import" | "file.export_png" | "file.export_gif" | "file.export_apng" | "file.export_webp" | "file.export_svg" | "file.export_sprite_sheet" | "file.export_video" | "file.export_lottie" | "file.export_html" | "file.export_png_sequence" | "modify.convert_to_symbol" | "layer.rename" | "scene.rename" | "plugin.install") {
         return true;
     }
     let inner = c.params.trim().trim_start_matches('{').trim_end_matches('}');
@@ -217,6 +217,7 @@ fn entries() -> Vec<Entry> {
     v.push(Entry::View(tr_noop!("Preview Through Camera"), "", App::toggle_camera_preview));
     v.push(Entry::View(tr_noop!("Fit Stage in Window"), "Ctrl+0", |a| a.view.fit = true));
     v.push(Entry::View(tr_noop!("Keyboard Shortcuts"), "F1", |a| a.show_shortcuts = true));
+    v.push(Entry::View(tr_noop!("User Guide"), "", App::open_user_guide));
     v.push(Entry::View(tr_noop!("Project Files & Docs"), "", |a| a.show_files = true));
     v.push(Entry::View(tr_noop!("Licenses & Notices"), "", |a| a.show_licenses = true));
     v.push(Entry::View(tr_noop!("Preferences"), "Ctrl+U", App::open_prefs));
@@ -417,10 +418,27 @@ fn preferences(app: &mut App, ctx: &egui::Context) {
                     ui.add_space(4.0);
                     form_row(ui, LW, tr!("Theme"), |ui| {
                         ui.vertical(|ui| {
+                            // Follow system (ADR 0064), then each palette by hand.
+                            let was = if p.follows_system() { None } else { Some(p.theme) };
+                            let mut choice = was;
+                            crate::theme::radio_value(ui, &mut choice, None, text(Type::Body, tr!("Follow system")));
+                            let says = match app.system_contrast {
+                                Some(true) => tr!("High contrast while the system asks for more contrast (it does now), graphite otherwise."),
+                                Some(false) => tr!("High contrast while the system asks for more contrast (it doesn't now), graphite otherwise."),
+                                None => tr!("High contrast while the system asks for more contrast, graphite otherwise. This system doesn't say, so it is graphite."),
+                            };
+                            form_note(ui, toggle_indent, text(Type::Caption, says));
+                            ui.add_space(2.0);
                             for (palette, name, tip) in crate::theme::Palette::ALL {
-                                crate::theme::radio_value(ui, &mut p.theme, palette, text(Type::Body, crate::i18n::t(name)));
+                                crate::theme::radio_value(ui, &mut choice, Some(palette), text(Type::Body, crate::i18n::t(name)));
                                 form_note(ui, toggle_indent, text(Type::Caption, crate::i18n::t(tip)));
                                 ui.add_space(2.0);
+                            }
+                            if choice != was {
+                                p.theme_follows_system = Some(choice.is_none());
+                                if let Some(t) = choice {
+                                    p.theme = t;
+                                }
                             }
                         });
                     });
@@ -502,6 +520,23 @@ fn preferences(app: &mut App, ctx: &egui::Context) {
                         });
                     });
                     form_note(ui, LW, text(Type::Caption, tr!("The timeline always leaves room before frame 1 for the playhead; this adds more. It stays the same at every zoom.")));
+                });
+
+                // Test Movie in a window of its own, or inside the editor (ADR 0062).
+                section(ui, "prefs_test_movie", Section::Rule, tr!("Test Movie"), None, |ui| {
+                    form_row(ui, LW, tr!("Window"), |ui| {
+                        ui.vertical(|ui| {
+                            crate::theme::checkbox(ui, &mut p.test_movie_window, text(Type::Body, tr!("Play Test Movie in a window of its own")));
+                            let note = match crate::platform::movie_host(ui.ctx().embed_viewports(), true) {
+                                crate::platform::MovieHost::Inside(why) => why.note().map(crate::i18n::t),
+                                crate::platform::MovieHost::Window if !crate::platform::window_positions() => Some(tr!("Off: it floats inside the editor. On Wayland the desktop places the window, so it can't open where it was last.")),
+                                crate::platform::MovieHost::Window => Some(tr!("Off: it floats inside the editor. The window opens where it was last.")),
+                            };
+                            if let Some(note) = note {
+                                form_note(ui, toggle_indent, text(Type::Caption, note));
+                            }
+                        });
+                    });
                 });
 
                 section(ui, "prefs_files", Section::Rule, tr!("Files"), None, |ui| {
@@ -652,7 +687,7 @@ enum SheetAct {
 
 /// Fixed keys: handled before the shortcut map, shown read-only. Groups and names are English
 /// keys (groups match [`GROUP_ORDER`]), translated where they are drawn.
-fn fixed_rows() -> Vec<(&'static str, &'static str, Vec<&'static str>)> {
+pub(crate) fn fixed_rows() -> Vec<(&'static str, &'static str, Vec<&'static str>)> {
     let quit = if crate::platform::OS == crate::platform::Os::Mac { tr_noop!("Quit") } else { tr_noop!("Exit") };
     let (essentials, view, editing) = (tr_noop!("Essentials"), tr_noop!("View"), tr_noop!("Editing"));
     // Keys in registry notation; the words among them are translated by `fixed_key`.
@@ -692,7 +727,7 @@ fn fixed_key(k: &str) -> String {
 }
 
 /// Section order, by group key (English; the titles are translated where they are drawn).
-const GROUP_ORDER: [&str; 13] = [
+pub(crate) const GROUP_ORDER: [&str; 13] = [
     tr_noop!("Essentials"),
     tr_noop!("Tools"),
     tr_noop!("File"),

@@ -97,6 +97,24 @@ flushed to disk, renamed).
 With the default "every minute or 25 changes", even the 262 MB document keeps the worker busy
 for about 1% of the time, and the UI never waits for it.
 
+**Opening a 50 MB `.fla` (2026-11-11, ADR 0054; release, 32 threads, one used).** A generated
+archive (`measure_importing_a_50_mb_fla` in `crates/xfl/tests/fla.rs`: 400 symbols of 600
+edges each, deflated, and 24 noisy 1024 × 512 PNGs, stored; 54.6 MB, 425 files, 65.8 MB
+inflated), five runs each:
+
+```sh
+cargo test --release -p anicraft-xfl --test fla -- --ignored --nocapture
+```
+
+| Step | CRC-32 byte by byte | CRC-32 by slicing by 8 |
+|---|---|---|
+| Open (end record, central directory, every local header, overlap check) | 0.19–0.25 ms | 0.18–0.24 ms |
+| Read and check every entry (inflate, size, CRC) | 128–140 ms (471–516 MB/s) | 53–54 ms (1.22–1.24 GB/s) |
+| Whole import (read, XML, edges, library, timeline) | 388–458 ms | **311–328 ms** |
+
+The checks on every entry (exact size, checksum) now cost about 30 ms of the import; the rest
+is parsing and building the document.
+
 ### GPU stage (M3, ADR 0019)
 
 `cargo run --release -p anicraft-gpu --example gpu_bench` (2026-11-09, RTX 5090 over Vulkan,
@@ -211,6 +229,24 @@ frames 12, 30 and 48) with hairlines: onion ±5 outlines **17.1 ms** against 14.
 * The limits live in `TIME_BUDGETS` in `crates/cli/src/lib.rs`; keep that list and this
   table in step. The GPU stage's are `BUDGETS` in `crates/gpu/examples/gpu_bench.rs`
   (`--check`; the CLI has no GPU).
+
+## Animated PNG and WebP (2026-11-11, ADR 0063)
+
+The sample, all 48 frames, release build, Windows 10, 32 threads
+(`cargo test --release -p anicraft-engine anim::tests::sizes -- --ignored --nocapture`).
+Times include rendering every frame.
+
+| Export | 1280 × 720 | Time | 640 × 360 | Time |
+|---|---|---|---|---|
+| Animated GIF (256 colours, 1-bit alpha) | 1464 KB | 421 ms | 660 KB | 110 ms |
+| Animated PNG | 2019 KB | 183 ms | 741 KB | 52 ms |
+| Animated WebP, lossless | 1829 KB | 130 ms | 666 KB | 36 ms |
+
+The sample moves something in every frame, so all 48 frames are stored. Its sky is a full-stage
+shape, so the transparent and stage-colour exports come out the same size. Compressing each
+APNG frame at the `png` crate's best level instead of its default brought the file from 3387 KB
+to 2019 KB for 25 % more time. The frames compress in parallel, which is why both formats are
+faster than GIF, whose LZW coding runs on one thread.
 
 ## Sound (2026-11-09, ADR 0020)
 

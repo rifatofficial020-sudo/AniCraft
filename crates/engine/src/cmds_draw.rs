@@ -2,7 +2,7 @@
 
 use crate::params::*;
 use crate::{CommandSpec, EngineError, Result, Selection, Session};
-use anicraft_doc::{ColorEffect, Element, ElementId, ElementKind, Layer, LayerId, LoopMode, Paint, Shape, Stroke, Symbol, SymbolId, SymbolKind, Timeline};
+use anicraft_doc::{ColorEffect, ColorStyle, Element, ElementId, ElementKind, Layer, LayerId, LibraryEntry, LibraryItem, LoopMode, Paint, ScaleGrid, Shape, Stroke, Symbol, SymbolId, SymbolKind, Timeline};
 use anicraft_geom::{Affine, Decomposed, Path, Vec2};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -23,25 +23,35 @@ pub fn specs() -> Vec<CommandSpec> {
         }),
         c("edit.delete", "Clear", "Edit", Some("Delete"), "{} (on every layer with selected items)", true, delete_selection),
         c("edit.duplicate", "Duplicate", "Edit", Some("Ctrl+D"), "{dx?, dy?} (each copy on its original's layer)", true, |s, p| s.each_layer(true, |s| duplicate(s, p))),
-        c("element.select", "Select Elements", "", None, "{ids: [..], add?: bool, layer?} selects elements on any visible, unlocked layer at the playhead (ids are unique; `layer` looks only there); the active layer becomes the first one's unless it has some of them", false, select),
+        c("element.select", "Select Elements", "", None, "{ids: [..], add?: bool, toggle?: bool, layer?} selects elements on any visible, unlocked layer at the playhead (ids are unique; `layer` looks only there); `toggle` takes each one that is selected out of the selection and adds the others (Shift+Space on a stage element); the active layer becomes the first one's unless it has some of them", false, select),
         c("element.pick", "Select at Point", "", None, "{x, y, add?: bool} the topmost element there on a visible, unlocked layer; `add` (Shift) adds it to the selection, or lets go of it, on any layer", false, pick),
         c("element.translate", "Move", "", None, "{dx, dy, snap?, from?: [x, y]} moves the selection, on every layer; with `snap` (a distance) one of its corners or ends (the nearest to `from`) then snaps onto a point, line or fill edge of the rest within that distance", true, translate),
         c("element.set_transform", "Transform", "", None, "{x?, y?, sx?, sy?, rotation? (degrees)}", true, |s, p| s.each_layer(true, |s| set_transform(s, p))),
         c("element.set_fill", "Fill Colour", "", None, "{color: \"#rrggbb\" | null}", true, |s, p| s.each_layer(false, |s| set_fill(s, p))),
         c("element.set_stroke", "Stroke", "", None, "{color?: \"#rrggbb\" | null, width?, profile?: uniform|taper_both|taper_start|taper_end|bulge|pinch | [[t, left, right], ..], cap?, join?, miter?, style?, dash?, dash_offset?, dot_spacing? (as stroke.set_style)}", true, |s, p| s.each_layer(false, |s| set_stroke(s, p))),
-        c("element.set_alpha", "Alpha", "", None, "{alpha: 0..1}", true, |s, p| s.each_layer(true, |s| set_alpha(s, p))),
+        c("element.set_alpha", "Alpha", "", None, "{alpha: 0..1} sets the alpha multiplier and keeps the rest of the colour effect (None becomes Alpha; Brightness and Tint become Advanced below 1)", true, |s, p| s.each_layer(true, |s| set_alpha(s, p))),
+        c("element.set_color_effect", "Colour Effect", "", None, "{style?: none|brightness|tint|advanced|alpha (default: the style the values belong to, else each element's own), alpha? (%, 0..100), brightness? (%, -100..100), tint? (#rrggbb), tint_amount? (%, 0..100), red_multiplier?, green_multiplier?, blue_multiplier?, alpha_multiplier? (%, -100..100), red_offset?, green_offset?, blue_offset?, alpha_offset? (-255..255)} on every selected element (ADR 0056); values not given keep each element's own. A new style starts from the look it can keep: Advanced is exactly the effect before, Alpha keeps the opacity, Brightness and Tint start at 0 %. The camera's effect is a tint", true, |s, p| s.each_layer(true, |s| set_color_effect(s, p))),
         c("element.set_blend", "Blending", "", None, "{mode: normal|layer|darken|multiply|lighten|screen|overlay|hardlight|add|subtract|difference|invert|alpha|erase} on the selected movie clip and button instances", true, |s, p| s.each_layer(false, |s| set_blend(s, p))),
         c("element.set_filters", "Filters", "", None, "{filters: [{type: blur|drop_shadow|glow|bevel|gradient_glow|gradient_bevel|adjust_color, …values}]} replaces the selected movie clip and button instances' filters (in order; [] removes them). Bevel: shadow_color, highlight_color, side: inner|outer|full, knockout; gradient filters: stops: [{offset 0..1, color \"#rrggbbaa\"}] (Gradient Glow's start and Gradient Bevel's middle stay transparent)", true, |s, p| s.each_layer(false, |s| set_filters(s, p))),
         c("element.set_loop", "Looping", "", None, "{loop?: loop|play_once|single_frame, first_frame?}", true, |s, p| s.each_layer(false, |s| set_loop(s, p))),
-        c("symbol.set_kind", "Symbol Type", "", None, "{kind: graphic|movie_clip|button, symbol?: id (default: the selected instance's)}", true, set_symbol_kind),
+        c("symbol.set_kind", "Symbol Type", "", None, "{kind: graphic|movie_clip|button, symbol?: id (default: the symbols of every selected instance)}", true, set_symbol_kind),
+        c(
+            "symbol.set_scale_grid",
+            "9-Slice Scaling",
+            "",
+            None,
+            "{symbol?: id (default: the symbol open for editing, else the selected instance's), on?: bool, left?, right?, top?, bottom? (guide positions in the symbol's space)} turns a symbol's guides for 9-slice scaling on or off, or moves them (ADR 0055). Turning them on brings back the guides it had when they were turned off (ADR 0057), else puts them a quarter of the way in from each edge of the symbol's artwork; moving one turns them on. Scaled instances then keep the corners outside the guides unscaled, stretch the edges one way and the centre both ways → {symbol, scale_grid: {left, right, top, bottom} | null}",
+            true,
+            set_scale_grid,
+        ),
         c("element.rename", "Instance Name", "", None, "{name}", true, |s, p| s.each_layer(true, |s| rename(s, p))),
         c("arrange.bring_to_front", "Bring to Front", "Modify/Arrange", Some("Ctrl+Shift+Up"), "{} (within each layer)", true, |s, _| s.each_layer(true, |s| arrange(s, true))),
         c("arrange.bring_forward", "Bring Forward", "Modify/Arrange", Some("Ctrl+Up"), "{} (within each layer)", true, |s, _| s.each_layer(true, |s| arrange_step(s, true))),
         c("arrange.send_backward", "Send Backward", "Modify/Arrange", Some("Ctrl+Down"), "{} (within each layer)", true, |s, _| s.each_layer(true, |s| arrange_step(s, false))),
         c("arrange.send_to_back", "Send to Back", "Modify/Arrange", Some("Ctrl+Shift+Down"), "{} (within each layer)", true, |s, _| s.each_layer(true, |s| arrange(s, false))),
-        c("modify.convert_to_symbol", "Convert to Symbol…", "Modify", Some("F8"), "{name?} (a selection on several layers becomes one symbol with those layers inside; the instance lands on the topmost)", true, convert_to_symbol),
+        c("modify.convert_to_symbol", "Convert to Symbol…", "Modify", Some("F8"), "{name? (default: the next free “Symbol n”; a name the folder holds gets a number), kind?: graphic|movie_clip|button (default: graphic), folder?: Library folder id (default: the top level)} → {symbol, instance, name, layer, folder} (a selection on several layers becomes one symbol with those layers inside; the instance lands on the topmost)", true, convert_to_symbol),
         c("modify.break_apart", "Break Apart", "Modify", Some("Ctrl+B"), "{}", true, |s, p| s.each_layer(false, |s| break_apart(s, p))),
-        c("library.place", "Place Instance", "", None, "{symbol | bitmap, x?, y?}", true, place),
+        c("library.place", "Place on Stage", "", None, "{symbol | bitmap | sound: id, x?, y?} or {items: [{symbol | bitmap | sound: id}, ..], x?, y?} → {element, elements, sound?}: symbols and bitmaps centred on x, y (default: the stage centre; inside an open symbol, in its space) in the active layer's keyframe at the playhead, selected; a sound goes onto that keyframe, its span grown to fit (one sound per keyframe). One undo step", true, place),
     ]
 }
 
@@ -200,6 +210,7 @@ fn select(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::Param(format!("param 'ids' has more than {MAX_SELECT} ids")));
     }
     let add = opt_bool(p, "add")?.unwrap_or(false);
+    let toggle = opt_bool(p, "toggle")?.unwrap_or(false);
     // Where each element is at the playhead: on `layer`, else the active layer first, then the
     // others top to bottom.
     let order: Vec<LayerId> = match opt_u64(p, "layer")?.map(LayerId) {
@@ -224,11 +235,17 @@ fn select(s: &mut Session, p: &Value) -> Result<Value> {
         }
         picked.push((l, id));
     }
-    if !add {
-        s.selection.clear();
-    }
-    for &(l, id) in &picked {
-        s.selection.insert(l, id);
+    if toggle {
+        for &(l, id) in &picked {
+            s.selection.toggle(l, id);
+        }
+    } else {
+        if !add {
+            s.selection.clear();
+        }
+        for &(l, id) in &picked {
+            s.selection.insert(l, id);
+        }
     }
     // As a click does: the active layer is where the artwork is.
     if let Some(&(l, _)) = picked.first()
@@ -401,9 +418,84 @@ fn set_alpha(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::Param("param 'alpha' must be between 0 and 1".into()));
     }
     for e in s.selected_elements_mut()? {
-        e.color.alpha = a;
+        e.color = e.color.with_alpha(a);
     }
     Ok(json!({"alpha": a}))
+}
+
+/// Each colour effect value `element.set_color_effect` takes: its key, style, range and scale
+/// (the model's value is the param's divided by it).
+const EFFECT_VALUES: [(&str, ColorStyle, f32, f32, f32); 11] = [
+    ("alpha", ColorStyle::Alpha, 0.0, 100.0, 100.0),
+    ("brightness", ColorStyle::Brightness, -100.0, 100.0, 100.0),
+    ("tint_amount", ColorStyle::Tint, 0.0, 100.0, 100.0),
+    ("red_multiplier", ColorStyle::Advanced, -100.0, 100.0, 100.0),
+    ("green_multiplier", ColorStyle::Advanced, -100.0, 100.0, 100.0),
+    ("blue_multiplier", ColorStyle::Advanced, -100.0, 100.0, 100.0),
+    ("alpha_multiplier", ColorStyle::Advanced, -100.0, 100.0, 100.0),
+    ("red_offset", ColorStyle::Advanced, -255.0, 255.0, 255.0),
+    ("green_offset", ColorStyle::Advanced, -255.0, 255.0, 255.0),
+    ("blue_offset", ColorStyle::Advanced, -255.0, 255.0, 255.0),
+    ("alpha_offset", ColorStyle::Advanced, -255.0, 255.0, 255.0),
+];
+
+fn set_color_effect(s: &mut Session, p: &Value) -> Result<Value> {
+    let style = match opt_str(p, "style")? {
+        Some(k) => Some(ColorStyle::from_key(k).ok_or_else(|| EngineError::Param(format!("unknown style '{k}' (none, brightness, tint, advanced or alpha)")))?),
+        None => None,
+    };
+    let tint = opt_color(p, "tint")?;
+    let mut values: Vec<(usize, f32)> = Vec::new();
+    let mut families: Vec<ColorStyle> = tint.map(|_| ColorStyle::Tint).into_iter().collect();
+    for (i, (key, fam, lo, hi, scale)) in EFFECT_VALUES.iter().enumerate() {
+        if let Some(v) = opt_f32(p, key)? {
+            if !(*lo..=*hi).contains(&v) {
+                return Err(EngineError::Param(format!("param '{key}' must be between {lo} and {hi}")));
+            }
+            values.push((i, v / scale));
+            if !families.contains(fam) {
+                families.push(*fam);
+            }
+        }
+    }
+    let style = match (style, families.as_slice()) {
+        (Some(st), f) if f.iter().any(|x| *x != st) => return Err(EngineError::Param(format!("the {} style has none of these values: give only its own", st.key()))),
+        (Some(st), _) => Some(st),
+        (None, []) => return Err(EngineError::Param("give a style, or a value to set".into())),
+        (None, [one]) => Some(*one),
+        (None, _) => return Err(EngineError::Param("these values belong to different styles: give one style's values".into())),
+    };
+    let mut first = None;
+    for e in s.selected_elements_mut()? {
+        let target = style.unwrap_or(e.color.style());
+        if matches!(e.kind, ElementKind::Camera) && !matches!(target, ColorStyle::Tint | ColorStyle::None) {
+            return Err(EngineError::State("the camera's colour effect is a tint".into()));
+        }
+        let mut fx = e.color.to_style(target);
+        if let ColorEffect::Tint { color, .. } = &mut fx
+            && let Some(t) = tint
+        {
+            *color = t.with_alpha(1.0);
+        }
+        for &(i, v) in &values {
+            match &mut fx {
+                ColorEffect::Alpha(a) if i == 0 => *a = v,
+                ColorEffect::Brightness(b) if i == 1 => *b = v,
+                ColorEffect::Tint { amount, .. } if i == 2 => *amount = v,
+                ColorEffect::Advanced(t) => {
+                    if let Some(m) = i.checked_sub(3).and_then(|j| t.mul.get_mut(j)) {
+                        *m = v;
+                    } else if let Some(o) = i.checked_sub(7).and_then(|j| t.add.get_mut(j)) {
+                        *o = v;
+                    }
+                }
+                _ => {}
+            }
+        }
+        e.color = fx.sanitized();
+        first.get_or_insert(e.color);
+    }
+    Ok(first.map_or(Value::Null, |fx| crate::color_effect_json(&fx)))
 }
 
 /// Most filters on one instance.
@@ -526,13 +618,38 @@ fn set_loop(s: &mut Session, p: &Value) -> Result<Value> {
 /// A symbol's kind, for every instance of it: a graphic keeps step with the timeline it is
 /// placed on, a movie clip plays its own timeline on a loop, a button shows its Up frame.
 fn set_symbol_kind(s: &mut Session, p: &Value) -> Result<Value> {
-    let kind = match str_req(p, "kind")? {
-        "graphic" => SymbolKind::Graphic,
-        "movie_clip" | "movie clip" => SymbolKind::MovieClip,
-        "button" => SymbolKind::Button,
-        other => return Err(EngineError::Param(format!("unknown symbol kind '{other}' (graphic, movie_clip or button)"))),
+    let kind = crate::cmds_library::kind_of(str_req(p, "kind")?)?;
+    let ids: Vec<SymbolId> = match opt_u64(p, "symbol")? {
+        Some(id) => vec![SymbolId(id)],
+        None => {
+            // The symbols of the selected instances, on every layer (ADR 0053: a "mixed" Type
+            // row sets them all), in selection order.
+            let mut ids = Vec::new();
+            for (layer, sel) in s.selection.iter() {
+                if let Some(ElementKind::Symbol { symbol, .. }) = s.elements_on(layer).iter().find(|e| e.id == sel).map(|e| &e.kind)
+                    && !ids.contains(symbol)
+                {
+                    ids.push(*symbol);
+                }
+            }
+            if ids.is_empty() {
+                return Err(EngineError::State(if s.selection.is_empty() { "select a symbol instance, or pass 'symbol'".into() } else { "the selection is not a symbol instance".into() }));
+            }
+            ids
+        }
     };
-    let id = match opt_u64(p, "symbol")? {
+    for id in &ids {
+        let sym = s.doc.library.iter_mut().find(|x| x.id == *id).ok_or_else(|| EngineError::State(format!("no symbol with id {}", id.0)))?;
+        if sym.kind != kind {
+            std::sync::Arc::make_mut(sym).kind = kind;
+        }
+    }
+    Ok(json!({"symbol": ids.first().map(|i| i.0), "symbols": ids.iter().map(|i| i.0).collect::<Vec<_>>(), "kind": format!("{kind:?}")}))
+}
+
+/// The symbol a command means: `symbol`, else the selected instance's.
+fn selected_symbol(s: &Session, p: &Value) -> Result<SymbolId> {
+    Ok(match opt_u64(p, "symbol")? {
         Some(id) => SymbolId(id),
         None => {
             // The symbol of the selected instance.
@@ -546,10 +663,48 @@ fn set_symbol_kind(s: &mut Session, p: &Value) -> Result<Value> {
                 })
                 .ok_or_else(|| EngineError::State("the selection is not a symbol instance".into()))?
         }
+    })
+}
+
+/// 9-slice guides (ADR 0055): on, off or moved, on one symbol.
+fn set_scale_grid(s: &mut Session, p: &Value) -> Result<Value> {
+    let on = opt_bool(p, "on")?;
+    let edges = [opt_f32(p, "left")?, opt_f32(p, "right")?, opt_f32(p, "top")?, opt_f32(p, "bottom")?];
+    if on.is_none() && edges.iter().all(Option::is_none) {
+        return Err(EngineError::Param("pass 'on', or a guide to move: 'left', 'right', 'top' or 'bottom'".into()));
+    }
+    // The open symbol is the one being edited; otherwise the selected instance's.
+    let id = match (opt_u64(p, "symbol")?, s.editing_symbol()) {
+        (None, Some(open)) => open,
+        _ => selected_symbol(s, p)?,
     };
-    let sym = s.doc.library.iter_mut().find(|x| x.id == id).ok_or_else(|| EngineError::State(format!("no symbol with id {}", id.0)))?;
-    std::sync::Arc::make_mut(sym).kind = kind;
-    Ok(json!({"symbol": id.0, "kind": format!("{kind:?}")}))
+    let sym = s.doc.symbol(id).ok_or_else(|| EngineError::State(format!("no symbol with id {}", id.0)))?;
+    let grid = if on == Some(false) {
+        if edges.iter().any(Option::is_some) {
+            return Err(EngineError::Param("guides can't be moved while turning them off".into()));
+        }
+        None
+    } else {
+        // Switched on again, the guides come back where they were (ADR 0057).
+        let start = sym.scale_grid.or(sym.scale_grid_kept).unwrap_or_else(|| {
+            let b = anicraft_doc::symbol_box(&s.doc, sym);
+            ScaleGrid::inset(&if b.is_empty() { anicraft_geom::Rect::new(0.0, 0.0, 100.0, 100.0) } else { b })
+        });
+        let [l, r, t, b] = edges;
+        let g = ScaleGrid { left: l.unwrap_or(start.left), right: r.unwrap_or(start.right), top: t.unwrap_or(start.top), bottom: b.unwrap_or(start.bottom) };
+        g.check().map_err(EngineError::Param)?;
+        Some(g)
+    };
+    // Off, the guides are kept (only hidden), so switching back on finds them.
+    let kept = if grid.is_none() { sym.scale_grid.or(sym.scale_grid_kept) } else { None };
+    if let Some(sym) = s.doc.library.iter_mut().find(|x| x.id == id)
+        && (sym.scale_grid != grid || sym.scale_grid_kept != kept)
+    {
+        let sym = Arc::make_mut(sym);
+        sym.scale_grid = grid;
+        sym.scale_grid_kept = kept;
+    }
+    Ok(json!({"symbol": id.0, "scale_grid": grid.map(|g| json!({"left": g.left, "right": g.right, "top": g.top, "bottom": g.bottom}))}))
 }
 
 fn rename(s: &mut Session, p: &Value) -> Result<Value> {
@@ -648,8 +803,14 @@ pub(crate) fn convert_to_symbol(s: &mut Session, p: &Value) -> Result<Value> {
     let Some(&top) = layers.first() else {
         return Err(EngineError::State("select something to convert".into()));
     };
-    let n = s.doc.library.len() + 1;
-    let name: String = opt_str(p, "name")?.map(|x| x.chars().take(128).collect()).unwrap_or_else(|| format!("Symbol {n}"));
+    // Into the folder asked for (ADR 0053), else the top level; the name is free there: the
+    // next free “Symbol n”, or the name asked for with a number when the folder has it already.
+    let folder = crate::cmds_library::opt_folder(s, p, "folder")?;
+    let kind = opt_str(p, "kind")?.map(crate::cmds_library::kind_of).transpose()?.unwrap_or(SymbolKind::Graphic);
+    let name: String = match opt_str(p, "name")? {
+        Some(n) => s.doc.unique_name(folder, n),
+        None => s.doc.numbered_name(folder, "Symbol", s.doc.library.len() + 1),
+    };
     let bounds = s.selection_bounds();
     let center = if bounds.is_empty() { Vec2::ZERO } else { bounds.center() };
     let sym_id = SymbolId(s.doc.alloc_id());
@@ -694,10 +855,13 @@ pub(crate) fn convert_to_symbol(s: &mut Session, p: &Value) -> Result<Value> {
         }
         inner.push(Arc::new(layer));
     }
-    s.doc.library.push(Arc::new(Symbol { id: sym_id, name: name.clone(), kind: SymbolKind::Graphic, linkage: None, timeline: Timeline { layers: inner } }));
+    s.doc.library.push(Arc::new(Symbol { id: sym_id, name: name.clone(), kind, linkage: None, scale_grid_kept: None, scale_grid: None, timeline: Timeline { layers: inner } }));
+    if folder.is_some() {
+        s.doc.place_entry(LibraryEntry::Item(LibraryItem::Symbol(sym_id)), folder);
+    }
     s.layer = top;
     s.select_only([inst_id]);
-    Ok(json!({"symbol": sym_id.0, "instance": inst_id.0, "name": name, "layer": top.0}))
+    Ok(json!({"symbol": sym_id.0, "instance": inst_id.0, "name": name, "layer": top.0, "folder": folder.map(|f| f.0)}))
 }
 
 fn break_apart(s: &mut Session, _: &Value) -> Result<Value> {
@@ -738,7 +902,7 @@ fn break_apart(s: &mut Session, _: &Value) -> Result<Value> {
                 let mut c = (**child).clone();
                 c.id = ElementId(s.doc.alloc_id());
                 c.transform = e.transform.mul(&child.transform);
-                c.color = e.color.concat(&child.color);
+                c.color = e.color.nested(&child.color);
                 fresh_ids.push(c.id);
                 out.push(Arc::new(c));
             }
@@ -752,21 +916,86 @@ fn break_apart(s: &mut Session, _: &Value) -> Result<Value> {
     Ok(json!({"created": fresh_ids.len()}))
 }
 
-/// Places a Library item centred on `x`/`y` (default: the stage centre): an instance of
-/// `symbol`, or a rectangle of `bitmap`'s size showing it, in the current keyframe, selected.
-fn place(s: &mut Session, p: &Value) -> Result<Value> {
-    if let Some(bitmap) = opt_u64(p, "bitmap")? {
-        return place_bitmap(s, p, anicraft_doc::BitmapId(bitmap));
+/// Most items one `library.place` takes.
+const MAX_PLACE: usize = 1_000;
+
+/// Places Library items at `x`/`y` (default: the stage centre), as a drop from the Library
+/// does (ADR 0053): an instance of each symbol, a rectangle of each bitmap's size showing it,
+/// in the active layer's keyframe at the playhead, all selected; a sound goes onto that
+/// keyframe. One command, so one undo step however many items.
+pub(crate) fn place(s: &mut Session, p: &Value) -> Result<Value> {
+    let items: Vec<LibraryItem> = match p.get("items") {
+        Some(list) => {
+            let list = list.as_array().ok_or_else(|| EngineError::Param("param 'items' must be a list of {\"symbol\" | \"bitmap\" | \"sound\": id}".into()))?;
+            if list.len() > MAX_PLACE {
+                return Err(EngineError::Param(format!("at most {MAX_PLACE} items at once")));
+            }
+            let mut out = Vec::with_capacity(list.len());
+            for v in list {
+                match crate::cmds_library::entry_of(v)? {
+                    LibraryEntry::Item(i) => out.push(i),
+                    LibraryEntry::Folder(_) => return Err(EngineError::Param("a folder can't be placed; name the items in it".into())),
+                }
+            }
+            out
+        }
+        None => match (opt_u64(p, "symbol")?, opt_u64(p, "bitmap")?, opt_u64(p, "sound")?) {
+            (Some(i), None, None) => vec![LibraryItem::Symbol(SymbolId(i))],
+            (None, Some(i), None) => vec![LibraryItem::Bitmap(anicraft_doc::BitmapId(i))],
+            (None, None, Some(i)) => vec![LibraryItem::Sound(anicraft_doc::SoundId(i))],
+            _ => return Err(EngineError::Param("name one item ('symbol', 'bitmap' or 'sound'), or a list in 'items'".into())),
+        },
+    };
+    if items.is_empty() {
+        return Err(EngineError::Param("nothing to place".into()));
     }
-    let sym = SymbolId(opt_u64(p, "symbol")?.ok_or_else(|| EngineError::Param("param 'symbol' or 'bitmap' is required".into()))?);
-    if s.doc.symbol(sym).is_none() {
-        return Err(EngineError::State(format!("no symbol with id {}", sym.0)));
-    }
-    if crate::editing::would_nest(s, sym) {
-        return Err(EngineError::State("a symbol can't be placed inside itself".into()));
+    let mut sound = None;
+    for &i in &items {
+        if !s.doc.has_item(i) {
+            return Err(EngineError::State(match i {
+                LibraryItem::Symbol(id) => format!("no symbol with id {}", id.0),
+                LibraryItem::Bitmap(id) => format!("no bitmap with id {}", id.0),
+                LibraryItem::Sound(id) => format!("no sound with id {} in the library", id.0),
+            }));
+        }
+        match i {
+            LibraryItem::Symbol(id) if crate::editing::would_nest(s, id) => return Err(EngineError::State("a symbol can't be placed inside itself".into())),
+            LibraryItem::Sound(id) => {
+                if sound.is_some_and(|x| x != id) {
+                    return Err(EngineError::State("a keyframe holds one sound; place sounds one at a time, on different keyframes or layers".into()));
+                }
+                sound = Some(id);
+            }
+            _ => {}
+        }
     }
     let x = opt_f32(p, "x")?.unwrap_or(s.doc.stage.width as f32 / 2.0);
     let y = opt_f32(p, "y")?.unwrap_or(s.doc.stage.height as f32 / 2.0);
+    if !(x.is_finite() && y.is_finite()) || x.abs() > 1.0e6 || y.abs() > 1.0e6 {
+        return Err(EngineError::Param("'x' and 'y' must be within a million pixels of the origin".into()));
+    }
+    let mut placed = Vec::new();
+    for &i in &items {
+        match i {
+            LibraryItem::Symbol(id) => placed.push(place_symbol(s, id, x, y)?),
+            LibraryItem::Bitmap(id) => placed.push(place_bitmap(s, id, x, y)?),
+            LibraryItem::Sound(_) => {}
+        }
+    }
+    let mut out = json!({"element": placed.first().map(|e| e.0), "elements": placed.iter().map(|e| e.0).collect::<Vec<_>>()});
+    if let Some(id) = sound {
+        if s.active_layer().is_some_and(|l| l.locked) || s.timeline().locked_by_folder(s.layer) {
+            return Err(EngineError::State("the active layer is locked; unlock it to put a sound on it".into()));
+        }
+        out["sound"] = crate::cmds_sound::place(s, &json!({"sound": id.0, "extend": true}))?;
+    }
+    if !placed.is_empty() {
+        s.select_only(placed.iter().copied());
+    }
+    Ok(out)
+}
+
+fn place_symbol(s: &mut Session, sym: SymbolId, x: f32, y: f32) -> Result<ElementId> {
     let id = ElementId(s.doc.alloc_id());
     let el = Element {
         id,
@@ -776,17 +1005,14 @@ fn place(s: &mut Session, p: &Value) -> Result<Value> {
         kind: ElementKind::Symbol { symbol: sym, loop_mode: LoopMode::Loop, first_frame: 0, blend: anicraft_doc::BlendMode::Normal, filters: Vec::new(), events: Vec::new() },
     };
     s.editable_keyframe()?.elements.push(Arc::new(el));
-    s.select_only([id]);
-    Ok(json!({"element": id.0}))
+    Ok(id)
 }
 
-fn place_bitmap(s: &mut Session, p: &Value, bitmap: anicraft_doc::BitmapId) -> Result<Value> {
+fn place_bitmap(s: &mut Session, bitmap: anicraft_doc::BitmapId, x: f32, y: f32) -> Result<ElementId> {
     let (name, w, h) = match s.doc.bitmap(bitmap) {
         Some(b) => (b.name.clone(), b.width as f32, b.height as f32),
         None => return Err(EngineError::State(format!("no bitmap with id {}", bitmap.0))),
     };
-    let x = opt_f32(p, "x")?.unwrap_or(s.doc.stage.width as f32 / 2.0);
-    let y = opt_f32(p, "y")?.unwrap_or(s.doc.stage.height as f32 / 2.0);
     let id = ElementId(s.doc.alloc_id());
     let el = Element {
         id,
@@ -802,6 +1028,5 @@ fn place_bitmap(s: &mut Session, p: &Value, bitmap: anicraft_doc::BitmapId) -> R
         }),
     };
     s.editable_keyframe()?.elements.push(Arc::new(el));
-    s.select_only([id]);
-    Ok(json!({"element": id.0}))
+    Ok(id)
 }
