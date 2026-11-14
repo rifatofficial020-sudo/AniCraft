@@ -47,6 +47,43 @@ pub enum StageRenderer {
     Cpu,
 }
 
+/// How the window itself is drawn (#207, #255): AniCraft picks, or one graphics interface the user
+/// chose for this computer. Takes effect the next time AniCraft starts; whichever is chosen, a
+/// failure falls back to the next way that works (`startup`). Read leniently, so a value a
+/// newer build wrote never resets the other preferences.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowBackend {
+    /// The platform's order (`platform::window_attempts`).
+    #[default]
+    Auto,
+    Vulkan,
+    /// Windows' own (Direct3D 12).
+    Dx12,
+    Metal,
+    OpenGl,
+}
+
+impl WindowBackend {
+    /// The choice's name and what it is for, as Preferences lists it (English keys).
+    pub fn describe(self) -> (&'static str, &'static str) {
+        match self {
+            WindowBackend::Auto => (tr_noop!("Automatic"), tr_noop!("AniCraft tries the best way for this computer first, and the next one if a way doesn't work.")),
+            WindowBackend::Vulkan => (tr_noop!("Vulkan"), tr_noop!("Try this if the window flickers or goes black with another choice.")),
+            WindowBackend::Dx12 => (tr_noop!("DirectX 12"), tr_noop!("Windows' own graphics: try this if the window flickers or goes black with another choice.")),
+            WindowBackend::Metal => (tr_noop!("Metal"), tr_noop!("The Mac's own graphics.")),
+            WindowBackend::OpenGl => (tr_noop!("OpenGL"), tr_noop!("Older and slower, but works with most graphics drivers. The stage is drawn on the CPU or on a graphics device of its own.")),
+        }
+    }
+}
+
+fn lenient_palette<'de, D: serde::Deserializer<'de>>(d: D) -> Result<crate::theme::Palette, D::Error> {
+    Ok(serde_json::from_value(serde_json::Value::deserialize(d)?).unwrap_or_default())
+}
+
+fn lenient_backend<'de, D: serde::Deserializer<'de>>(d: D) -> Result<WindowBackend, D::Error> {
+    Ok(serde_json::from_value(serde_json::Value::deserialize(d)?).unwrap_or_default())
+}
+
 impl StageRenderer {
     pub const ALL: [(StageRenderer, &'static str, &'static str); 2] = [
         (StageRenderer::Gpu, tr_noop!("Graphics card (GPU)"), tr_noop!("Draws the stage on the graphics card, and on the CPU when there is no card that can. The picture is the same either way.")),
@@ -63,11 +100,14 @@ pub struct Prefs {
     pub language: String,
     pub ui_font: FontChoice,
     pub data_font: FontChoice,
-    /// Graphite or high contrast (ADR 0022), when chosen by hand.
+    /// Dark (Graphite), Light (ADR 0077) or high contrast (ADR 0022), when chosen by hand. A
+    /// palette this build doesn't know (a newer build's) reads as Graphite, keeping the rest.
+    #[serde(deserialize_with = "lenient_palette")]
     pub theme: crate::theme::Palette,
-    /// Follow the system's contrast setting (ADR 0064): high contrast while the system asks for
-    /// more contrast, graphite otherwise. `None` (files from before): it follows, unless the
-    /// file chose high contrast.
+    /// Follow the system (ADR 0064, ADR 0077): high contrast while the system asks for more
+    /// contrast, otherwise light or dark as its apps are. `None` (never chosen): Dark (Graphite),
+    /// still switching to high contrast when the system asks for more contrast, as creative tools
+    /// open dark whatever the system's light/dark setting (the lead's call on #266).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme_follows_system: Option<bool>,
     /// Interface scale (1.0 = 100%).
@@ -78,6 +118,9 @@ pub struct Prefs {
     /// the choice), so that key is not read.
     #[serde(rename = "stage")]
     pub stage_renderer: StageRenderer,
+    /// How the window is drawn, from the next start (#207, #255).
+    #[serde(deserialize_with = "lenient_backend")]
+    pub window_backend: WindowBackend,
     /// Native open/save dialogs; off = a built-in path field (for Linux setups without an XDG
     /// desktop portal).
     pub native_dialogs: bool,
@@ -108,12 +151,22 @@ pub struct Prefs {
     /// Brushes of your own (ADR 0068), for the Brush and the Paint Brush.
     #[serde(deserialize_with = "lenient_brushes")]
     pub brushes: anicraft_engine::brush_library::BrushLibrary,
+    /// Filter presets of your own (ADR 0091), for movie clips and buttons in any document.
+    #[serde(deserialize_with = "lenient_filter_presets")]
+    pub filter_presets: anicraft_engine::filter_library::FilterLibrary,
     /// Test Movie plays in a window of its own (ADR 0062); off, or where a system can't open
     /// one, it floats inside the editor.
     pub test_movie_window: bool,
     /// Where the Test Movie window was last, in points (its top-left corner); `None` until it
     /// has been opened where the system says where windows are.
     pub test_movie_pos: Option<[f32; 2]>,
+    /// Window › Workspace (ADR 0075): the workspace in use, each one's arrangement of the
+    /// panels, and your own saved ones.
+    #[serde(deserialize_with = "crate::dock::lenient_workspaces")]
+    pub workspaces: crate::dock::Workspaces,
+    /// Whether the rulers, grid and guides show and snap (ADR 0076), kept from session to
+    /// session; where the guides are and how they look is the document's.
+    pub aids: anicraft_engine::ViewAids,
 }
 
 /// Most publish presets kept, and the longest name one has.
@@ -162,6 +215,7 @@ impl Default for Prefs {
             ui_scale: 1.0,
             render_mode: RenderMode::Auto,
             stage_renderer: StageRenderer::Gpu,
+            window_backend: WindowBackend::Auto,
             native_dialogs: true,
             timeline_start_gap: 0.0,
             timeline_short_rows: false,
@@ -174,8 +228,11 @@ impl Default for Prefs {
             recent: Default::default(),
             start_screen: true,
             brushes: Default::default(),
+            filter_presets: Default::default(),
             test_movie_window: true,
             test_movie_pos: None,
+            workspaces: crate::dock::Workspaces::default(),
+            aids: Default::default(),
         }
     }
 }
@@ -203,6 +260,16 @@ fn lenient_brushes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<anicraft_en
     Ok(anicraft_engine::brush_library::BrushLibrary::from_values(list))
 }
 
+/// Your filter presets as written, skipping entries that aren't one (a hand-edited file).
+fn lenient_filter_presets<'de, D: serde::Deserializer<'de>>(d: D) -> Result<anicraft_engine::filter_library::FilterLibrary, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    let list: Vec<serde_json::Value> = match v {
+        serde_json::Value::Array(a) => a,
+        _ => Vec::new(),
+    };
+    Ok(anicraft_engine::filter_library::FilterLibrary::from_values(list))
+}
+
 /// Autosave intervals offered in Preferences: `(seconds, label)`.
 pub const AUTOSAVE_INTERVALS: [(u32, &str); 5] = [(30, tr_noop!("30 seconds")), (60, tr_noop!("1 minute")), (120, tr_noop!("2 minutes")), (300, tr_noop!("5 minutes")), (600, tr_noop!("10 minutes"))];
 pub const AUTOSAVE_SECS_RANGE: std::ops::RangeInclusive<u32> = 15..=600;
@@ -212,18 +279,33 @@ pub const SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.75..=2.0;
 pub const GAP_RANGE: std::ops::RangeInclusive<f32> = 0.0..=48.0;
 
 impl Prefs {
-    /// Whether the theme follows the system's contrast setting ("Follow system", the default).
+    /// Whether the theme follows the system ("Follow system", the default): its contrast setting
+    /// (ADR 0064) and its light or dark mode (ADR 0077). A file that names a palette other than
+    /// the default without saying whether it follows chose that palette.
     pub fn follows_system(&self) -> bool {
-        self.theme_follows_system.unwrap_or(self.theme != crate::theme::Palette::HighContrast)
+        self.theme_follows_system.unwrap_or(false)
     }
 
-    /// The palette to draw with, given what the system says about contrast (`None`: it
-    /// doesn't say, or hasn't yet).
-    pub fn palette(&self, system_high_contrast: Option<bool>) -> crate::theme::Palette {
-        match (self.follows_system(), system_high_contrast) {
-            (true, Some(true)) => crate::theme::Palette::HighContrast,
-            (true, _) => crate::theme::Palette::Graphite,
-            (false, _) => self.theme,
+    /// Never chose a look: Dark (Graphite), with high contrast when the system asks for it.
+    fn default_look(&self) -> bool {
+        self.theme_follows_system.is_none() && self.theme == crate::theme::Palette::Graphite
+    }
+
+    /// The palette to draw with, given what the system says (each part `None` where it doesn't
+    /// say, or hasn't yet). More contrast wins over light or dark; a system that says nothing gets
+    /// Graphite.
+    pub fn palette(&self, system: crate::platform::SystemLook) -> crate::theme::Palette {
+        use crate::theme::Palette;
+        if self.default_look() {
+            return if system.high_contrast == Some(true) { Palette::HighContrast } else { Palette::Graphite };
+        }
+        if !self.follows_system() {
+            return self.theme;
+        }
+        match (system.high_contrast, system.dark) {
+            (Some(true), _) => Palette::HighContrast,
+            (_, Some(false)) => Palette::Light,
+            _ => Palette::Graphite,
         }
     }
 
@@ -256,6 +338,7 @@ impl Prefs {
             .collect();
         self.recent = std::mem::take(&mut self.recent).sanitized();
         self.brushes = std::mem::take(&mut self.brushes).sanitized();
+        self.filter_presets = std::mem::take(&mut self.filter_presets).sanitized();
         self.test_movie_pos = self.test_movie_pos.filter(|[x, y]| x.is_finite() && y.is_finite() && x.abs() < 1e5 && y.abs() < 1e5);
         self
     }
@@ -319,21 +402,42 @@ mod tests {
 
     #[test]
     fn the_theme_follows_the_system_unless_one_was_chosen() {
+        use crate::platform::SystemLook;
         use crate::theme::Palette;
-        // New installs, and files from before ADR 0064 that kept the default, follow the system.
+        let look = |high_contrast, dark| SystemLook { high_contrast, dark };
+        // New installs, and files that kept the default: dark, but high contrast when the system
+        // asks for more contrast; a light system doesn't turn the editor light (#266).
         for p in [Prefs::default(), Prefs::from_json(r#"{"theme": "Graphite"}"#)] {
-            assert!(p.follows_system());
-            assert_eq!(p.palette(Some(true)), Palette::HighContrast);
-            assert_eq!(p.palette(Some(false)), Palette::Graphite);
-            assert_eq!(p.palette(None), Palette::Graphite, "a system that doesn't say: graphite");
+            assert!(!p.follows_system());
+            assert_eq!(p.palette(look(Some(true), None)), Palette::HighContrast);
+            assert_eq!(p.palette(look(Some(true), Some(false))), Palette::HighContrast, "more contrast wins over light");
+            assert_eq!(p.palette(look(Some(false), None)), Palette::Graphite);
+            assert_eq!(p.palette(look(Some(false), Some(false))), Palette::Graphite, "a light system: still dark by default");
+            assert_eq!(p.palette(look(None, Some(true))), Palette::Graphite);
+            assert_eq!(p.palette(SystemLook::default()), Palette::Graphite, "a system that doesn't say: graphite");
         }
+        // Follow system, chosen: light or dark as the system is (ADR 0077).
+        let follow = Prefs { theme_follows_system: Some(true), ..Prefs::default() };
+        assert!(follow.follows_system());
+        assert_eq!(follow.palette(look(Some(false), Some(false))), Palette::Light, "a light system: light");
+        assert_eq!(follow.palette(look(Some(true), Some(false))), Palette::HighContrast);
         // A file that chose high contrast keeps it whatever the system says.
         let hc = Prefs::from_json(r#"{"theme": "HighContrast"}"#);
         assert!(!hc.follows_system());
-        assert_eq!(hc.palette(Some(false)), Palette::HighContrast);
+        assert_eq!(hc.palette(look(Some(false), Some(true))), Palette::HighContrast);
+        // Light chosen by hand stays light on a dark system, through a round trip.
+        let light = Prefs { theme: Palette::Light, theme_follows_system: Some(false), ..Prefs::default() };
+        let json = serde_json::to_string(&light).unwrap_or_default();
+        assert!(json.contains(r#""theme": "Light""#) || json.contains(r#""theme":"Light""#), "{json}");
+        let back = Prefs::from_json(&json);
+        assert_eq!((back.theme, back.palette(look(Some(false), Some(true)))), (Palette::Light, Palette::Light));
+        assert_eq!(Prefs::from_json(r#"{"theme": "Light"}"#).palette(look(None, Some(true))), Palette::Light, "named without the flag: chosen");
+        // A palette this build doesn't know (a newer file) falls back to the defaults, not a crash.
+        let newer = Prefs::from_json(r#"{"theme": "Sepia", "ui_scale": 1.5}"#);
+        assert_eq!((newer.theme, newer.ui_scale), (Palette::Graphite, 1.5), "the other preferences stay");
         // Graphite chosen by hand stays graphite; the choice survives a round trip.
         let manual = Prefs { theme_follows_system: Some(false), ..Prefs::default() };
-        assert_eq!(manual.palette(Some(true)), Palette::Graphite);
+        assert_eq!(manual.palette(look(Some(true), Some(false))), Palette::Graphite);
         let back = Prefs::from_json(&serde_json::to_string(&manual).unwrap_or_default());
         assert_eq!(back.theme_follows_system, Some(false));
         assert!(!serde_json::to_string(&Prefs::default()).unwrap_or_default().contains("theme_follows_system"), "nothing new written until chosen");
@@ -387,6 +491,12 @@ mod tests {
         assert_eq!(p.stage_renderer, StageRenderer::Gpu, "the GPU draws the stage unless the CPU is chosen");
         assert_eq!(Prefs::from_json(r#"{"stage_renderer": "Cpu"}"#).stage_renderer, StageRenderer::Gpu, "the old default, written by every earlier build, is not a choice");
         assert_eq!(Prefs::from_json(r#"{"stage": "Cpu"}"#).stage_renderer, StageRenderer::Cpu);
+        // The window's graphics: automatic unless chosen, and a value this build doesn't know
+        // (a newer build's) leaves it automatic without resetting anything else.
+        assert_eq!(p.window_backend, WindowBackend::Auto);
+        assert_eq!(Prefs::from_json(r#"{"window_backend": "Dx12"}"#).window_backend, WindowBackend::Dx12);
+        let newer = Prefs::from_json(r#"{"window_backend": "Hologram", "stage": "Cpu"}"#);
+        assert_eq!((newer.window_backend, newer.stage_renderer), (WindowBackend::Auto, StageRenderer::Cpu));
         let chosen = Prefs { stage_renderer: StageRenderer::Cpu, ..Prefs::default() };
         assert_eq!(Prefs::from_json(&serde_json::to_string(&chosen).unwrap()).stage_renderer, StageRenderer::Cpu, "a choice survives saving");
         let p = Prefs::from_json(r#"{"shortcuts": {"tool.pen": ["F10", "Ctrl+K"], "nope": ["F2"]}}"#);

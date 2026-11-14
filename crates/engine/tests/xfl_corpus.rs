@@ -40,10 +40,12 @@ const FRAMES: &[(&str, &[u32])] = &[
     ("scenes", &[0, 3, 7, 8, 10]),
     ("scripts", &[0, 4]),
     ("shapes", &[0]),
+    ("sounds", &[0]),
     ("symbols", &[0, 5]),
     ("text", &[0]),
     ("textfields", &[0]),
     ("tweens", &[0, 6, 12]),
+    ("video", &[0]),
 ];
 
 /// Render scale: the corpus stages are 320 × 180.
@@ -59,6 +61,18 @@ const PROBES: &[(&str, u32, f32, f32, u32)] = &[
     ("shapes", 0, 80.0, 30.0, 0x2B6CD9),
     ("shapes", 0, 95.0, 50.0, 0xF4F1EA),
     ("shapes", 0, 270.0, 60.0, 0xF29E1F),
+    // ADR 0086: the sounds package's artwork under its sound layers, on its own stage colour.
+    ("sounds", 0, 40.0, 60.0, 0x2A9D8F),
+    ("sounds", 0, 160.0, 90.0, 0xE9C46A),
+    ("sounds", 0, 10.0, 10.0, 0xF4F1EA),
+    // The Screen Video's first frame at 1.5 times (20..116 × 20..92), its quarters the right
+    // way up and round; the VP6 video draws nothing; the rectangle beside it.
+    ("video", 0, 35.0, 35.0, 0xE63946),
+    ("video", 0, 100.0, 35.0, 0x2A9D8F),
+    ("video", 0, 35.0, 80.0, 0x2646C8),
+    ("video", 0, 100.0, 80.0, 0xE9C46A),
+    ("video", 0, 200.0, 50.0, 0x264653),
+    ("video", 0, 10.0, 150.0, 0xFFFFFF),
     ("primitives", 0, 40.0, 50.0, 0xF2CC8F),
     ("primitives", 0, 210.0, 40.0, 0xE07A5F),
     ("primitives", 0, 6.0, 170.0, 0xFFFFFF),
@@ -99,6 +113,10 @@ const PROBES: &[(&str, u32, f32, f32, u32)] = &[
     ("colour", 12, 280.0, 152.0, 0xAAD8D2),
     ("tweens", 0, 20.0, 25.0, 0xF4A261),
     ("tweens", 12, 300.0, 25.0, 0xF4A261),
+    // Per-property custom eases (ADR 0081): halfway, position's three-segment curve has carried
+    // the ball past its end (x 180) to about 214; at the end it is there, half as big again.
+    ("tweens", 6, 214.0, 145.0, 0xF4A261),
+    ("tweens", 12, 180.0, 145.0, 0xF4A261),
     // Masked stripes: inside the spot, and outside it.
     ("masks", 0, 60.0, 22.0, 0x264653),
     ("masks", 0, 60.0, 27.0, 0xFFFFFF),
@@ -266,6 +284,7 @@ fn every_package_opens_from_a_fla_with_the_same_golden_frames() {
             let mut t = Session::default();
             let got = t.execute("file.open", &json!({"path": path.display().to_string()})).unwrap_or_else(|e| panic!("{case}, {}: {e}", v.name));
             assert_eq!(got["report"], want["report"], "{case}, {}", v.name);
+            assert_eq!(got["named"], want["named"], "{case}, {}", v.name);
             assert!(t.doc == s.doc, "{case}, {}: the .fla opens differently from the folder", v.name);
         }
         // The goldens (imported without fonts, as they were made), rendered from the .fla in
@@ -284,4 +303,71 @@ fn every_package_opens_from_a_fla_with_the_same_golden_frames() {
     assert!(failures.is_empty(), "{} of {checked} .fla frames differ from their goldens:
 {}", failures.len(), failures.join("
 "));
+}
+
+/// #226: each package as a `.fla` opens as the same document through every way in: File › Open,
+/// the command line and a document the system hands over (all `file.open`), Open Recent and the
+/// start screen's list (`file.open_recent`), a drop anywhere on the window (routed to
+/// `file.open`), an upper-case extension, and a file a web browser hands over (`vfs`).
+#[test]
+fn every_entry_point_opens_the_corpus_as_a_fla() {
+    use anicraft_engine::cmds_drop::{DropAction, DropKind, DropTarget, kind_of, route};
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("xfl-corpus-entry-points");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (case, _) in FRAMES {
+        let mut s = Session::default();
+        s.execute("file.open", &json!({"path": corpus().join(case).display().to_string()})).unwrap_or_else(|e| panic!("{case}: {e}"));
+        let bytes = pack::pack(&pack::package(&corpus().join(case)), &pack::VARIANTS[0]);
+        let fla = dir.join(format!("{case}.fla"));
+        std::fs::write(&fla, &bytes).unwrap();
+        let upper = dir.join(format!("{case} COPY.FLA"));
+        std::fs::write(&upper, &bytes).unwrap();
+        let open = |path: &Path| {
+            let mut t = Session::default();
+            t.execute("file.open", &json!({"path": path.display().to_string()})).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            t
+        };
+        for path in [&fla, &upper] {
+            let t = open(path);
+            assert!(t.doc == s.doc, "{}: opens differently from its folder", path.display());
+            assert!(t.path.is_none(), "{case}: imported untitled, so Save never writes over the Animate file");
+        }
+        // Open Recent reopens the Animate file it imported.
+        let mut t = open(&fla);
+        t.execute("file.new", &json!({})).unwrap();
+        t.execute("file.open_recent", &json!({"index": 0, "confirm": true})).unwrap_or_else(|e| panic!("{case}: Open Recent: {e}"));
+        assert!(t.doc == s.doc, "{case}: Open Recent opens it the same");
+        // A drop anywhere opens it.
+        for path in [&fla, &upper] {
+            assert_eq!(kind_of(path), DropKind::Document, "{}", path.display());
+            for target in [DropTarget::Stage, DropTarget::Timeline, DropTarget::Library, DropTarget::Window] {
+                assert_eq!(route(kind_of(path), target), DropAction::Open, "{case} on {target:?}");
+            }
+        }
+        // In a browser the file arrives in memory, on the thread that opens it (ADR 0036).
+        let (name, data, want) = (format!("{case}.fla"), bytes.clone(), s.doc.clone());
+        std::thread::spawn(move || {
+            anicraft_engine::vfs::use_memory();
+            anicraft_engine::vfs::put(Path::new(&name), data).unwrap();
+            let mut w = Session::default();
+            w.execute("file.open", &json!({"path": name})).unwrap_or_else(|e| panic!("{name} in a browser: {e}"));
+            assert!(w.doc == want, "{name}: opens differently in a browser");
+        })
+        .join()
+        .unwrap();
+    }
+}
+
+/// ADR 0086: opening a document headless (the CLI and MCP) says which sounds and videos didn't
+/// come across, by name, and the sounds that did are in the Library with their waveforms.
+#[test]
+fn file_open_names_the_sounds_and_videos_that_did_not_come_across() {
+    let mut s = Session::default();
+    let got = s.execute("file.open", &json!({"path": corpus().join("sounds").display().to_string()})).unwrap();
+    assert_eq!(got["named"]["missing sound files"], json!(["lost.wav"]));
+    assert!(got["report"].as_str().unwrap().contains("3 sounds in formats AniCraft can't decode (theme.aif: AIFF; voice.wav: WAV in IMA ADPCM; Sounds/loop: Animate's own sound data)"), "{}", got["report"]);
+    assert_eq!(s.doc.sounds.len(), 2);
+    assert!(s.doc.sounds.iter().all(|x| x.decoded().is_some_and(|d| d.pcm.frames() > 0)), "waveforms ready to draw");
+    let got = s.execute("file.open", &json!({"path": corpus().join("video").display().to_string(), "confirm": true})).unwrap();
+    assert_eq!(got["named"]["videos AniCraft can't play"], json!(["intro.flv: FLV, On2 VP6, 4.5 s", "gone.mp4: its file is missing, 1.0 s"]));
 }

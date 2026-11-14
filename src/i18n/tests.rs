@@ -55,6 +55,8 @@ fn without_tests(src: &str) -> String {
 const NOT_UI: &[&str] = &[
     "eprintln!(", "println!(", "print!(", "panic!(", "assert", "unreachable!(", "Id::new(", "id_salt(", "persistent_id(", "json!(", "execute(", "perform(", "invoke(", ".run(", "find_command(", "#[", "env!(", "include_str!(", "include_bytes!(", "concat!(", "var(",
     "contains(", "starts_with(", "ends_with(", "strip_prefix(", "strip_suffix(", "matches!(", "== ", "!= ",
+    // The start-up log (`startup::line`): English, like console messages, for bug reports.
+    "line(&", "write(&format!(",
 ];
 
 /// Whether a prose literal outside the macros is allowed: not interface text by its context,
@@ -120,7 +122,13 @@ fn all_keys() -> BTreeSet<Key> {
     }
     add(&doc::Easing::Linear.label());
     doc::Property::ALL.iter().for_each(|p| add(p.label()));
+    doc::FilterParam::ALL.iter().for_each(|p| add(p.label()));
+    add("Filters");
+    add("Filter");
     doc::ColorStyle::ALL.iter().for_each(|s| add(s.label()));
+    doc::EaseFamily::ALL.iter().for_each(|f| add(f.label()));
+    doc::EaseDir::ALL.iter().for_each(|d| add(d.label()));
+    doc::EaseGroup::ALL.iter().for_each(|g| add(g.label()));
     doc::ProfilePreset::ALL.iter().for_each(|p| add(p.label()));
     doc::Cap::ALL.iter().for_each(|c| add(c.label()));
     doc::Join::ALL.iter().for_each(|j| add(j.label()));
@@ -594,7 +602,7 @@ fn every_control_can_be_used_in_the_pseudo_locale() {
             a.run("element.set_color_effect", serde_json::json!({"style": style}));
         }));
     }
-    for panel in ["sound", "camera", "motion", "motionpins", "actions", "script", "prefs", "envelope", "onionmenu", "editmultiple", "edittransform", "onionsymbol", "find", "explorer", "publish", "publishreport", "publishanim", "start", "testmovie", "testmovieinside", "templates", "savetemplate", "brushlibrary", "brushcurve"] {
+    for panel in ["sound", "camera", "springbones", "shapebones", "shapeweights", "warp", "motion", "motionpins", "actions", "script", "prefs", "envelope", "onionmenu", "editmultiple", "edittransform", "onionsymbol", "find", "explorer", "publish", "publishreport", "publishanim", "start", "testmovie", "testmovieinside", "templates", "savetemplate", "brushlibrary", "brushcurve"] {
         found.extend(click_everything(panel, |a, _| a.open_panel(Some(panel))));
     }
     // Test Movie in a window of its own (ADR 0062; egui stands in for the window system here).
@@ -756,7 +764,7 @@ fn screen_reader_names_are_translated_too() {
     // the source guideline can't see: ones passed through variables or built at run time).
     use crate::app::Tool;
     let mut found = untranslated_names("default", |_, _| {});
-    for tool in [Tool::Rect, Tool::Star, Tool::Text, Tool::Pencil, Tool::Brush, Tool::Eraser, Tool::PaintBucket, Tool::Eyedropper, Tool::Pen, Tool::Camera, Tool::Bone] {
+    for tool in [Tool::Rect, Tool::Star, Tool::Text, Tool::Pencil, Tool::Brush, Tool::Eraser, Tool::PaintBucket, Tool::Eyedropper, Tool::Pen, Tool::Camera, Tool::Bone, Tool::Bind, Tool::Warp] {
         found.extend(untranslated_names(&format!("{tool:?} tool"), |a, _| a.tool = tool));
     }
     // Selections and states that change what Properties, the timeline and the dialogs show.

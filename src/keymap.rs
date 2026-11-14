@@ -48,6 +48,7 @@ pub fn tool_id(t: Tool) -> &'static str {
         Tool::Select => "tool.selection",
         Tool::Subselect => "tool.subselection",
         Tool::Transform => "tool.free_transform",
+        Tool::GradientTransform => "tool.gradient_transform",
         Tool::Width => "tool.width",
         Tool::Pen => "tool.pen",
         Tool::Text => "tool.text",
@@ -64,6 +65,8 @@ pub fn tool_id(t: Tool) -> &'static str {
         Tool::Eyedropper => "tool.eyedropper",
         Tool::Camera => "tool.camera",
         Tool::Bone => "tool.bone",
+        Tool::Bind => "tool.bind",
+        Tool::Warp => "tool.warp",
         Tool::Hand => "tool.hand",
         Tool::Zoom => "tool.zoom",
     }
@@ -129,6 +132,8 @@ fn key_name(k: Key) -> &'static str {
         Key::Equals => "=",
         Key::OpenBracket => "[",
         Key::CloseBracket => "]",
+        Key::Semicolon => ";",
+        Key::Quote => "'",
         other => other.name(),
     }
 }

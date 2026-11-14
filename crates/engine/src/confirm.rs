@@ -38,6 +38,10 @@ fn plural(n: usize, word: &str) -> String {
     if n == 1 { format!("1 {word}") } else { format!("{n} {word}s") }
 }
 
+fn swatches(n: usize) -> String {
+    if n == 1 { "1 swatch".into() } else { format!("{n} swatches") }
+}
+
 fn target_layer<'a>(s: &'a Session, p: &Value) -> Option<&'a Layer> {
     let id = p.get("layer").and_then(Value::as_u64).map_or(s.layer, LayerId);
     s.timeline().layer(id)
@@ -124,6 +128,58 @@ pub fn confirmation(s: &Session, id: &str, p: &Value) -> Option<Confirmation> {
                 irreversible: true,
             })
         }
+        // Swatches are document data and undoable (ADR 0078): replacing many asks by default.
+        "swatch.export" => {
+            let path = Path::new(p.get("path").and_then(Value::as_str)?);
+            crate::vfs::exists(path).then(|| overwrite(path, "Exporting the swatches"))
+        }
+        "swatch.clear" => {
+            let n = s.doc.swatches.len();
+            (n > 2).then(|| Confirmation {
+                title: "Clear swatches?".into(),
+                message: format!("{} will be removed, leaving black and white. You can undo this.", swatches(n)),
+                action: "Clear Swatches".into(),
+                irreversible: false,
+            })
+        }
+        "swatch.reset" => {
+            let custom = !anicraft_doc::swatch::is_default_set(&s.doc.swatches) && !s.doc.swatches.is_empty();
+            custom.then(|| Confirmation {
+                title: "Load the default swatches?".into(),
+                message: "The document's swatches will be replaced with a new document's set. You can undo this.".into(),
+                action: "Load Default Swatches".into(),
+                irreversible: false,
+            })
+        }
+        "swatch.import" if p.get("replace").and_then(Value::as_bool) == Some(true) && !s.doc.swatches.is_empty() => Some(Confirmation {
+            title: "Replace swatches?".into(),
+            message: format!("The document's {} will be replaced with the file's. You can undo this.", swatches(s.doc.swatches.len())),
+            action: "Replace Swatches".into(),
+            irreversible: false,
+        }),
+        // Filter presets live in your preferences, outside undo (ADR 0091).
+        "filter.preset_delete" => {
+            let name = s.filter_presets.find(p.get("name").and_then(Value::as_str)?)?.name.clone();
+            Some(Confirmation {
+                title: "Delete filter preset?".into(),
+                message: format!("The filter preset “{name}” will be deleted from your presets. Artwork that uses its filters keeps them. This cannot be undone."),
+                action: "Delete Preset".into(),
+                irreversible: true,
+            })
+        }
+        "filter.preset_save" => {
+            let name = s.filter_presets.find(p.get("name").and_then(Value::as_str)?)?.name.clone();
+            Some(Confirmation {
+                title: "Replace filter preset?".into(),
+                message: format!("You already have a filter preset named “{name}”. Saving replaces its filters. This cannot be undone."),
+                action: "Replace".into(),
+                irreversible: true,
+            })
+        }
+        "filter.preset_export" => {
+            let path = Path::new(p.get("path").and_then(Value::as_str)?);
+            crate::vfs::exists(path).then(|| overwrite(path, "Exporting the filter presets"))
+        }
         "brush.preset_export" => {
             let path = Path::new(p.get("path").and_then(Value::as_str)?);
             crate::vfs::exists(path).then(|| overwrite(path, "Exporting the brushes"))
@@ -139,7 +195,7 @@ pub fn confirmation(s: &Session, id: &str, p: &Value) -> Option<Confirmation> {
             let same = s.path.as_deref() == Some(path);
             (!same && crate::vfs::exists(path)).then(|| overwrite(path, "Saving"))
         }
-        "file.export_png" | "file.export_gif" | "file.export_apng" | "file.export_webp" | "file.export_svg" | "file.export_video" | "file.export_lottie" | "file.export_html" | "file.export_audio" => {
+        "file.export_png" | "file.export_gif" | "file.export_apng" | "file.export_webp" | "file.export_svg" | "file.export_video" | "file.export_lottie" | "file.export_html" | "file.export_audio" | "file.export_plugin" => {
             let path = Path::new(p.get("path").and_then(Value::as_str)?);
             crate::vfs::exists(path).then(|| overwrite(path, "Exporting"))
         }

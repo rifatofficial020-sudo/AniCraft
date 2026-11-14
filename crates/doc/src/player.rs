@@ -18,7 +18,7 @@ use crate::actions::as3::ir::{Base, Function, ListenEvent, Place, Prop, Value};
 use crate::actions::as3::run::{self, Stop, World};
 use crate::actions::as3::{Compiled, Decls, Problem};
 use crate::actions::{Action, ButtonEvent, EventHandler, FrameRef, FrameScript, PluginScript, Property, Seg, Target};
-use crate::eval::{Play, evaluate_guided, evaluate_symbol, guide_walk};
+use crate::eval::{Play, evaluate_shown, evaluate_symbol, guide_walk};
 use crate::field::{Changed, Edit, Editor, FieldLook, FieldState, chars, fit, scroll_to_caret};
 use crate::sound::Started;
 use crate::{BlendMode, ColorTransform, DisplayList, Document, Element, ElementId, ElementKind, FIELD_GUTTER, Group, LayerKind, MAX_SYMBOL_DEPTH, Rgba, SoundSync, SymbolId, SymbolKind, TextBlock, TextField, TextKind, Timeline};
@@ -560,15 +560,29 @@ fn walk(doc: &Document, st: &PlayerState, tl: &Timeline, frame: u32, parent: usi
     }
     let base: InstancePath = out.get(parent).map(|n| n.path.clone()).unwrap_or_default();
     let parent_gain = out.get(parent).map_or(1.0, |n| n.gain);
-    for (index, layer) in tl.layers.iter().enumerate().rev() {
+    // Drawn deepest first (ADR 0082), so the topmost hit is the one drawn last.
+    // (Only sorted when some layer has a depth: nested timelines allocate nothing.)
+    let sorted = (depth == 1 && tl.layers.iter().any(|l| l.has_depth())).then(|| tl.draw_order(frame));
+    let n = tl.layers.len();
+    for k in 0..n {
+        let index = sorted.as_ref().map_or(n - 1 - k, |o| o.get(k).copied().unwrap_or(n));
+        let Some(layer) = tl.layers.get(index) else { continue };
         if !plays(tl, index) {
             continue;
         }
         let gain = parent_gain * layer.sound_gain();
         let hit = hittable && layer.kind != LayerKind::Mask;
         let path_walk = layer.parent.and_then(|p| tl.layer(p)).filter(|g| g.kind == LayerKind::Guide).and_then(|g| guide_walk(g, frame));
-        let Some((kf_start, els)) = evaluate_guided(layer, frame, path_walk.as_ref()) else { continue };
-        let layer_xf = camera.map_or(xf, |c| c.view(&doc.stage, layer.depth));
+        let Some((kf_start, els)) = evaluate_shown(layer, frame, path_walk.as_ref(), doc.stage.fps) else { continue };
+        let layer_xf = match camera {
+            Some(c) => match c.layer_view(&doc.stage, layer, frame) {
+                Some(v) => v,
+                None => continue,
+            },
+            None => xf,
+        };
+        // Instances inside a group belong to the group's timeline (ADR 0073).
+        let els = crate::expand_groups(&els).into_owned();
         for el in els.iter() {
             if out.len() >= MAX_NODES {
                 return;

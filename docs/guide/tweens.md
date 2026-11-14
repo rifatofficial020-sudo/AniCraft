@@ -39,18 +39,60 @@ artwork.
 ## Easing
 
 Easing makes motion speed up or slow down instead of moving at one steady pace. Pick an ease
-for a classic or shape tween in any of these places:
+for a classic or shape tween in either of these places:
 
-* the **Easing** menu in the timeline header (it appears while the playhead is in a tween);
-* **Properties › Frame › Tween**, which also shows a small picture of the curve;
-* the right-click menu on the span, under **Ease**.
+* the ease menu in the timeline header (it appears while the playhead is in a tween);
+* **Properties › Frame › Ease**, which also shows a small picture of the curve (click it to
+  edit the curve).
 
-The presets are **Linear**, **Ease in (quad)**, **Ease out (quad)**, **Ease in-out (quad)**,
-**Ease in (cubic)**, **Ease out (cubic)**, **Ease in-out (cubic)** and **Smooth (bezier)**. An
-"in" ease starts slowly, an "out" ease ends slowly, and "in-out" does both.
+The menu holds:
 
-Motion tweens have their own, finer easing per property: see [The Motion
-Editor](#the-motion-editor).
+* **No Ease**: a steady pace.
+* **Classic Ease**: one **Strength**, from −100 (starts slowly) to +100 (ends slowly).
+* **Quad, Cubic, Quart, Quint, Sine, Back, Circ, Bounce and Elastic**, each **In**, **Out** and
+  **In Out**, drawn as small curves. An In ease starts slowly, an Out ease ends slowly, In Out
+  does both. Quad to Quint get steeper in turn; Back overshoots a little and comes back;
+  Bounce lands like a dropped ball; Elastic springs past the end and settles.
+* The eases you saved in this document (see below).
+* **Edit Ease…**, which opens the Custom Ease window.
+
+### Custom eases
+
+The **Custom Ease** window (Edit Ease…, the ✎ button in Properties, or **Edit Ease…** on the
+span's right-click menu) shows the ease as a graph: time goes across, progress goes up from
+0 % (the first keyframe) to 100 % (the next), and the curve may go above or below them for an
+overshoot or a wind-up.
+
+* Click the curve to add a point. The shape doesn't change until you move it.
+* Drag a point, or the handles of the selected point, to shape the curve. Each drag is one
+  undo step. A point can't pass its neighbours, so time never runs backwards.
+* Double-click a point to make it smooth (handles in line) or a corner. Right-click a point to
+  delete it. The two ends stay where they are.
+* The selected point's **Time** and **Value** can be typed below the graph.
+* With the graph focused, the keyboard does the same: `[` and `]` pick a point, the arrows move
+  it (Shift moves ten times further), `S` makes it smooth or a corner, `+` adds a point after
+  it, and Delete removes it.
+
+Picking a preset and then dragging its curve turns it into a custom ease. **Reset** goes back
+to No Ease.
+
+**Ease each property separately** gives a classic tween one ease for each of **Position**,
+**Rotation**, **Scale**, **Colour** and **Filters**: pick one at the top of the window and
+shape its curve. Turn it off to use one ease for everything again. (Shape tweens have one
+ease.)
+
+### Saving and copying eases
+
+Type a name beside **Save as** and click **Save** to keep the ease in the document. Saved eases
+appear in every ease menu, for classic tweens and Motion Editor properties alike. A tween
+given a saved ease gets a copy of its curve, so changing or deleting the saved ease later
+doesn't change tweens that already use it. Click a saved ease's name under the buttons to edit
+it, rename it or delete it.
+
+**Copy Ease** and **Paste Ease** (in the window, or on the span's right-click menu) carry an
+ease from one tween, property group or Motion Editor segment to another.
+
+Motion tweens have their own easing per property: see [The Motion Editor](#the-motion-editor).
 
 ## Shape tweens
 
@@ -126,18 +168,74 @@ On the left is the list of properties, with each one's value at the playhead.
 On the right is the selected property's curve:
 
 * drag a key up or down to change its value;
+* drag a key sideways to move it in time (see below);
 * drag the two handles of a segment to shape its ease (overshoot is allowed, for a bounce or a
   wind-up);
 * double-click to add a key;
 * click to move the playhead.
 
-Under **Ease**, pick a preset for the segment at the playhead. **Same for all** gives every
-property's segment there the same ease. Each drag is one undo step.
+Under **Ease**, pick a preset or a saved ease for the segment at the playhead, or click ✎ to
+shape it in the Custom Ease window. Eases that one curve can't draw (Bounce, Elastic, custom
+eases of several points) show no handles in the graph: shape them in the window. **Same for
+all** gives every property's segment there the same ease. Each drag is one undo step.
 
 **Remove Tween** takes the motion tween away, leaving the object as it is on the span's first
 frame.
 
-Not there yet: moving keys in time (retiming), and stretching keys when you resize the span.
+### Animating filters
+
+A movie clip or button with filters (see **Properties › Filters**) lists each filter in the
+Motion Editor, below the colour effect, with its numbers under its name: **Blur X** and **Blur Y**,
+**Strength**, **Angle** and **Distance** for the shadows, glows and bevels, and **Brightness**,
+**Contrast**, **Saturation** and **Hue** for Adjust Color. They key, curve, ease and retime like
+any other property, so a blur can sharpen with an ease-out and then pulse.
+
+You can also change a filter in **Properties › Filters** with the playhead inside the tween: the
+number you changed gets a key there, as moving the object does. Reordering or removing filters
+takes their keys along with them. A filter's colours, quality and switches aren't animated yet;
+they stay as the object has them.
+
+### Moving keys in time
+
+Drag a key **sideways** to move it to another frame. It snaps to whole frames, carries its value
+and ease with it, and never passes the key before or after it on the same property (it stops
+next to that key). A drag goes either sideways or up and down, depending on which way you first
+move the pointer, so retiming never changes a value by accident.
+
+To move several keys together:
+
+* **Shift-click** (or Ctrl-click) keys to pick them. The pick stays when you switch to another
+  property, so you can pick keys of X, Y and rotation and move them as one.
+* The **All** lane under the frame numbers has a diamond on every frame that holds a key. Click
+  one to pick every property's keys on that frame, then drag it to move them all.
+
+With the curve focused (click it, or Tab to it), **Left** and **Right** move the picked keys one
+frame; with **Shift**, ten frames. Each drag, and each key press, is one undo step.
+
+On a motion path, a frame pinned to a path point keeps its X and Y keys together: moving one
+moves both, and the pin moves with them.
+
+## Retiming tweens on the timeline
+
+* **Stretch a tween**: drag the right edge of a span. On a motion tween its property keyframes
+  stretch in proportion, as in Animate: a key halfway through stays halfway through. Hold
+  **Shift** while you let go to keep the keys on their frames instead. The readout beside the
+  edge shows the new length and what happens to the keys. Later frames on the layer move with
+  the edge. Classic and shape tweens get longer or shorter the same way.
+* **Move a tween**: click a motion tween span to pick the whole span (Ctrl-click picks a single
+  frame), then drag it. A selection that covers whole classic or shape tween spans moves the
+  same way. The span keeps its length and its tween, and replaces what it lands on. The frames
+  it leaves become empty.
+* **Copy a tween**: hold **Alt** while you drag. The original stays where it was.
+* **Split Motion**: right-click a motion tween on any frame after its first and choose **Split
+  Motion**, or use **Modify › Timeline › Split Motion**. You get two tweens, and the object
+  moves exactly as it did before.
+* **Join Motion**: put the playhead on a motion tween that has another motion tween of the same
+  object right after it, and choose **Join Motion** from the right-click menu or **Modify ›
+  Timeline**. To join more than two, select frames across all of them first. Tweens you split
+  join back exactly as they were. Other tweens keep how the object looks on every frame. Join
+  Motion doesn't join two tweens with their own motion paths yet, and it won't join a keyframe
+  that has a sound or actions on it (move those first).
 
 ## Motion paths
 
@@ -198,8 +296,9 @@ Classic tweens can follow a path too, using a motion guide layer. See
 
 ## Tweens in Animate files
 
-When you open an Animate document, its classic tweens (with their eases), shape tweens and shape
-hints come across. Motion tweens and their motion paths don't come across from Animate files
+When you open an Animate document, its classic tweens (with their eases, custom eases of any
+number of points and eases set per property included), shape tweens and shape hints come
+across. Motion tweens and their motion paths don't come across from Animate files
 yet. See [Opening Animate files](opening-animate-files.md).
 
 ## Next steps

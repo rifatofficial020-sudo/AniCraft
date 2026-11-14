@@ -21,8 +21,11 @@ This page is generated from the editor's shortcut map, so it always matches the 
 | Selection | V | V |
 | Subselection | A | A |
 | Free Transform | Q | Q |
+| Asset Warp | Shift+Q | ⇧Q |
+| Gradient Transform | F | F |
 | Width | U | U |
 | Bone | M | M |
+| Bind | Shift+M | ⇧M |
 | Pen | P | P |
 | Text | T | T |
 | Pencil | Shift+Y | ⇧Y |
@@ -76,6 +79,14 @@ This page is generated from the editor's shortcut map, so it always matches the 
 | Action | Windows and Linux | macOS |
 |---|---|---|
 | Snapping › Snap to Objects | Ctrl+Shift+/, Ctrl+Shift+? | ⇧⌘/, ⇧⌘? |
+| Rulers | Ctrl+Alt+Shift+R | ⌥⇧⌘R |
+| Grid › Show Grid | Ctrl+' | ⌘' |
+| Grid › Snap to Grid | Ctrl+Shift+' | ⇧⌘' |
+| Grid › Edit Grid… | Ctrl+Alt+G | ⌥⌘G |
+| Guides › Show Guides | Ctrl+; | ⌘; |
+| Guides › Lock Guides | Ctrl+Alt+; | ⌥⌘; |
+| Guides › Snap to Guides | Ctrl+Shift+; | ⇧⌘; |
+| Guides › Edit Guides… | Ctrl+Alt+Shift+G | ⌥⇧⌘G |
 | Fit Stage in Window | Ctrl+2 | ⌘2 |
 | Onion Skin On / Off | Alt+Shift+O | ⌥⇧O |
 | Select All Frames | Ctrl+Alt+A | ⌥⌘A |
@@ -115,6 +126,8 @@ This page is generated from the editor's shortcut map, so it always matches the 
 | Arrange › Send to Back | Ctrl+Shift+Down | ⇧⌘↓ |
 | Convert to Symbol… | F8 | F8 |
 | Break Apart | Ctrl+B | ⌘B |
+| Group | Ctrl+G | ⌘G |
+| Ungroup | Ctrl+Shift+G | ⇧⌘G |
 | Transform › Rotate 90° CW | Ctrl+Shift+9 | ⇧⌘9 |
 | Transform › Rotate 90° CCW | Ctrl+Shift+7 | ⇧⌘7 |
 | Transform › Remove Transform | Ctrl+Shift+Z | ⇧⌘Z |

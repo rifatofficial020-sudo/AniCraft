@@ -87,7 +87,7 @@ fn bitmap_layer(id: u64, n: u32, bitmaps: &[Arc<Bitmap>], frames: u32) -> Arc<La
         let b = &bitmaps[i as usize % bitmaps.len()];
         let (x, y) = ((i % 20) as f32 * 64.0, (i / 20) as f32 * 72.0);
         let fill = Paint::Bitmap { bitmap: b.id, repeat: i % 3 == 0, matrix: Affine::translate(x, y).mul(&Affine::rotate(i as f32 * 0.1)).mul(&Affine::scale(0.4, 0.4)) };
-        let shape = Shape { merge: false, path: Arc::new(Path::ellipse(x + 40.0, y + 40.0, 60.0, 45.0)), fill: Some(fill), stroke: None, fill_rule: FillRule::NonZero };
+        let shape = Shape { merge: false, path: Arc::new(Path::ellipse(x + 40.0, y + 40.0, 60.0, 45.0)), fill: Some(fill), stroke: None, fill_rule: FillRule::NonZero, warp: None };
         k.elements.push(Arc::new(Element { id: ElementId(id * 10_000 + u64::from(i)), name: String::new(), transform: Affine::IDENTITY, color: ColorEffect::default(), kind: ElementKind::Shape(shape) }));
     }
     let mut l = Layer::new(LayerId(id), "Bitmaps");
@@ -115,13 +115,13 @@ fn filtered() -> Document {
         for k in &mut l.keyframes {
             for e in &mut Arc::make_mut(k).elements {
                 if let ElementKind::Symbol { filters, .. } = &mut Arc::make_mut(e).kind {
-                    *filters = match i {
+                    *filters = Vec::from_iter(match i {
                         0 => vec![
                             Filter::DropShadow { blur_x: 8.0, blur_y: 8.0, strength: 0.8, quality: 2, angle: 45.0, distance: 10.0, color: Rgba::BLACK, inner: false, knockout: false, hide_object: false },
                             Filter::Bevel { blur_x: 5.0, blur_y: 5.0, strength: 1.0, quality: 1, angle: 45.0, distance: 4.0, shadow_color: Rgba::BLACK, highlight_color: Rgba::WHITE, side: FilterSide::Inner, knockout: false },
                         ],
                         _ => vec![Filter::Glow { blur_x: 12.0, blur_y: 12.0, strength: 1.4, quality: 2, color: Rgba::new(1.0, 0.85, 0.2, 1.0), inner: false, knockout: false }],
-                    };
+                    }.into_iter().map(anicraft_doc::FilterEntry::from));
                 }
             }
         }
@@ -131,7 +131,7 @@ fn filtered() -> Document {
         let mut layer = bitmap_layer(91_000, 0, std::slice::from_ref(&sky), frames);
         let l = Arc::make_mut(&mut layer);
         let fill = Paint::Bitmap { bitmap: sky.id, repeat: true, matrix: Affine::scale(5.0, 5.0) };
-        let shape = Shape { merge: false, path: Arc::new(Path::rect(0.0, 0.0, 1280.0, 300.0)), fill: Some(fill), stroke: None, fill_rule: FillRule::NonZero };
+        let shape = Shape { merge: false, path: Arc::new(Path::rect(0.0, 0.0, 1280.0, 300.0)), fill: Some(fill), stroke: None, fill_rule: FillRule::NonZero, warp: None };
         if let Some(k) = l.keyframes.first_mut() {
             Arc::make_mut(k).elements.push(Arc::new(Element { id: ElementId(91_001), name: "sky".into(), transform: Affine::IDENTITY, color: ColorEffect::default(), kind: ElementKind::Shape(shape) }));
         }

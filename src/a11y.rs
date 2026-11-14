@@ -77,9 +77,10 @@ pub fn pointer_only() -> egui::Sense {
     egui::Sense::click_and_drag() - egui::Sense::FOCUSABLE
 }
 
-/// Names the resize handle egui puts on a panel (`Panel::…(id)`), which it leaves anonymous.
-pub fn name_splitter(ctx: &egui::Context, panel: &str, name: &str) {
-    ctx.accesskit_node_builder(Id::new(panel).with("__resize"), |node| {
+/// Names the resize handle egui puts on a panel (`Panel::…(id)`, its `id.with("__resize")`),
+/// which it leaves anonymous.
+pub fn name_resize(ctx: &egui::Context, id: Id, name: &str) {
+    ctx.accesskit_node_builder(id, |node| {
         node.set_role(egui::accesskit::Role::Splitter);
         node.set_label(name);
     });
@@ -144,56 +145,65 @@ pub fn with_key(name: &str, key: Option<&str>) -> String {
 
 // ----- panels and the keyboard -------------------------------------------------------------------
 
-/// The panels Ctrl+F6 moves keyboard focus between, in that order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The panels Ctrl+F6 moves keyboard focus between: the stage, each docked panel (ADR 0075),
+/// the tools.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Region {
     Stage,
-    Timeline,
-    Properties,
-    Library,
     Tools,
+    Panel(crate::dock::Panel),
 }
 
+#[allow(non_upper_case_globals)]
 impl Region {
-    pub const CYCLE: [Region; 5] = [Region::Stage, Region::Timeline, Region::Properties, Region::Library, Region::Tools];
+    pub const Timeline: Region = Region::Panel(crate::dock::Panel::Timeline);
+    #[cfg(test)]
+    pub const Properties: Region = Region::Panel(crate::dock::Panel::Properties);
+    #[cfg(test)]
+    pub const Library: Region = Region::Panel(crate::dock::Panel::Library);
 
     /// English (a key): translate where it is shown with `crate::i18n::t`.
     pub fn label(self) -> &'static str {
         match self {
             Region::Stage => tr_noop!("Stage"),
-            Region::Timeline => tr_noop!("Timeline"),
-            Region::Properties => tr_noop!("Properties"),
-            Region::Library => tr_noop!("Library"),
             Region::Tools => tr_noop!("Tools"),
+            Region::Panel(p) => p.label(),
         }
     }
 
     /// The stage and the timeline are where the work is: while their anchor has focus every
     /// shortcut, Enter (play) and the arrows (nudge) work as with nothing focused. The other
-    /// anchors are ordinary controls (a section header, the active tool).
+    /// anchors are ordinary controls (a panel's tab, the active tool).
     pub fn is_surface(self) -> bool {
-        matches!(self, Region::Stage | Region::Timeline)
+        matches!(self, Region::Stage) || self == Region::Timeline
     }
 
-    fn index(self) -> usize {
-        Region::CYCLE.iter().position(|r| *r == self).unwrap_or(0)
-    }
-
-    /// The next panel (`step` 1) or the previous one (`step` -1), wrapping around.
-    pub fn step(from: Option<Region>, forward: bool) -> Region {
-        let n = Region::CYCLE.len();
-        let i = match (from, forward) {
+    /// The next panel in `order` (`forward`) or the previous one, wrapping around.
+    pub fn step(order: &[Region], from: Option<Region>, forward: bool) -> Region {
+        let n = order.len().max(1);
+        let at = from.and_then(|r| order.iter().position(|o| *o == r));
+        let i = match (at, forward) {
             (None, true) => 0,
             (None, false) => n - 1,
-            (Some(r), true) => (r.index() + 1) % n,
-            (Some(r), false) => (r.index() + n - 1) % n,
+            (Some(i), true) => (i + 1) % n,
+            (Some(i), false) => (i + n - 1) % n,
         };
-        Region::CYCLE.get(i).copied().unwrap_or(Region::Stage)
+        order.get(i).copied().unwrap_or(Region::Stage)
     }
 
     fn key(self) -> Id {
-        Id::new(("a11y_region", self.index()))
+        Id::new(("a11y_region", self))
     }
+}
+
+/// Sets this frame's Ctrl+F6 order (the dock's, ADR 0075).
+pub fn set_order(ctx: &egui::Context, order: Vec<Region>) {
+    ctx.data_mut(|d| d.insert_temp(Id::new("a11y_region_order"), order));
+}
+
+/// The Ctrl+F6 order: the stage, the panels as docked, the tools.
+pub fn order(ctx: &egui::Context) -> Vec<Region> {
+    ctx.data(|d| d.get_temp::<Vec<Region>>(Id::new("a11y_region_order"))).unwrap_or_else(|| vec![Region::Stage, Region::Tools])
 }
 
 /// Where a panel is this frame and the widget that takes focus when Ctrl+F6 lands on it.
@@ -227,24 +237,26 @@ fn anchor_of(ctx: &egui::Context, region: Region) -> Option<Anchor> {
 /// The panel holding the focused widget, if any.
 pub fn focused_region(ctx: &egui::Context) -> Option<Region> {
     let id = ctx.memory(|m| m.focused())?;
-    if let Some(r) = Region::CYCLE.into_iter().find(|r| anchor_of(ctx, *r).is_some_and(|a| a.id == id)) {
+    let order = order(ctx);
+    if let Some(r) = order.iter().copied().find(|r| anchor_of(ctx, *r).is_some_and(|a| a.id == id)) {
         return Some(r);
     }
     let at = ctx.read_response(id)?.rect.center();
-    Region::CYCLE.into_iter().find(|r| anchor_of(ctx, *r).is_some_and(|a| a.rect.contains(at)))
+    order.into_iter().find(|r| anchor_of(ctx, *r).is_some_and(|a| a.rect.contains(at)))
 }
 
 /// Moves keyboard focus to the next or previous panel's anchor. Returns the panel, or `None`
 /// when no panel has drawn yet.
 pub fn cycle_focus(ctx: &egui::Context, from: Option<Region>, forward: bool) -> Option<Region> {
-    let mut region = Region::step(focused_region(ctx).or(from), forward);
-    // A panel that isn't on screen (the Motion Editor in place of the timeline) is skipped.
-    for _ in 0..Region::CYCLE.len() {
+    let order = order(ctx);
+    let mut region = Region::step(&order, focused_region(ctx).or(from), forward);
+    // A panel that isn't on screen (a tab behind another, a folded group) is skipped.
+    for _ in 0..order.len() {
         if let Some(a) = anchor_of(ctx, region) {
             ctx.memory_mut(|m| m.request_focus(a.id));
             return Some(region);
         }
-        region = Region::step(Some(region), forward);
+        region = Region::step(&order, Some(region), forward);
     }
     None
 }
@@ -266,7 +278,7 @@ pub fn keyboard(ctx: &egui::Context) -> Keyboard {
     if ctx.text_edit_focused() {
         return Keyboard::Text;
     }
-    if Region::CYCLE.into_iter().any(|r| r.is_surface() && anchor_of(ctx, r).is_some_and(|a| a.id == id)) {
+    if [Region::Stage, Region::Timeline].into_iter().any(|r| anchor_of(ctx, r).is_some_and(|a| a.id == id)) {
         return Keyboard::App;
     }
     Keyboard::Control
@@ -280,11 +292,13 @@ mod tests {
 
     #[test]
     fn region_cycle_wraps_both_ways() {
-        assert_eq!(Region::step(None, true), Region::Stage);
-        assert_eq!(Region::step(None, false), Region::Tools);
-        assert_eq!(Region::step(Some(Region::Tools), true), Region::Stage);
-        assert_eq!(Region::step(Some(Region::Stage), false), Region::Tools);
-        assert_eq!(Region::step(Some(Region::Timeline), true), Region::Properties);
+        let o = [Region::Stage, Region::Timeline, Region::Properties, Region::Library, Region::Tools];
+        assert_eq!(Region::step(&o, None, true), Region::Stage);
+        assert_eq!(Region::step(&o, None, false), Region::Tools);
+        assert_eq!(Region::step(&o, Some(Region::Tools), true), Region::Stage);
+        assert_eq!(Region::step(&o, Some(Region::Stage), false), Region::Tools);
+        assert_eq!(Region::step(&o, Some(Region::Timeline), true), Region::Properties);
+        assert_eq!(Region::step(&[], None, true), Region::Stage);
     }
 
     /// Scroll bars inside egui's scroll areas: screen readers scroll by moving focus, and egui
@@ -367,16 +381,73 @@ mod tests {
         assert_eq!((score.role(), score.value()), (Role::Label, Some("Hello, Ada Lovelace!")));
     }
 
+    /// Painted weights (ADR 0090) are reachable without a pointer: the brush and a point's weight
+    /// are named fields, the weight a number to type.
+    #[test]
+    fn shape_weights_are_named_numeric_fields() {
+        let (t, _, _) = tree(|a, _| a.open_panel(Some("shapeweights")));
+        for n in ["Paint Weights", "Weight brush size", "Weight brush strength", "Focused point", "Bone weight at the point"] {
+            assert!(t.nodes.iter().any(|(_, x)| x.label() == Some(n)), "no node named {n}");
+        }
+        let w = t.nodes.iter().map(|(_, x)| x).find(|x| x.label() == Some("Bone weight at the point")).expect("the weight field");
+        assert!(matches!(w.role(), Role::SpinButton | Role::Slider | Role::TextInput), "{:?}", w.role());
+    }
+
+    /// The layer footer (after #265 cut "Delete" short): icon buttons only, each named, side
+    /// by side inside the layer column at the default window size, none clipped or overlapping.
+    #[test]
+    fn the_layer_footer_buttons_fit_and_are_named() {
+        let (t, _, _) = tree(|_, _| {});
+        let names = ["New layer", "Delete layer", "New folder above the active layer (move layers in under it with Up and Down)", "Move layer up", "Move layer down"];
+        let rects: Vec<egui::accesskit::Rect> = names
+            .iter()
+            .map(|n| {
+                let node = t.nodes.iter().map(|(_, x)| x).find(|x| x.label() == Some(n)).unwrap_or_else(|| panic!("no footer button named {n}"));
+                assert_eq!(node.role(), Role::Button, "{n}");
+                node.bounds().unwrap_or_else(|| panic!("{n} has no bounds"))
+            })
+            .collect();
+        for (i, a) in rects.iter().enumerate() {
+            assert!(a.width() >= 20.0 && a.height() >= 20.0, "{} is too small: {a:?}", names[i]);
+            for (j, b) in rects.iter().enumerate().skip(i + 1) {
+                let apart = a.x1 <= b.x0 + 0.5 || b.x1 <= a.x0 + 0.5 || a.y1 <= b.y0 + 0.5 || b.y1 <= a.y0 + 0.5;
+                assert!(apart, "{} overlaps {}", names[i], names[j]);
+            }
+        }
+        // All on one row, New layer and Delete first.
+        assert!(rects.iter().all(|r| (r.y0 - rects[0].y0).abs() < 1.0));
+        assert!(rects[0].x0 < rects[1].x0 && rects[1].x1 < rects[2].x0);
+    }
+
     #[test]
     fn every_interactive_node_has_a_name_and_a_role() {
         let mut found = Vec::new();
         found.extend(check("default", |_, _| {}));
-        for tool in [Tool::Bone, Tool::Rect, Tool::Star, Tool::Text, Tool::Pencil, Tool::Brush, Tool::PaintBrush, Tool::Eraser, Tool::PaintBucket, Tool::InkBottle, Tool::Eyedropper, Tool::Pen] {
+        for tool in [Tool::Bone, Tool::Bind, Tool::Warp, Tool::Rect, Tool::Star, Tool::Text, Tool::Pencil, Tool::Brush, Tool::PaintBrush, Tool::Eraser, Tool::PaintBucket, Tool::InkBottle, Tool::Eyedropper, Tool::Pen] {
             found.extend(check(&format!("{tool:?} tool"), |a, _| a.tool = tool));
         }
-        for panel in ["select", "motion", "motionspan", "motionpath", "motionpoints", "motionedit", "motionpins", "motionpinsspan", "rawsub", "camera", "cameraview", "bones", "sound", "envelope", "prefs", "shortcuts", "palette", "about", "files", "licenses", "confirm", "recovery", "frames", "actions", "script", "scriptproblems", "testscript", "onion", "onionmenu", "editmultiple", "library", "librarymenu", "edittransform", "onionsymbol", "layerprops", "frameview", "layercolour", "timelinepolish", "convert", "mixed", "bitmap", "nineslice", "nineslicedit", "find", "explorer", "publish", "publishreport", "publishanim", "start", "drop", "droplibrary", "testmovie", "testmovieinside", "templates", "savetemplate", "droptimeline", "textfields", "testtext", "brushlibrary", "brushcurve", "paintbrush"] {
+        for panel in ["select", "motion", "motionspan", "motionpath", "motionpoints", "motionedit", "motionpins", "motionpinsspan", "rawsub", "camera", "cameraview", "bones", "springbones", "shapebones", "shapeweights", "warp", "sound", "envelope", "prefs", "shortcuts", "palette", "about", "files", "licenses", "confirm", "recovery", "frames", "actions", "script", "scriptproblems", "testscript", "onion", "onionmenu", "editmultiple", "library", "librarymenu", "edittransform", "onionsymbol", "layerprops", "frameview", "layercolour", "timelinepolish", "convert", "mixed", "bitmap", "nineslice", "nineslicedit", "find", "explorer", "publish", "publishreport", "publishanim", "start", "drop", "droplibrary", "testmovie", "testmovieinside", "templates", "savetemplate", "droptimeline", "textfields", "testtext", "softmask", "pathtext", "gradient", "gradientbucket", "swatches", "swatchpanel", "brushlibrary", "brushcurve", "paintbrush"] {
             found.extend(check(panel, |a, _| a.open_panel(Some(panel))));
         }
+        // Every panel in front where it docks, and floating (ADR 0075); the other workspaces.
+        for p in crate::dock::Panel::ALL {
+            found.extend(check(&format!("{p:?} panel"), |a, _| a.show_panel(p)));
+            found.extend(check(&format!("{p:?} floating"), |a, _| a.dock.move_to(p, crate::dock::Target::Float(None))));
+        }
+        found.extend(check("floating panel window", |a, ctx| {
+            ctx.set_embed_viewports(false);
+            a.dock.move_to(crate::dock::Panel::Colour, crate::dock::Target::Float(None));
+        }));
+        for w in ["animator", "designer"] {
+            found.extend(check(w, |a, _| a.switch_workspace(w)));
+        }
+        // Dockable panels, second slice (ADR 0087).
+        for state in ["dockicons", "floattabs", "docknarrow", "workspaces"] {
+            found.extend(check(state, |a, _| a.open_panel(Some(state))));
+        }
+        found.extend(check("tools above the stage", |a, _| a.dock.move_to(crate::dock::Panel::Tools, crate::dock::Target::Bar(crate::dock::Side::Top))));
+        found.extend(check("tools as a tab", |a, _| a.dock.move_to(crate::dock::Panel::Tools, crate::dock::Target::Stack(crate::dock::Panel::Library))));
+        found.extend(check("timeline above the stage", |a, _| a.dock.move_to(crate::dock::Panel::Timeline, crate::dock::Target::Split { side: crate::dock::Side::Top, before: None })));
         // Test Movie in a window of its own (ADR 0062): its controls, named in that window.
         found.extend(check("test movie window", |a, ctx| {
             ctx.set_embed_viewports(false);
@@ -407,6 +478,12 @@ mod tests {
         found.extend(check("motion editor colour rows", |a, _| {
             a.open_panel(Some("motionedit"));
             a.me_styles = vec![anicraft_engine::doc::ColorStyle::Tint, anicraft_engine::doc::ColorStyle::Advanced, anicraft_engine::doc::ColorStyle::Brightness];
+        }));
+        found.extend(check("light", |a, ctx| {
+            let mut p = a.prefs.clone();
+            p.theme = crate::theme::Palette::Light;
+            p.theme_follows_system = Some(false);
+            a.set_prefs(ctx, p);
         }));
         found.extend(check("high contrast at 200%", |a, ctx| {
             let mut p = a.prefs.clone();
@@ -441,10 +518,7 @@ mod tests {
         frame(&ctx, &mut app, press(egui::Key::Enter, egui::Modifiers::NONE));
         assert!(!app.playing, "Enter went to the focused header, not to play");
         // On the stage, Enter plays as usual.
-        for _ in 0..3 {
-            frame(&ctx, &mut app, press(egui::Key::F6, egui::Modifiers::COMMAND));
-            frame(&ctx, &mut app, input(1.0));
-        }
+        focus_stage(&ctx, &mut app);
         assert_eq!(focused_region(&ctx), Some(Region::Stage));
         frame(&ctx, &mut app, press(egui::Key::Enter, egui::Modifiers::NONE));
         assert!(app.playing, "Enter on the focused stage plays");
@@ -672,26 +746,68 @@ mod tests {
 
     #[test]
     fn the_palette_follows_the_system_contrast_setting_in_the_same_frame() {
+        use crate::platform::SystemLook;
+        use crate::theme::Palette;
+        let look = |high_contrast, dark| SystemLook { high_contrast, dark };
         let (_, mut app, ctx) = tree(|_, _| {});
-        app.set_system_contrast(&ctx, Some(true));
+        app.set_system_look(&ctx, look(Some(true), Some(true)));
         let followed = crate::theme::palette();
-        app.set_system_contrast(&ctx, Some(false));
+        app.set_system_look(&ctx, look(Some(false), Some(true)));
         let back = crate::theme::palette();
+        // The system switches its apps to light: the default look stays dark (#266)...
+        app.set_system_look(&ctx, look(Some(false), Some(false)));
+        let default_on_light = crate::theme::palette();
+        // ...and with Follow system chosen, so does the interface (ADR 0077), egui's own style
+        // with it.
+        let mut p = app.prefs.clone();
+        p.theme_follows_system = Some(true);
+        app.set_prefs(&ctx, p);
+        app.set_system_look(&ctx, look(Some(false), Some(false)));
+        let light = (crate::theme::palette(), ctx.global_style().visuals.panel_fill, ctx.global_style().visuals.dark_mode);
+        assert_eq!(default_on_light, Palette::Graphite);
         // Chosen by hand: the system's setting no longer changes it.
         let mut p = app.prefs.clone();
         p.theme_follows_system = Some(false);
         app.set_prefs(&ctx, p);
-        app.set_system_contrast(&ctx, Some(true));
+        app.set_system_look(&ctx, look(Some(true), Some(false)));
         let manual = crate::theme::palette();
-        crate::theme::apply_palette(&egui::Context::default(), crate::theme::Palette::Graphite);
-        assert_eq!((followed, back, manual), (crate::theme::Palette::HighContrast, crate::theme::Palette::Graphite, crate::theme::Palette::Graphite));
+        crate::theme::apply_palette(&egui::Context::default(), Palette::Graphite);
+        assert_eq!((followed, back, manual), (Palette::HighContrast, Palette::Graphite, Palette::Graphite));
+        assert_eq!(light, (Palette::Light, crate::theme::LIGHT.panel, false));
+    }
+
+    #[test]
+    fn choosing_a_theme_in_preferences_restyles_everything_in_the_same_frame() {
+        use crate::theme::{LIGHT, Palette, T};
+        let (_, mut app, ctx) = tree(|_, _| {});
+        for palette in [Palette::Light, Palette::HighContrast, Palette::Graphite] {
+            let mut p = app.prefs.clone();
+            p.theme = palette;
+            p.theme_follows_system = Some(false);
+            app.set_prefs(&ctx, p);
+            let tokens = palette.tokens();
+            // Tokens read from here on, egui's widgets, and both of egui's styles.
+            for theme in [egui::Theme::Dark, egui::Theme::Light] {
+                let v = ctx.style_of(theme).visuals.clone();
+                assert_eq!((v.panel_fill, v.window_fill, v.widgets.inactive.bg_fill, v.override_text_color), (tokens.panel, tokens.panel_alt, tokens.header, Some(tokens.text)), "{palette:?} in egui's {theme:?} style");
+            }
+            assert_eq!((crate::theme::palette(), T.panel, ctx.theme() == egui::Theme::Dark), (palette, tokens.panel, tokens.dark));
+        }
+        // The light look's controls carry their hairline; Graphite's stay flat.
+        app.set_prefs(&ctx, crate::prefs::Prefs { theme: Palette::Light, theme_follows_system: Some(false), ..app.prefs.clone() });
+        assert_eq!(ctx.global_style().visuals.widgets.inactive.bg_stroke.color, LIGHT.border);
+        crate::theme::apply_palette(&egui::Context::default(), Palette::Graphite);
     }
 
     #[test]
     fn ctrl_f6_moves_focus_through_the_panels_and_back() {
         let (_, mut app, ctx) = tree(|_, _| {});
         let mut seen = Vec::new();
-        for _ in 0..Region::CYCLE.len() {
+        // Each docked panel in Essentials is a stop (ADR 0075); the Motion Editor and the Movie
+        // Explorer are behind other tabs, so they are skipped.
+        use crate::dock::Panel as P;
+        let expect = [Region::Stage, Region::Timeline, Region::Properties, Region::Panel(P::Align), Region::Library, Region::Panel(P::History), Region::Tools];
+        for _ in 0..expect.len() {
             let mut i = input(1.0);
             i.events.push(egui::Event::Key { key: egui::Key::F6, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::COMMAND });
             frame(&ctx, &mut app, i);
@@ -702,11 +818,11 @@ mod tests {
             let expect = if at.is_some_and(Region::is_surface) { Keyboard::App } else { Keyboard::Control };
             assert_eq!(keyboard(&ctx), expect, "{at:?}");
         }
-        assert_eq!(seen, Region::CYCLE.map(Some).to_vec());
+        assert_eq!(seen, expect.map(Some).to_vec());
         let mut i = input(1.0);
         i.events.push(egui::Event::Key { key: egui::Key::F6, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::COMMAND | egui::Modifiers::SHIFT });
         frame(&ctx, &mut app, i);
         frame(&ctx, &mut app, input(1.0));
-        assert_eq!(focused_region(&ctx), Some(Region::Library), "Ctrl+Shift+F6 goes back");
+        assert_eq!(focused_region(&ctx), Some(Region::Panel(P::History)), "Ctrl+Shift+F6 goes back");
     }
 }

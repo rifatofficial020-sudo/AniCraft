@@ -5,6 +5,7 @@
 //! The web build (ADR 0036) is one more platform: the browser's file picker and downloads take
 //! the dialogs' place, its storage the settings folder's, and the glue lives in `web.rs`.
 
+use crate::prefs::WindowBackend;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -82,15 +83,92 @@ pub fn system_high_contrast() -> Option<bool> {
     }
 }
 
+/// What the system says about how interfaces should look (ADR 0064, ADR 0077), for Preferences ›
+/// Appearance › Follow system. Each part is `None` where this system doesn't say.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SystemLook {
+    /// More contrast asked for ([`system_high_contrast`]).
+    pub high_contrast: Option<bool>,
+    /// Dark mode on ([`system_dark_mode`]); `Some(false)`: light.
+    pub dark: Option<bool>,
+}
+
+/// Asks the system for both parts of its look. Can block for a moment: call it off the UI thread.
+pub fn system_look() -> SystemLook {
+    SystemLook { high_contrast: system_high_contrast(), dark: system_dark_mode() }
+}
+
+/// Whether the system's apps are set to dark (ADR 0077): Windows' "default app mode"
+/// (`AppsUseLightTheme`), macOS' Appearance (`AppleInterfaceStyle`, also while it switches
+/// automatically), the desktop portal's `color-scheme` on Linux (GNOME's own setting where there is
+/// no portal), the browser's `prefers-color-scheme`. `None`: this system doesn't say. Can block for
+/// a moment: call it off the UI thread.
+pub fn system_dark_mode() -> Option<bool> {
+    #[cfg(windows)]
+    {
+        let key = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER).open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize").ok()?; // i18n-exempt: a registry path
+        let light: u32 = key.get_value("AppsUseLightTheme").ok()?; // i18n-exempt: a registry value name
+        Some(light == 0)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // The key exists only while the appearance is dark; `defaults` fails when it is missing.
+        let out = std::process::Command::new("defaults").args(["read", "-g", "AppleInterfaceStyle"]).output().ok()?; // i18n-exempt: a command line
+        Some(out.status.success() && String::from_utf8_lossy(&out.stdout).trim().eq_ignore_ascii_case("dark"))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::window()?.match_media("(prefers-color-scheme: dark)").ok()??.matches().into() // i18n-exempt: a media query
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_arch = "wasm32")))]
+    {
+        portal_color_scheme().or_else(gnome_color_scheme)
+    }
+}
+
+/// The XDG desktop portal's `org.freedesktop.appearance color-scheme`: 1 prefers dark, 2 light,
+/// 0 says nothing.
+#[cfg(not(any(windows, target_os = "macos", target_arch = "wasm32")))]
+fn portal_color_scheme() -> Option<bool> {
+    portal_appearance("color-scheme").and_then(scheme_from_portal)
+}
+
+#[cfg_attr(any(windows, target_os = "macos", target_arch = "wasm32"), allow(dead_code))]
+fn scheme_from_portal(v: u32) -> Option<bool> {
+    match v {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
+
+/// GNOME's `color-scheme` (`'prefer-dark'`, `'prefer-light'`, `'default'`), for desktops without
+/// the portal setting.
+#[cfg(not(any(windows, target_os = "macos", target_arch = "wasm32")))]
+fn gnome_color_scheme() -> Option<bool> {
+    let out = std::process::Command::new("gsettings").args(["get", "org.gnome.desktop.interface", "color-scheme"]).output().ok().filter(|o| o.status.success())?; // i18n-exempt: a command line
+    match String::from_utf8_lossy(&out.stdout).trim().trim_matches('\'') {
+        "prefer-dark" => Some(true),
+        "prefer-light" => Some(false),
+        _ => None,
+    }
+}
+
 /// The XDG desktop portal's `org.freedesktop.appearance contrast` (1: high), through `gdbus`.
 #[cfg(not(any(windows, target_os = "macos", target_arch = "wasm32")))]
 fn portal_contrast() -> Option<bool> {
+    portal_appearance("contrast").map(|v| v == 1)
+}
+
+/// One `org.freedesktop.appearance` number from the desktop portal, through `gdbus`.
+#[cfg(not(any(windows, target_os = "macos", target_arch = "wasm32")))]
+fn portal_appearance(key: &str) -> Option<u32> {
     let out = std::process::Command::new("gdbus") // i18n-exempt: a command line
-        .args(["call", "--session", "--timeout", "1", "--dest", "org.freedesktop.portal.Desktop", "--object-path", "/org/freedesktop/portal/desktop", "--method", "org.freedesktop.portal.Settings.ReadOne", "org.freedesktop.appearance", "contrast"]) // i18n-exempt: a command line
+        .args(["call", "--session", "--timeout", "1", "--dest", "org.freedesktop.portal.Desktop", "--object-path", "/org/freedesktop/portal/desktop", "--method", "org.freedesktop.portal.Settings.ReadOne", "org.freedesktop.appearance", key]) // i18n-exempt: a command line
         .output()
         .ok()
         .filter(|o| o.status.success())?;
-    parse_portal_uint(&String::from_utf8_lossy(&out.stdout)).map(|v| v == 1)
+    parse_portal_uint(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// GNOME's own switch, for desktops without the portal setting.
@@ -331,9 +409,16 @@ pub const APP_ID: &str = "ai.storyteller.anicraft";
 pub fn viewport(b: egui::ViewportBuilder) -> egui::ViewportBuilder {
     // The Wayland app_id / X11 class: docks match it to the installed desktop entry
     // (packaging/linux/ai.storyteller.anicraft.desktop) for the icon and the launcher.
-    let b = b.with_app_id(APP_ID).with_icon(app_icon());
-    match OS {
-        Os::Mac => b.with_fullsize_content_view(true).with_title_shown(false),
+    chrome(OS, b.with_app_id(APP_ID).with_icon(app_icon()))
+}
+
+/// The window chrome for `os`. On macOS the content runs under the title bar, so the bar must be
+/// transparent too: an opaque one covers the menu row (File, Edit, …) and swallows its clicks,
+/// which left Mac users with no menus at all (#247).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+fn chrome(os: Os, b: egui::ViewportBuilder) -> egui::ViewportBuilder {
+    match os {
+        Os::Mac => b.with_fullsize_content_view(true).with_titlebar_shown(false).with_title_shown(false).with_titlebar_buttons_shown(true),
         _ => b,
     }
 }
@@ -539,14 +624,49 @@ pub fn is_system_argument(arg: &str) -> bool {
     arg.starts_with("-psn_")
 }
 
-/// Renderer requested by `--renderer` / `ANICRAFT_RENDERER` (`wgpu` or `gl`), if any.
+/// The window's graphics asked for by `--renderer` / `ANICRAFT_RENDERER`, if any: `gl`,
+/// `wgpu` (automatic), `vulkan`, `dx12` or `metal`. Before #207 the last three all meant `wgpu`.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn forced_renderer(arg: Option<&str>) -> Option<eframe::Renderer> {
+pub fn forced_backend(arg: Option<&str>) -> Option<WindowBackend> {
     let v = arg.map(str::to_owned).or_else(|| std::env::var("ANICRAFT_RENDERER").ok())?;
-    match v.to_ascii_lowercase().as_str() {
-        "gl" | "glow" | "opengl" => Some(eframe::Renderer::Glow),
-        "wgpu" | "vulkan" | "metal" | "dx12" => Some(eframe::Renderer::Wgpu),
+    match v.trim().to_ascii_lowercase().as_str() {
+        "gl" | "glow" | "opengl" => Some(WindowBackend::OpenGl),
+        "wgpu" | "auto" => Some(WindowBackend::Auto),
+        "vulkan" => Some(WindowBackend::Vulkan),
+        "dx12" | "d3d12" | "directx" => Some(WindowBackend::Dx12),
+        "metal" => Some(WindowBackend::Metal),
         _ => None,
+    }
+}
+
+/// The ways to open the window on `os`, in the order Automatic tries them (`startup`, #207):
+/// each a graphics interface and whether to ask for the low-power GPU. On a laptop with two
+/// GPUs (a Surface Book, most gaming laptops) the integrated one drives the display, so the
+/// second try is the system's own interface on it; OpenGL is the last resort everywhere.
+pub fn window_attempts(os: Os) -> Vec<(WindowBackend, bool)> {
+    match os {
+        Os::Windows => vec![(WindowBackend::Auto, false), (WindowBackend::Dx12, true), (WindowBackend::OpenGl, false)],
+        Os::Mac => vec![(WindowBackend::Auto, false), (WindowBackend::Metal, true), (WindowBackend::OpenGl, false)],
+        _ => vec![(WindowBackend::Auto, false), (WindowBackend::Vulkan, true), (WindowBackend::OpenGl, false)],
+    }
+}
+
+/// The window graphics Preferences offers on `os`.
+pub fn window_backends(os: Os) -> &'static [WindowBackend] {
+    match os {
+        Os::Windows => &[WindowBackend::Auto, WindowBackend::Dx12, WindowBackend::Vulkan, WindowBackend::OpenGl],
+        Os::Mac => &[WindowBackend::Auto, WindowBackend::Metal, WindowBackend::OpenGl],
+        Os::Web => &[],
+        _ => &[WindowBackend::Auto, WindowBackend::Vulkan, WindowBackend::OpenGl],
+    }
+}
+
+/// Where the start-up log goes (#207): `Logs` in the settings folder. `ANICRAFT_LOG_DIR`
+/// points it elsewhere (tests, portable installs).
+pub fn log_dir() -> Option<PathBuf> {
+    match std::env::var_os("ANICRAFT_LOG_DIR").filter(|v| !v.is_empty()) {
+        Some(d) => Some(PathBuf::from(d)),
+        None => config_dir().map(|d| d.join("Logs")), // i18n-exempt: a folder name
     }
 }
 
@@ -572,13 +692,16 @@ pub fn filters(cmd: &str) -> (&'static str, &'static [&'static str]) {
         "file.open" => (tr_noop!("Documents"), &["anicraft", "fla", "xfl"]),
         "plugin.install" => (tr_noop!("WebAssembly plug-in"), &["wasm"]),
         "brush.preset_export" | "brush.preset_import" => (tr_noop!("Brush set"), &["json"]),
+        "filter.preset_export" | "filter.preset_import" => (tr_noop!("Filter preset file"), &["json"]),
+        "swatch.export" => (tr_noop!("Swatch file"), &["json"]),
+        "swatch.import" => (tr_noop!("Swatch file or GIMP palette"), &["json", "gpl"]),
         _ => (tr_noop!("AniCraft document"), &["anicraft"]),
     }
 }
 
 /// Commands that read a file the user picks (the others write one, or a folder of them).
 pub fn reads_file(cmd: &str) -> bool {
-    matches!(cmd, "file.open" | "plugin.install" | "file.import" | "file.import_to_library" | "brush.preset_import")
+    matches!(cmd, "file.open" | "plugin.install" | "file.import" | "file.import_to_library" | "brush.preset_import" | "filter.preset_import" | "swatch.import")
 }
 
 /// Shows the platform's own dialog (Windows common dialog, macOS panel, Linux XDG portal), with
@@ -592,6 +715,17 @@ pub fn file_dialog(cmd: &str, title: &str, default_name: &str) -> Option<PathBuf
         "file.export_png_sequence" => d.pick_folder(),
         _ => d.add_filter(label, exts).set_file_name(default_name).save_file(),
     }
+}
+
+/// The platform's save dialog for a file type that isn't a command's (an exporter plug-in's,
+/// ADR 0088): `label` names it in the filter, `ext` without the dot. `None` when cancelled.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn save_dialog(title: &str, label: &str, ext: &str, dir: Option<&std::path::Path>, default_name: &str) -> Option<PathBuf> {
+    let mut d = rfd::FileDialog::new().set_title(title).add_filter(label, &[ext]).set_file_name(default_name);
+    if let Some(dir) = dir.filter(|d| d.is_dir()) {
+        d = d.set_directory(dir);
+    }
+    d.save_file()
 }
 
 /// In a browser: asks for a file with the browser's file picker. It arrives later through
@@ -637,6 +771,21 @@ pub fn set_unsaved(unsaved: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_mac_menu_row_is_never_under_an_opaque_title_bar() {
+        // #247: content under the title bar (full-size content view) with the bar still drawn
+        // hid File, Edit and the rest on macOS. Whenever content goes under it, it is see-through.
+        for os in [Os::Mac, Os::Windows, Os::Linux] {
+            let b = chrome(os, egui::ViewportBuilder::default());
+            if b.fullsize_content_view == Some(true) {
+                assert_eq!(b.titlebar_shown, Some(false), "{os:?}: the title bar would cover the menus");
+                assert_ne!(b.titlebar_buttons_shown, Some(false), "{os:?}: keep the traffic lights");
+            }
+        }
+        assert_eq!(chrome(Os::Mac, egui::ViewportBuilder::default()).fullsize_content_view, Some(true));
+        assert_eq!(chrome(Os::Windows, egui::ViewportBuilder::default()).fullsize_content_view, None, "native frame");
+    }
 
     #[test]
     fn the_desktop_runs_every_command() {
@@ -720,17 +869,36 @@ mod tests {
         assert_eq!(parse_portal_uint("(<uint32 0>,)
 "), Some(0));
         assert_eq!(parse_portal_uint("Error: no such key"), None);
+        // color-scheme: 1 dark, 2 light, 0 (no preference) and anything else say nothing.
+        assert_eq!([0, 1, 2, 7].map(scheme_from_portal), [None, Some(true), Some(false), None]);
     }
 
     #[test]
     fn the_system_contrast_setting_can_be_read_without_panicking() {
         // Whatever this machine says (or doesn't), asking never fails loudly.
         let _ = system_high_contrast();
+        let look = system_look();
+        assert_eq!(look.dark, system_dark_mode());
     }
 
     #[test]
     fn renderer_override() {
-        assert_eq!(forced_renderer(Some("gl")), Some(eframe::Renderer::Glow));
-        assert_eq!(forced_renderer(Some("WGPU")), Some(eframe::Renderer::Wgpu));
+        assert_eq!(forced_backend(Some("gl")), Some(WindowBackend::OpenGl));
+        assert_eq!(forced_backend(Some("WGPU")), Some(WindowBackend::Auto));
+        // #207: each interface is its own choice now, not just "wgpu".
+        assert_eq!(forced_backend(Some("dx12")), Some(WindowBackend::Dx12));
+        assert_eq!(forced_backend(Some("vulkan")), Some(WindowBackend::Vulkan));
+        assert_eq!(forced_backend(Some("metal")), Some(WindowBackend::Metal));
+    }
+
+    #[test]
+    fn every_platform_falls_back_to_opengl_and_offers_what_it_tries() {
+        for os in [Os::Windows, Os::Mac, Os::Linux, Os::Other] {
+            let tries = window_attempts(os);
+            assert_eq!(tries.first(), Some(&(WindowBackend::Auto, false)), "{os:?}");
+            assert_eq!(tries.last(), Some(&(WindowBackend::OpenGl, false)), "{os:?}: OpenGL is the last resort");
+            assert!(tries.iter().all(|(b, _)| window_backends(os).contains(b)), "{os:?}: Preferences offers each");
+        }
+        assert!(window_attempts(Os::Windows).contains(&(WindowBackend::Dx12, true)), "DirectX 12 on the integrated GPU");
     }
 }

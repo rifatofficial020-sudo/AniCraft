@@ -85,13 +85,23 @@ stage colour.
 ### Lottie
 
 A Lottie JSON animation for websites and apps. Shapes, strokes, solid and gradient fills,
-colour effects, opacity and masks come across, frame for frame. Some things can't be written
-exactly; the status bar names them after the export:
+colour effects, opacity and masks come across, and every frame shows what AniCraft shows.
+
+Tweens become Lottie keyframes with Lottie's own eases, so the file stays small and the motion
+is smooth on any screen: No Ease, Classic Ease, Quad, Cubic, Back and Bounce, Bézier handles
+and your custom curves come across exactly (a custom curve of several points becomes a key per
+piece). Objects that move, turn or scale keep their shape and move as a whole. Where Lottie
+has no matching ease (Elastic, Sine, Quart, Quint and Circ, motion along a curved guide, a
+tween inside a tweening symbol), that motion is written frame by frame instead: still exact at
+every frame, and the status bar says so.
+
+Some things can't be written exactly; the status bar names them after the export:
 
 * bitmaps and bitmap fills, and sound;
 * masks inside masks (the innermost is kept);
 * symbols fading as one (each shape fades on its own);
-* stretched round gradients (drawn as circles).
+* stretched round gradients (drawn as circles), gradient focal points (drawn centred),
+  reflected or repeated gradients (drawn extended) and linear-RGB gradients.
 
 ### HTML canvas
 
@@ -108,8 +118,12 @@ a server or send it as one file.
 * The movie fits the browser window and stays sharp on high-density screens. In Publish
   Settings you can turn off **Scale to the browser window**, turn off **Include sounds**, and set
   the **Page title**.
-* Filters, Subtract and Invert blending and plug-in frame scripts are left out of the page, and
-  9-slice symbols are scaled as a whole. The status bar lists what was left out.
+* Filters (Drop Shadow, Blur, Glow, Bevel, Gradient Glow, Gradient Bevel and Adjust Color) and
+  every blend mode look as they do in AniCraft. A filtered symbol that doesn't change is filtered
+  once; large filtered symbols that change every frame can slow the page down, as in any
+  browser movie, so keep animated filters small.
+* Plug-in frame scripts are left out of the page, and 9-slice symbols are scaled as a whole. The
+  status bar lists what was left out.
 
 ### Audio
 

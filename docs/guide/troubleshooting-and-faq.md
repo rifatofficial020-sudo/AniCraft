@@ -8,17 +8,26 @@ On macOS, press ⌘ where this guide says Ctrl, and ⌥ where it says Alt.
 ## The window won't open, or stays blank
 
 AniCraft draws its window with your graphics card through a modern graphics interface (Vulkan,
-Metal or Direct3D 12). If that fails to start, which happens on some older cards, virtual
-machines and Linux setups, AniCraft tries once more with OpenGL by itself.
+Metal or DirectX 12). If that fails to start, which happens on some older cards, laptops with two
+graphics chips, virtual machines and Linux setups, AniCraft tries the next way by itself: on
+Windows, DirectX 12 on the built-in graphics chip, and then OpenGL everywhere. If a graphics
+driver crashes or hangs while AniCraft starts, the next start tries that way last.
 
-If the window still opens blank or garbled, force OpenGL from a terminal:
+If no way works, AniCraft says so in a message and names its **start-up log**, a text file that
+records each way it tried and why it failed. Please attach it to your bug report. It is
+`anicraft.log` in the `Logs` folder of the [settings folder](#where-settings-live), with the
+previous run's beside it as `anicraft.previous.log`.
+
+If the window opens but flickers, goes black for a moment or looks garbled, choose another way
+in **Preferences › Stage › Window graphics** (for example **DirectX 12** or **OpenGL** on
+Windows) and restart AniCraft. From a terminal, the same choice is:
 
 ```sh
-anicraft --renderer gl
+anicraft --renderer gl        # or dx12, vulkan, metal
 ```
 
-To make that stick, set the environment variable `ANICRAFT_RENDERER=gl` for your account.
-`--renderer wgpu` (or `ANICRAFT_RENDERER=wgpu`) goes back to the default.
+To make it stick without Preferences, set the environment variable `ANICRAFT_RENDERER` for your
+account. `--renderer wgpu` (or `ANICRAFT_RENDERER=wgpu`) goes back to the automatic choice.
 
 ## The stage is slow, flickers or looks wrong
 
@@ -37,6 +46,27 @@ The same choices are in **View › Stage Rendering**. If the note says `ANICRAFT
 is set, that environment variable overrides Preferences; remove it to choose again.
 
 Exports always use the CPU renderer, so a stage problem never ends up in your files.
+
+## The graphics card stopped in the middle of my work
+
+Under heavy load (a game or a render running beside AniCraft, a very large scene) a graphics
+driver can stop answering or reset itself. AniCraft keeps going:
+
+* **The stage** switches to the CPU at once and the status bar says so. The picture is the same,
+  only slower on big scenes. AniCraft tries the graphics card again after a few seconds, then
+  after longer pauses (and sooner when you resize the window); the status bar says when it is
+  back. After several failures in a row the CPU keeps the stage for the rest of the session.
+* **A driver error** the window survives is written to the log, your unsaved work is autosaved
+  straight away, and the status bar says AniCraft carried on.
+* **If the window itself loses the graphics card**, AniCraft saves your work, closes the window
+  and opens it again a safer way (on Windows, DirectX 12 on the built-in graphics chip, then
+  OpenGL). The **Recover unsaved work** window offers your work back. The next three starts try
+  that safer way first too, then the fastest way gets its chance again.
+
+If it keeps happening, update the graphics driver, or choose another way in **Preferences ›
+Stage › Window graphics**. The log (`anicraft.log`, in the `Logs` folder of the
+[settings folder](#where-settings-live)) says what the driver reported; please attach it to a
+bug report.
 
 ## Fonts look different or are missing
 
@@ -102,7 +132,8 @@ in one settings folder. Its path is shown at the bottom of the Preferences windo
 | Web version | the browser's storage for the site |
 
 Inside it: `prefs.json` (preferences and shortcuts), `Recovery` (autosaved copies), `Templates`
-(your templates), `plugins` (installed plug-ins) and `Thumbnails` (start screen pictures).
+(your templates), `plugins` (installed plug-ins), `Thumbnails` (start screen pictures) and `Logs`
+(the start-up log).
 
 To start over with default preferences, quit AniCraft and rename or delete `prefs.json`. A
 damaged preferences file never stops AniCraft from starting: it falls back to the defaults.

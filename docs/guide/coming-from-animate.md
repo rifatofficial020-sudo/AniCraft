@@ -10,30 +10,32 @@ On macOS, press ⌘ where this guide says Ctrl, and ⌥ where it says Alt.
 
 ## Panels
 
-AniCraft keeps its panels docked in one fixed layout: tools on the left, the stage in the middle,
-Properties and the Library on the right, and the timeline at the bottom. You don't open or close
-most of them; they are always there.
+AniCraft opens with its panels docked as in Animate's Essentials: tools on the left, the stage
+in the middle, Properties and the Library on the right, and the timeline at the bottom. As in
+Animate, you drag a panel's tab to dock it elsewhere (the timeline above the stage, for
+example), stack it with other panels or float it, and **Window › Workspace** has Essentials,
+Animator and Designer, plus your own saved workspaces and Reset.
 
 | In Animate | In AniCraft |
 |---|---|
 | Tools | The tools column on the left. A drawing tool's options show at the top of Properties while it is active. |
 | Timeline | The timeline at the bottom (**Window › Timeline**). |
-| Properties | Properties on the right, always shown. |
+| Properties | Properties on the right (**Window › Properties**). |
 | Library | The Library on the right (**Window › Library**). |
 | Motion Editor | A tab beside the timeline (**Window › Motion Editor**). |
 | Actions (**F9**) | The Actions panel, same key (**Window › Actions**). |
 | Movie Explorer (**Alt+F3**) | Same key; a tab next to the Library (**Window › Movie Explorer**). |
-| Output | The Output panel inside Test Movie. |
-| Align | The Align section on the right, and **Modify › Align**. |
-| History | The History section on the right. |
-| Color and Swatches | The Fill and Stroke rows in Properties, and in each drawing tool's options. |
+| Output | The Output panel inside Test Movie, and **Window › Output**, which keeps the last run's lines. |
+| Align | The Align panel on the right, and **Modify › Align**. |
+| History | The History panel on the right. |
+| Color and Swatches | **Window › Colour** (stroke and fill, Swap, Black and White). Click the Fill or Stroke squares in the Tools panel, the Colour panel, or any colour swatch in Properties: web-safe swatches, a mixer and a hex field. The fill's picker also sets its type (None, Solid, Linear, Radial, Bitmap) and a gradient's stops, overflow and Linear RGB, like the Color panel. **Window › Swatches** keeps the document's colours and gradients (click applies to the active stroke or fill, drag to reorder, import and export swatch files and GIMP `.gpl` palettes; not Adobe `.aco`/`.ase`/`.clr`). |
 | Transform and Info | Position, scale and rotation rows in Properties, and the Free Transform tool. |
 | Scene | The scene menu at the top left of the stage, **Insert › Scene** and **Modify › Scene**. |
 | Find and Replace | **Edit › Find and Replace** (**Ctrl+F**). |
 | Publish Settings | **File › Publish Settings…** (**Ctrl+Shift+F12**). |
 
-Not in AniCraft yet: saved workspaces and rearranging panels, Components, Code Snippets and the
-Assets panel. See [The workspace](workspace.md) for a tour.
+Not in AniCraft yet: Components, Code Snippets, the Assets panel, and moving the Tools panel.
+See [The workspace](workspace.md) for a tour.
 
 ## Tools and their keys
 
@@ -44,8 +46,10 @@ Each tool has the key you already know.
 | Selection | **V** | Selects raw strokes and fills with the dot pattern; drag an edge to bend it. |
 | Subselection | **A** | Points and handles, on raw drawings and drawing objects. |
 | Free Transform | **Q** | Scale, rotate and move; Shift and Alt as you'd expect. |
+| Gradient Transform | **F** | Its own button (no flyouts yet). Gradient and bitmap fills, with Lock Fill. |
 | Width | **U** | Variable-width strokes, with profiles in Properties. |
-| Bone | **M** | Joins symbol instances into an armature. |
+| Bone | **M** | Joins symbol instances into an armature, or draws bones inside a shape. |
+| Bind | **Shift+M** | Chooses which points of a shape follow which bone. |
 | Pen | **P** | Alt-click adds a point to a path. |
 | Text | **T** | Static, dynamic and input text. |
 | Pencil | **Shift+Y** | Smooth, Straighten and Ink modes. |
@@ -63,7 +67,7 @@ Each tool has the key you already know.
 | Zoom | **Z** | |
 | Object Drawing | **J** | Toggles between merge drawing and drawing objects. |
 
-Not in AniCraft yet: the Lasso, Polygon and Magic Wand tools, Gradient Transform, the 3D tools,
+Not in AniCraft yet: the Lasso, Polygon and Magic Wand tools, the 3D tools,
 Asset Warp, the Paint Brush and Fluid Brush, Deco and the Spray Brush. More on the tools in
 [Drawing](drawing.md).
 
@@ -110,11 +114,12 @@ frame, and **Shift+PageUp** and **Shift+PageDown** for the previous and next sce
 
 * **Ctrl+K** opens AniCraft's command palette, which finds any command by name. Align is always on
   the right, and on **Ctrl+Alt+1** to **6**.
-* **Ctrl+G** and **Ctrl+Shift+G**: AniCraft has no groups yet. Use a graphic symbol (**F8**), or
-  draw with Object Drawing (**J**) to keep shapes apart.
+* **Ctrl+G** and **Ctrl+Shift+G** group and ungroup, as in Animate. A drawing object that
+  mixes colours, such as the result of a Union, is a group in AniCraft: double-click it to edit
+  inside.
 * **Ctrl+F8** (New Symbol): not there yet. Draw something and convert it with **F8**.
 * **Ctrl+J** (Document Settings): it is **Modify › Document Settings**, with no key by default.
-* Panel toggles such as **Ctrl+L** for the Library aren't needed, because the panels are docked.
+* Panel toggles such as **Ctrl+L** for the Library have no key yet; use the **Window** menu.
 * **Ctrl+0** fits the stage in the window and **Ctrl+1** shows it at 100 %.
 
 Any key can be changed in **Help › Keyboard Shortcuts** (**F1**), so you can bring back a habit
@@ -187,9 +192,10 @@ ActionScript 1.0 and 2.0, and scripts placed on instances. See [Interactivity](i
 
 Besides the tools and keys above, these are still to come:
 
-* groups, saved workspaces and several open documents at once;
+* saved workspaces and several open documents at once;
+* Envelope and Delete Envelope, and editing a multi-colour drawing object without opening it;
 * motion tweens and bones from Animate documents;
-* shape armatures, spring and joint translation for bones;
+* spring and joint translation for bones, and armatures mixing symbols and shapes;
 * the Brush's Paint Selection and Paint Inside modes, pressure curves and a brush library;
 * per-character text styles and text on a path;
 * full screen and zoom in Test Movie;

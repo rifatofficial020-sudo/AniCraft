@@ -212,6 +212,8 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
         info["kept"] = json!(report.kept);
         info["runs"] = json!(report.runs);
         info["missing_fonts"] = json!(report.missing_fonts);
+        // The sounds and videos that didn't come across, by name and why (ADR 0086).
+        info["named"] = json!(report.names);
         info["merged_keyframes"] = json!(merged);
         return Ok(info);
     }
@@ -384,6 +386,7 @@ pub(crate) fn import_to_stage(s: &mut Session, p: &Value) -> Result<Value> {
                 let mut ml = new_layer(s, label, anicraft_doc::LayerKind::Mask, Some(fid));
                 // Mask layers are locked, as Animate keeps them: the mask shows, its edge hides.
                 ml.locked = true;
+                ml.mask_mode = mask.mode;
                 ml.keyframes = keys(elements(s, mask.elements));
                 inside = Some(ml.id);
                 stack.push(ml);
@@ -396,7 +399,7 @@ pub(crate) fn import_to_stage(s: &mut Session, p: &Value) -> Result<Value> {
             cl.keyframes = keys(els);
             stack.push(cl);
         }
-        let tl = crate::editing::edited_mut(&mut s.doc, s.scene, &s.editing);
+        let tl = crate::editing::edited_mut(&mut s.doc, s.scene, &s.editing)?;
         for (k, l) in stack.into_iter().enumerate() {
             tl.layers.insert((at + k).min(tl.layers.len()), Arc::new(l));
         }
@@ -469,6 +472,7 @@ pub(crate) fn import_svg_symbol(s: &mut Session, path: &std::path::Path, name: O
             let mut ml = Layer::new(LayerId(s.doc.alloc_id()), if mask.name.is_empty() { "Mask".to_string() } else { mask.name.clone() });
             ml.kind = LayerKind::Mask;
             ml.locked = true;
+            ml.mask_mode = mask.mode;
             ml.keyframes = one_key(elements(s, mask.elements));
             parent = Some(ml.id);
             layers.push(Arc::new(ml));
@@ -503,6 +507,7 @@ fn import_image(s: &mut Session, path: &std::path::Path, bytes: Vec<u8>) -> Resu
         stroke: None,
         fill_rule: anicraft_geom::FillRule::NonZero,
         merge: false,
+        warp: None,
     };
     Ok(anicraft_svg::SvgImport::single(w, h, vec![anicraft_svg::ImportedElement { name, transform: anicraft_geom::Affine::IDENTITY, alpha: 1.0, kind: anicraft_doc::ElementKind::Shape(shape) }]))
 }
@@ -787,7 +792,8 @@ pub fn gif_delays(frames: usize, fps: f32) -> Vec<u16> {
         .collect()
 }
 
-/// The movie as a Lottie (JSON) animation, frame-accurate (see `anicraft_render::lottie`).
+/// The movie as a Lottie (JSON) animation, keyed with eases and equal to `evaluate` at every
+/// frame (see `anicraft_render::lottie`, ADR 0089).
 fn export_lottie(s: &mut Session, p: &Value) -> Result<Value> {
     let path = PathBuf::from(str_req(p, "path")?);
     let last = s.doc.frame_count().saturating_sub(1);

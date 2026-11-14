@@ -422,10 +422,13 @@ fn preferences(app: &mut App, ctx: &egui::Context) {
                             let was = if p.follows_system() { None } else { Some(p.theme) };
                             let mut choice = was;
                             crate::theme::radio_value(ui, &mut choice, None, text(Type::Body, tr!("Follow system")));
-                            let says = match app.system_contrast {
-                                Some(true) => tr!("High contrast while the system asks for more contrast (it does now), graphite otherwise."),
-                                Some(false) => tr!("High contrast while the system asks for more contrast (it doesn't now), graphite otherwise."),
-                                None => tr!("High contrast while the system asks for more contrast, graphite otherwise. This system doesn't say, so it is graphite."),
+                            // What following would show now, and why (ADR 0064, ADR 0077).
+                            let look = app.system_look;
+                            let says = match (look.high_contrast, look.dark) {
+                                (Some(true), _) => tr!("Light or dark as your system's apps are, and high contrast while it asks for more contrast. It does now, so it is high contrast."),
+                                (_, Some(false)) => tr!("Light or dark as your system's apps are, and high contrast while it asks for more contrast. Your system is light now."),
+                                (_, Some(true)) => tr!("Light or dark as your system's apps are, and high contrast while it asks for more contrast. Your system is dark now."),
+                                (_, None) => tr!("Light or dark as your system's apps are, and high contrast while it asks for more contrast. This system doesn't say whether it is light, so it is dark."),
                             };
                             form_note(ui, toggle_indent, text(Type::Caption, says));
                             ui.add_space(2.0);
@@ -503,12 +506,34 @@ fn preferences(app: &mut App, ctx: &egui::Context) {
                             State::Running { adapter, direct: true } => Some(tr!("Drawing on {adapter}, straight into the window.", adapter = adapter)),
                             State::Running { adapter, direct: false } => Some(tr!("Drawing on {adapter}, then copied to the window (slower: the window's graphics device can't be shared).", adapter = adapter)),
                             State::Failed(why) => Some(tr!("The graphics card can't draw the stage, so the CPU does: {why}", why = why)),
+                            State::Stopped { why, retry_at: Some(_) } => Some(tr!("The graphics card stopped drawing the stage, so the CPU does for now; AniCraft tries the graphics card again soon. It said: {why}", why = why)),
+                            State::Stopped { why, retry_at: None } => Some(tr!("The graphics card stopped drawing the stage, so the CPU does for the rest of this session. It said: {why}", why = why)),
                         };
                         if crate::gpu_stage::wanted(p.stage_renderer) != p.stage_renderer {
                             form_note(ui, LW, text(Type::Caption, tr!("ANICRAFT_STAGE_RENDERER is set, and it takes precedence over this choice.")));
                         }
                         if let Some(s) = status {
                             form_note(ui, LW, text(Type::Caption, s));
+                        }
+                    }
+                    // How the window itself is drawn (#207, #255): read when AniCraft starts.
+                    let backends = crate::platform::window_backends(crate::platform::OS);
+                    if !backends.is_empty() {
+                        ui.add_space(4.0);
+                        form_row(ui, LW, tr!("Window graphics"), |ui| {
+                            ui.vertical(|ui| {
+                                for &choice in backends {
+                                    let (name, tip) = choice.describe();
+                                    crate::theme::radio_value(ui, &mut p.window_backend, choice, text(Type::Body, crate::i18n::t(name)));
+                                    form_note(ui, toggle_indent, text(Type::Caption, crate::i18n::t(tip)));
+                                    ui.add_space(2.0);
+                                }
+                            });
+                        });
+                        form_note(ui, LW, text(Type::Caption, tr!("A change takes effect the next time AniCraft starts. If a way doesn't work, AniCraft starts with the next one.")));
+                        if let Some(log) = crate::startup::log_path() {
+                            form_note(ui, LW, text(Type::Caption, tr!("If AniCraft has trouble starting, this start-up log says why (attach it to a bug report):")));
+                            form_note(ui, LW, text(Type::Path, log.display().to_string()));
                         }
                     }
                 });

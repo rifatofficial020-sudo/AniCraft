@@ -427,8 +427,13 @@ fn enabled(app: &App, id: &str) -> bool {
         "scene.delete" => app.s.doc.scenes.len() > 1,
         // Ctrl+E opens the selected instance, or goes back to the document (ADR 0045).
         "symbol.exit" => !app.s.editing.is_empty(),
-        "symbol.edit" => !app.s.editing.is_empty() || app.s.selected_elements().iter().any(|(_, e)| matches!(e.kind, anicraft_engine::doc::ElementKind::Symbol { .. })),
+        "symbol.edit" => !app.s.editing.is_empty() || app.s.selected_elements().iter().any(|(_, e)| anicraft_engine::editing::opens(e)),
+        // Groups and Combine Objects (ADR 0073).
+        "modify.group" => !app.s.selection.is_empty(),
+        "modify.ungroup" => app.s.selected_elements().iter().any(|(_, e)| matches!(e.kind, anicraft_engine::doc::ElementKind::Group { .. })),
+        "modify.union" | "modify.intersect" | "modify.punch" | "modify.crop" => app.s.selected_elements().iter().filter(|(_, e)| matches!(e.kind, anicraft_engine::doc::ElementKind::Shape(_))).count() >= 2,
         "scene.prev" | "scene.move_up" => app.s.scene > 0,
+        "view.guides_clear" => !app.s.guides().is_empty(),
         "scene.next" | "scene.move_down" => app.s.scene + 1 < app.s.doc.scenes.len(),
         "timeline.clear_keyframe" => match app.frame_sel {
             Some(sel) => sel.has_keys(&app.s.timeline().layers),
@@ -447,6 +452,14 @@ fn checked(app: &App, id: &str) -> Option<bool> {
     match id {
         "draw.snap_to_objects" => Some(app.s.style.snap_objects),
         "draw.object_drawing" => Some(app.s.style.object_drawing),
+        // Rulers, grid and guides (ADR 0076).
+        "view.rulers" => Some(app.s.aids.rulers),
+        "view.grid_show" => Some(app.s.aids.show_grid),
+        "view.grid_snap" => Some(app.s.aids.snap_grid),
+        "view.guides_show" => Some(app.s.aids.show_guides),
+        "view.guides_lock" => Some(app.s.aids.lock_guides),
+        "view.guides_snap" => Some(app.s.aids.snap_guides),
+        "view.snap_pixels" => Some(app.s.aids.snap_pixels),
         _ => None,
     }
 }
@@ -548,6 +561,17 @@ fn registry_items(app: &mut App, ui: &mut egui::Ui, top: &str, cmds: &[CommandSp
             for spec in cmds.iter().filter(|c| c.menu == path) {
                 item(app, ui, spec);
             }
+            // View › Snapping also has Snap to Grid and Snap to Guides, where Animate users
+            // look for them (ADR 0076); they live in View › Grid and View › Guides too.
+            // Exporter plug-ins' formats, below the built-in ones (ADR 0088).
+            if path == "File/Export" {
+                crate::plugin_export_ui::menu_items(app, ui);
+            }
+            if path == "View/Snapping" {
+                for id in ["view.grid_snap", "view.guides_snap"] {
+                    cmd_item(app, ui, id);
+                }
+            }
         });
     }
 }
@@ -604,6 +628,9 @@ pub(crate) fn menu_contents(app: &mut App, ui: &mut egui::Ui, top: &str, cmds: &
                 crate::onion::toggle_edit_multiple(app);
             }
             ui.menu_button(tr!("Onion Skin Options"), |ui| crate::onion::menu(app, ui));
+            if ui_item(ui, tr!("Clip Content Outside the Stage"), "", Some(app.view.clip_to_stage)) {
+                app.view.clip_to_stage = !app.view.clip_to_stage;
+            }
             if ui_item(ui, tr!("Preview Through Camera"), "", Some(app.camera_preview)) {
                 app.toggle_camera_preview();
             }
@@ -643,22 +670,43 @@ pub(crate) fn menu_contents(app: &mut App, ui: &mut egui::Ui, top: &str, cmds: &
             }
         }
         "Window" => {
-            use crate::app::BottomTab;
-            if ui_item(ui, tr!("Timeline"), "", Some(app.bottom == BottomTab::Timeline)) {
-                app.bottom = BottomTab::Timeline;
-            }
-            if ui_item(ui, tr!("Motion Editor"), "", Some(app.bottom == BottomTab::MotionEditor)) {
-                app.bottom = BottomTab::MotionEditor;
-            }
-            if ui_item(ui, tr!("Actions"), app.keymap.primary("view.actions").unwrap_or(""), Some(app.show_actions)) {
-                app.show_actions = !app.show_actions;
-            }
-            use crate::movie_explorer::DockTab;
-            if ui_item(ui, tr!("Library"), "", Some(app.explorer.tab == DockTab::Library)) {
-                app.explorer.tab = DockTab::Library;
-            }
-            if ui_item(ui, tr!("Movie Explorer"), app.keymap.primary("view.movie_explorer").unwrap_or(""), Some(app.explorer.tab == DockTab::Explorer)) {
-                crate::movie_explorer::open(app);
+            // Workspaces (ADR 0075): the built-in ones, yours, Save and Reset.
+            ui.menu_button(tr!("Workspace"), |ui| {
+                let current = app.prefs.workspaces.current.clone();
+                for key in app.prefs.workspaces.keys() {
+                    let name = crate::i18n::t_dyn(crate::dock::Workspaces::name(&key)).into_owned();
+                    if ui_item(ui, &name, "", Some(key == current)) && key != current {
+                        app.switch_workspace(&key);
+                    }
+                }
+                ui.separator();
+                if ui_item(ui, tr!("Save Workspace…"), "", None) {
+                    app.prompt = Some(crate::app::Prompt { title: tr_noop!("Save Workspace"), cmd: "view.save_workspace", key: "name", text: String::new(), focus: true });
+                }
+                if ui_item(ui, tr!("Manage Workspaces…"), "", None) {
+                    crate::workspaces_window::open(app);
+                }
+                let name = crate::i18n::t_dyn(crate::dock::Workspaces::name(&current)).into_owned();
+                if ui_item(ui, &tr!("Reset “{name}”", name = name), "", None) {
+                    app.reset_workspace();
+                }
+            });
+            ui.separator();
+            // Every panel: ticked while it is in front; choosing one brings it forward, or
+            // closes it when it already is.
+            for p in crate::dock::Panel::ALL {
+                let key = match p {
+                    crate::dock::Panel::Actions => app.keymap.primary("view.actions").unwrap_or(""),
+                    crate::dock::Panel::MovieExplorer => app.keymap.primary("view.movie_explorer").unwrap_or(""),
+                    _ => "",
+                };
+                if ui_item(ui, crate::i18n::t(p.label()), key, Some(app.panel_visible(p))) {
+                    if p == crate::dock::Panel::MovieExplorer && !app.panel_visible(p) {
+                        crate::movie_explorer::open(app);
+                    } else {
+                        app.toggle_panel(p);
+                    }
+                }
             }
             // Brush presets with previews, and your own (ADR 0068).
             if ui_item(ui, tr!("Brush Library"), "", Some(app.brush_lib.open)) {
@@ -668,7 +716,7 @@ pub(crate) fn menu_contents(app: &mut App, ui: &mut egui::Ui, top: &str, cmds: &
             if ui_item(ui, tr!("Onion Skin"), "", Some(app.onion.ghosts)) {
                 crate::onion::toggle_ghosts(app);
             }
-            ui.label(text(Type::Caption, tr!("Panels are docked: Tools, Stage, Timeline, Properties, Library and Movie Explorer")));
+            ui.label(text(Type::Caption, tr!("Drag a panel's tab to dock it on any side, stack it with others or float it")));
         }
         "Help" => {
             if ui_item(ui, tr!("User Guide"), "", None) {
