@@ -521,6 +521,10 @@ pub struct App {
     pub close_after_save: bool,
     pub prefs: prefs::Prefs,
     pub show_prefs: bool,
+    /// This copy as an AppImage, and its applications menu entry (ADR 0094); `None` elsewhere.
+    pub desktop: Option<crate::desktop_ui::Desktop>,
+    /// Preferences scrolls to About when it next opens (`--open prefsabout`).
+    pub prefs_to_about: bool,
     /// Installed fonts, scanned off the UI thread on first need.
     pub system_fonts: Option<std::sync::Arc<prefs::SystemFonts>>,
     fonts_rx: Option<std::sync::mpsc::Receiver<prefs::SystemFonts>>,
@@ -762,6 +766,8 @@ impl App {
             close_after_save: false,
             prefs,
             show_prefs: false,
+            desktop: None,
+            prefs_to_about: false,
             system_fonts: None,
             fonts_rx: None,
             glyph_check: true,
@@ -799,6 +805,8 @@ impl App {
             app.status_err(e);
         }
         crate::plugins_ui::load_at_start(&mut app);
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::desktop_ui::at_start(&mut app);
         app
     }
 
@@ -954,6 +962,15 @@ impl App {
     }
 
     /// Changes preferences: applies them live and saves them.
+    /// Writes the preferences as they are (a setting changed in place, such as the volume).
+    pub fn save_prefs(&mut self) {
+        if self.shot.is_none()
+            && let Err(e) = self.prefs.save()
+        {
+            self.status_err(tr!("Could not save preferences: {e}", e = e));
+        }
+    }
+
     pub fn set_prefs(&mut self, ctx: &egui::Context, p: prefs::Prefs) {
         let p = p.sanitized();
         if p == self.prefs {
@@ -1274,6 +1291,18 @@ impl App {
             Some("prefs") => {
                 self.show_prefs = true;
                 self.scan_system_fonts();
+            }
+            Some(which @ ("prefsabout" | "desktopoffer")) => {
+                // Preferences › About and the AppImage offer (ADR 0094), on a made-up AppImage in
+                // the temporary folder, so they show on any OS.
+                if let Some(d) = crate::desktop_ui::sample(which) {
+                    let _ = std::fs::remove_dir_all(&d.data_home);
+                    crate::desktop_ui::start_with(self, d, false);
+                }
+                if which == "prefsabout" {
+                    self.open_prefs();
+                    self.prefs_to_about = true;
+                }
             }
             Some("confirm") => self.request("layer.delete", json!({})),
             Some("libraryfolders") => {
@@ -3067,10 +3096,16 @@ impl App {
         }
     }
 
-    /// Scrubbing: a moved playhead plays a frame's worth of the stream sounds there.
+    /// The monitor volume from the preferences (0 while muted): playback only, never exports.
+    pub fn playback_volume(&self) -> f32 {
+        if self.prefs.sound_muted { 0.0 } else { self.prefs.sound_volume.clamp(0.0, 1.0) }
+    }
+
+    /// Scrubbing (a preference, ADR 0095): a moved playhead plays a short slice of the stream
+    /// sounds there.
     fn scrub_sound(&mut self) {
         let here = (self.s.scene, self.s.frame);
-        if !self.playing && self.shot.is_none() && self.heard.is_some_and(|h| h != here) {
+        if !self.playing && self.shot.is_none() && self.prefs.audio_scrubbing && self.heard.is_some_and(|h| h != here) {
             self.sound.scrub(&self.s.doc, self.s.state, self.movie_frame());
         }
         self.heard = Some(here);
@@ -3092,13 +3127,17 @@ impl App {
             if let Some(mf) = self.sound.frame(self.s.doc.stage.fps) {
                 let local = mf.saturating_sub(self.s.doc.scene_start(self.s.scene));
                 if local >= n {
+                    // Event sounds play to their end (ADR 0095): round a loop they carry on
+                    // under the new pass; at the end they play out after the playhead stops.
                     if self.looping {
                         self.s.set_frame(0);
-                        self.start_sound();
+                        let mf = self.movie_frame();
+                        self.sound.wrap(&self.s.doc, self.s.state, mf);
                     } else {
                         self.s.set_frame(n.saturating_sub(1));
                         self.playing = false;
-                        self.start_sound();
+                        self.audio_clock = false;
+                        self.sound.finish();
                     }
                 } else if local != self.s.frame {
                     self.s.set_frame(local);
@@ -3107,9 +3146,14 @@ impl App {
                 ctx.request_repaint();
                 return;
             }
-            // The device went away: carry on silently on the wall clock.
+            // The device went away: carry on silently on the wall clock (said once; the
+            // next play opens the device again).
             self.audio_clock = false;
             self.play_acc = 0.0;
+            self.sound.check();
+            if let Some(e) = self.sound.error.take() {
+                self.status_err(tr!("Playing without sound: {e}", e = e));
+            }
         }
         let fps = f64::from(self.s.doc.stage.fps.max(1.0));
         self.play_acc += f64::from(ctx.input(|i| i.stable_dt)).min(0.25);
@@ -3675,6 +3719,8 @@ impl App {
         crate::warp_tool::upkeep(self);
         // An open button shows its hit area over its other states, in the theme's colour (ADR 0057).
         self.s.hit_area = Some(theme::hit_area());
+        let volume = self.playback_volume();
+        self.sound.set_volume(volume);
         self.tick_playback(&ctx);
         self.scrub_sound();
         self.update_title(&ctx);
@@ -3717,6 +3763,7 @@ impl App {
         self.about_window(&ctx);
         dialogs::show_all(self, &ctx);
         autosave::window(self, &ctx);
+        crate::desktop_ui::offer(self, &ctx);
         crate::plugins_ui::show(self, &ctx);
         crate::plugin_export_ui::show(self, &ctx);
         crate::dock_float::floating(self, &ctx);

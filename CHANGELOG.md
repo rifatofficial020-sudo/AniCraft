@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+* **Sound output polish** (ADR 0095, M5).
+  * The playhead follows the sound being **heard**: the device's latency is taken off and slow
+    frames are dropped rather than drifting (within a frame over an hour of play in tests).
+  * **Event sounds play to their end** when Loop Playback goes round and after the playhead stops
+    on the last frame; pressing Enter stops all sound.
+  * **Volume and mute** in the timeline header (also **Control › Mute Sounds** and **Preferences ›
+    Sound**): for listening only, kept in your preferences, never in exports.
+  * **Control › Audio Scrubbing** turns scrubbing off or on; a scrub plays at least 1/20 s.
+  * No sound device, or one unplugged mid-play, never crashes: playback carries on silently with a
+    notice and a log line, and the next play opens the device again.
+  * The **web version plays sound** through Web Audio.
+* **Portable copies and AppImage desktop integration** (ADR 0094, M8).
+  * **The Windows zip and the Linux tar.gz are portable**: preferences, autosaved work, logs,
+    plug-ins, templates, brushes, filter presets, workspaces and recent files stay in a `data`
+    folder beside AniCraft. A file named `anicraft-portable` next to the program (or next to
+    `AniCraft.app` or an `.AppImage`) is what makes a copy portable; delete it to use your user
+    folder. A portable folder that can't be written falls back to your user folder and says so.
+  * **Preferences › About** shows the version, whether this copy is installed or portable, and
+    every folder AniCraft keeps things in, each with an Open button.
+  * **AppImage: Add to Menu.** The first start from an AppImage offers once, in a card that
+    nothing waits on, to add AniCraft to your applications menu and open `.anicraft`, `.fla` and
+    `.xfl` files with it. Only `~/.local/share` changes; Preferences › About removes it again,
+    and the entry follows the AppImage when you move or update it. Headless:
+    `desktop.integrate`, `desktop.remove`, `desktop.status`.
+  * **Store readiness:** a Packaging lint job validates the Flatpak manifests, the AppStream
+    metainfo (`appstreamcli validate`), the desktop entry and any winget or MSIX manifests.
+    Nothing is submitted.
+
 * **Brushes and erasing, second slice: tilt, textured brushes, erasing inside symbols, profiles
   in the merge** (ADR 0093, M7).
   * **Pen tilt** shapes the Brush: it turns the tip with the way the pen leans and paints up
@@ -1395,7 +1423,7 @@
   play, go to a frame or label, button clicks) in Test Movie and HTML canvas export. Until
   then, opening an Animate document now says how many frame scripts it left out instead of
   dropping them silently.
-* **Filters** (Properties › Filters, on movie clip and button instances as in Animate): **Drop
+* **Filters** (Properties › Filters, on movie clip and button instances): **Drop
   Shadow**, **Blur**, **Glow** and **Adjust Color**, in any order and combination, with blur
   X/Y, quality (Low, Medium, High), strength, colour, angle and distance, and inner, knockout
   and hide object. They show on the stage and in every picture export; SVG export writes
@@ -1404,7 +1432,7 @@
   Animate. Animate documents keep their instances' filters (bevel and gradient filters are
   reported). Headless: `element.set_filters`.
 
-* **Blend modes** (Properties › Blending, on movie clip and button instances as in Animate):
+* **Blend modes** (Properties › Blending, on movie clip and button instances):
   Normal, Layer, Darken, Multiply, Lighten, Screen, Overlay, Hard Light, Add, Subtract,
   Difference, Invert, Alpha and Erase. The instance is composited on its own and then blended
   with what is below, on the stage and in every export. SVG export writes the CSS blend modes
@@ -1465,7 +1493,7 @@
   (loop, play once, single frame) and **First frame** (`symbol.set_kind`, `element.set_loop`).
 
 * **Symbols fade as one.** A symbol instance below full opacity now composites its contents
-  first and then fades the result, as in Animate, so overlapping parts no longer show through
+  first and then fades the result, so overlapping parts no longer show through
   each other. This applies on the stage and in PNG, GIF, sprite sheet and SVG exports (SVG
   uses `<g opacity>`). Fully opaque instances render exactly as before.
 
@@ -1507,7 +1535,7 @@
   Properties › Kind, and the easing is kept. Animate documents' shape tweens now import as
   shape tweens.
 
-* **Import to Stage** (File › Import, **Ctrl+R** as in Animate; `file.import`): SVG drawings
+* **Import to Stage** (File › Import, **Ctrl+R**; `file.import`): SVG drawings
   come in as editable shapes on a new layer named after the file, at the playhead, centred
   and selected, as one undo step. Supported: paths and basic shapes, groups, `use` and
   symbols, transforms, `viewBox`, inline and attribute styles, opacity, and linear and radial

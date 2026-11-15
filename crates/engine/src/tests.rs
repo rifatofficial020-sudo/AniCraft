@@ -368,15 +368,10 @@ fn animated_gif_export() {
     let bytes = std::fs::read(&path).unwrap();
     assert_eq!(&bytes[..6], b"GIF89a");
     // decode: 48 frames, 160×90, total delay ≈ 2 s at 24 fps
-    let mut opts = gif::DecodeOptions::new();
-    opts.set_color_output(gif::ColorOutput::Indexed);
-    let mut dec = opts.read_info(std::fs::File::open(&path).unwrap()).unwrap();
-    assert_eq!((dec.width(), dec.height()), (160, 90));
-    let (mut n, mut total) = (0, 0u32);
-    while let Some(f) = dec.read_next_frame().unwrap() {
-        n += 1;
-        total += u32::from(f.delay);
-    }
+    let info = craft_gif::scan(&bytes, 1024).unwrap();
+    assert_eq!((info.width, info.height), (160, 90));
+    let n = info.frames.len();
+    let total: u32 = info.frames.iter().map(|f| u32::from(f.delay_cs)).sum();
     assert_eq!(n, 48);
     assert_eq!(total, 200, "delays sum to exactly 2 s");
     // overwriting asks; absurd sizes are refused
@@ -666,6 +661,10 @@ fn panic_hunt_every_command() {
         json!({"format": "sprite_sheet", "columns": u64::MAX, "padding": 256, "from": null, "to": null, "output": "{name}{name}{name}.png"}),
         json!({"profile": {"gif": {"scale": 1e30, "range": {"from": 5, "to": 1}, "output": ""}, "audio": {"bits": 3, "rate": 0}, "html": {"title": "x"}}}),
         json!({"profile": {"png": {"frame": 99_999, "enabled": true}}, "format": "svg", "enabled": true}),
+        // Desktop integration (ADR 0094): system folders, missing files, line breaks, junk.
+        json!({"appimage": "/no/such/AniCraft.AppImage", "data_home": "/usr/share", "refresh": "x"}),
+        json!({"appimage": "/a
+Exec=evil", "data_home": "relative/share", "refresh": false}),
     ];
     // File commands are exercised separately (they touch the disk).
     let skip = |id: &str| id.starts_with("file.");
@@ -1990,11 +1989,9 @@ fn sprite_sheet_export_lays_frames_in_a_grid_with_a_frame_map() {
     let total: u64 = frames.values().map(|f| f["duration"].as_u64().unwrap()).sum();
     assert!((200..=220).contains(&total), "5 frames at 24 fps ≈ 208 ms: {total}");
     // The PNG is that size, transparent between frames, and each cell matches a plain render.
-    let dec = png::Decoder::new(std::io::Cursor::new(std::fs::read(&sheet).unwrap()));
-    let mut r = dec.read_info().unwrap();
-    let mut buf = vec![0; r.output_buffer_size()];
-    let info = r.next_frame(&mut buf).unwrap();
-    assert_eq!((info.width, info.height), (388, 146));
+    let img = craft_image_codecs::decode_as(craft_image_codecs::Format::Png, &std::fs::read(&sheet).unwrap()).unwrap();
+    assert_eq!(img.dimensions(), (388, 146));
+    let buf = img.to_rgba8();
     let at = |x: usize, y: usize| buf[(y * 388 + x) * 4 + 3];
     assert_eq!(at(129, 10), 0, "the padding is transparent");
     // Replacing either file asks first; an impossible sheet is refused.
@@ -2295,7 +2292,7 @@ fn blend_modes_apply_to_movie_clips_and_survive_a_save() {
     run(&mut s, "layer.new", json!({}));
     run(&mut s, "draw.rect", json!({"x": 0, "y": 0, "w": 100, "h": 100, "fill": "#ff0000"}));
     run(&mut s, "modify.convert_to_symbol", json!({"name": "Red"}));
-    // A graphic can't blend, as in Animate; a movie clip can.
+    // A graphic can't blend; a movie clip can.
     assert!(s.execute("element.set_blend", &json!({"mode": "multiply"})).unwrap_err().to_string().contains("movie clip"));
     run(&mut s, "symbol.set_kind", json!({"kind": "movie_clip"}));
     assert!(s.execute("element.set_blend", &json!({"mode": "sparkle"})).is_err());
@@ -2346,7 +2343,7 @@ fn filters_render_on_movie_clips_clip_after_masks_and_save() {
     assert!(crate::cmds_file::frame_svg(&s.doc, 0).contains("<feDropShadow dx=\"0\" dy=\"0\""));
     assert!(anicraft_render::lottie::to_lottie(&s.doc, "f", 0, 0, false).report.keys().any(|k| k.starts_with("filters")));
 
-    // Under a mask, the blur is clipped by the mask after filtering (as in Animate).
+    // Under a mask, the blur is clipped by the mask after filtering.
     run(&mut s, "element.set_filters", json!({"filters": [{"type": "blur", "blur_x": 40, "blur_y": 40, "quality": 3}]}));
     run(&mut s, "layer.new", json!({"name": "Mask"}));
     run(&mut s, "draw.rect", json!({"x": 0, "y": 0, "w": 150, "h": 400}));

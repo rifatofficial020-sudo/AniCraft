@@ -4,6 +4,14 @@ use crate::import::{XflError, import_with};
 use anicraft_doc::{ElementKind, LayerKind, LoopMode, Paint, Rgba, SymbolKind, evaluate};
 use std::collections::HashMap;
 
+#[test]
+fn shared_zip_errors_keep_anicraft_import_wording() {
+    let entry = XflError::from(crate::zip::ZipError::Unsupported("a.xml".into(), "encryption"));
+    assert_eq!(entry.to_string(), "'a.xml' uses a zip feature AniCraft can't read (encryption)");
+    let archive = XflError::from(crate::zip::ZipError::UnsupportedArchive("split across several files"));
+    assert_eq!(archive.to_string(), "the archive uses a zip feature AniCraft can't read (split across several files)");
+}
+
 const DOC: &str = r##"<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="640" height="360" frameRate="30" backgroundColor="#336699">
   <symbols><Include href="Characters/Ball.xml"/><Include href="Missing.xml"/></symbols>
   <timelines>
@@ -113,6 +121,27 @@ fn stage_layers_frames_and_tweens() {
     // Every scene comes across, in order.
     assert_eq!(doc.scenes.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["Scene 1", "Scene 2"]);
     assert_eq!(doc.timeline(1).layers.len(), 1, "an empty scene gets a layer to draw on");
+}
+
+#[test]
+fn prefixed_xfl_names_survive_shared_parse_and_domain_mapping() {
+    let doc = r##"<a:DOMDocument xmlns:a="http://ns.adobe.com/xfl/2008/" width="120" height="80">
+      <a:timelines><a:DOMTimeline name="Prefixed Scene"><a:layers>
+        <a:DOMLayer name="Prefixed Layer"><a:frames><a:DOMFrame index="0" duration="3" name="key">
+          <a:elements><a:DOMRectangleObject x="2" y="3" objectWidth="10" objectHeight="8"><a:fill><a:SolidColor color="#336699"/></a:fill></a:DOMRectangleObject></a:elements>
+        </a:DOMFrame></a:frames></a:DOMLayer>
+      </a:layers></a:DOMTimeline></a:timelines>
+    </a:DOMDocument>"##;
+    let (document, _) = import(&HashMap::from([("DOMDocument.xml", doc)])).unwrap();
+    assert_eq!(document.scenes[0].name, "Prefixed Scene");
+    let layer = &document.timeline(0).layers[0];
+    assert_eq!(layer.name, "Prefixed Layer");
+    assert_eq!(layer.keyframes.len(), 1);
+    assert_eq!(
+        (layer.keyframes[0].start, layer.keyframes[0].duration, layer.keyframes[0].label.as_str()),
+        (0, 3, "key")
+    );
+    assert_eq!(layer.keyframes[0].elements.len(), 1, "prefixed geometry reaches the app model");
 }
 
 #[test]
@@ -252,15 +281,8 @@ fn shape_tweens_come_across_as_shape_tweens() {
 }
 
 fn png_2x1() -> Vec<u8> {
-    let mut out = Vec::new();
-    {
-        let mut enc = png::Encoder::new(&mut out, 2, 1);
-        enc.set_color(png::ColorType::Rgba);
-        enc.set_depth(png::BitDepth::Eight);
-        let mut wr = enc.write_header().unwrap();
-        wr.write_image_data(&[255, 0, 0, 255, 0, 0, 255, 255]).unwrap();
-    }
-    out
+    let img = craft_image_codecs::Image::from_u8(2, 1, craft_image_codecs::ChannelLayout::Rgba, vec![255, 0, 0, 255, 0, 0, 255, 255]).unwrap();
+    craft_image_codecs::encode(&img, craft_image_codecs::Format::Png, &craft_image_codecs::EncodeOptions::default()).unwrap()
 }
 
 const BITMAP_DOC: &str = r##"<DOMDocument width="200" height="100">

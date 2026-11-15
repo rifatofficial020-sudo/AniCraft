@@ -41,16 +41,38 @@ struct RawHint {
     end: Option<Vec2>,
 }
 
+struct PendingSymbol {
+    id: SymbolId,
+    name: String,
+    kind: SymbolKind,
+    linkage: Option<Linkage>,
+    item: X,
+    timeline: Option<craft_xfl::document::TimelineModel>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum XflError {
     #[error("{0}")]
     Xml(#[from] xml::XmlError),
-    #[error("{0}")]
+    #[error("{}", ani_zip_error(.0))]
     Zip(#[from] crate::zip::ZipError),
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
     #[error("this isn't an Animate document: {0}")]
     NotXfl(String),
+}
+
+/// Keep AniCraft's established import diagnostics while the shared XFL reader stays neutral.
+fn ani_zip_error(error: &crate::zip::ZipError) -> String {
+    match error {
+        crate::zip::ZipError::UnsupportedArchive(feature) => {
+            format!("the archive uses a zip feature AniCraft can't read ({feature})")
+        }
+        crate::zip::ZipError::Unsupported(name, feature) => {
+            format!("'{name}' uses a zip feature AniCraft can't read ({feature})")
+        }
+        other => other.to_string(),
+    }
 }
 
 /// What the import couldn't bring across, by kind ("3 bitmaps"), the scripts it brought that
@@ -224,7 +246,7 @@ struct Builder<'a> {
     /// refer to any symbol).
     ids: HashMap<String, SymbolId>,
     /// Parsed symbol files waiting to be built, with their script class.
-    pending: Vec<(SymbolId, String, SymbolKind, Option<Linkage>, X)>,
+    pending: Vec<PendingSymbol>,
     /// The language the document's frame scripts are written in (from its publish settings).
     language: Language,
     /// Library item name → bitmap id, for the bitmaps that could be read.
@@ -264,14 +286,13 @@ fn ramp(el: &X) -> Vec<GradientStop> {
 }
 
 pub(crate) fn color(el: &X, key: &str, alpha_key: &str) -> Rgba {
-    let rgb = el.attr(key).and_then(|c| u32::from_str_radix(c.trim().trim_start_matches('#'), 16).ok()).unwrap_or(0);
-    Rgba::hex(rgb).with_alpha(el.f32(alpha_key).unwrap_or(1.0).clamp(0.0, 1.0))
+    let parsed = craft_xfl::shape::color(el, key, alpha_key);
+    Rgba::hex(parsed.rgb).with_alpha(parsed.alpha)
 }
 
 fn matrix(el: &X) -> Affine {
-    let Some(m) = el.child("matrix").and_then(|m| m.child("Matrix")) else { return Affine::IDENTITY };
-    let a = Affine { m: [m.f32("a").unwrap_or(1.0), m.f32("b").unwrap_or(0.0), m.f32("c").unwrap_or(0.0), m.f32("d").unwrap_or(1.0), m.f32("tx").unwrap_or(0.0), m.f32("ty").unwrap_or(0.0)] };
-    if a.is_finite() { a } else { Affine::IDENTITY }
+    let m = craft_xfl::shape::matrix(el);
+    Affine { m: [m.a, m.b, m.c, m.d, m.tx, m.ty] }
 }
 
 /// Half the side of the square XFL gradients are defined on, in pixels (16384 twips / 20).
@@ -280,19 +301,26 @@ const GRADIENT_HALF: f32 = 819.2;
 /// A fill definition (`SolidColor`, `LinearGradient`, `RadialGradient`, `BitmapFill`) as a
 /// paint.
 fn paint(def: &X, bitmaps: &HashMap<String, BitmapId>, report: &mut Report) -> Option<Paint> {
-    match def.name.as_str() {
-        "SolidColor" => Some(Paint::Solid(color(def, "color", "alpha"))),
-        "LinearGradient" | "RadialGradient" => {
+    let fill = craft_xfl::shape::Fill::new(def);
+    match fill.kind() {
+        craft_xfl::shape::FillKind::SolidColor => Some(Paint::Solid(color(def, "color", "alpha"))),
+        craft_xfl::shape::FillKind::LinearGradient | craft_xfl::shape::FillKind::RadialGradient => {
             let m = matrix(def);
-            let stops: Vec<GradientStop> = def.children.iter().filter(|c| c.name == "GradientEntry").map(|g| GradientStop { offset: g.f32("ratio").unwrap_or(0.0).clamp(0.0, 1.0), color: color(g, "color", "alpha") }).collect();
+            let stops: Vec<GradientStop> = fill
+                .gradient_entries()
+                .map(|g| {
+                    let color = g.color_value();
+                    GradientStop { offset: g.ratio().unwrap_or(0.0).clamp(0.0, 1.0), color: Rgba::hex(color.rgb).with_alpha(color.alpha) }
+                })
+                .collect();
             if stops.is_empty() {
                 return None;
             }
             // Overflow, interpolation and the focal point carry over as they are (ADR 0074).
-            let spread = def.attr("spreadMethod").and_then(|s| Spread::from_key(s.trim())).unwrap_or_default();
-            let linear_rgb = def.attr("interpolationMethod").is_some_and(|s| s.trim() == "linearRGB");
+            let spread = fill.spread_method().and_then(|s| Spread::from_key(s.trim())).unwrap_or_default();
+            let linear_rgb = fill.interpolation_method().is_some_and(|s| s.trim() == "linearRGB");
             let frame = m.mul(&Affine::scale(GRADIENT_HALF, GRADIENT_HALF));
-            let mut p = if def.name == "LinearGradient" { Paint::linear(Vec2::new(-1.0, 0.0), Vec2::new(1.0, 0.0), stops) } else { Paint::radial(Vec2::ZERO, 1.0, stops) };
+            let mut p = if fill.kind() == craft_xfl::shape::FillKind::LinearGradient { Paint::linear(Vec2::new(-1.0, 0.0), Vec2::new(1.0, 0.0), stops) } else { Paint::radial(Vec2::ZERO, 1.0, stops) };
             match &mut p {
                 Paint::Linear { spread: s, linear_rgb: l, .. } => {
                     *s = spread;
@@ -301,14 +329,14 @@ fn paint(def: &X, bitmaps: &HashMap<String, BitmapId>, report: &mut Report) -> O
                 Paint::Radial { spread: s, linear_rgb: l, focal, .. } => {
                     *s = spread;
                     *l = linear_rgb;
-                    *focal = def.f32("focalPointRatio").filter(|f| f.is_finite()).unwrap_or(0.0).clamp(-MAX_FOCAL, MAX_FOCAL);
+                    *focal = fill.focal_point_ratio().unwrap_or(0.0).clamp(-MAX_FOCAL, MAX_FOCAL);
                 }
                 _ => {}
             }
             Some(p.with_frame(&frame, None))
         }
-        "BitmapFill" => {
-            let Some(&bitmap) = def.attr("bitmapPath").and_then(|n| bitmaps.get(n)) else {
+        craft_xfl::shape::FillKind::Bitmap => {
+            let Some(&bitmap) = fill.bitmap_path().and_then(|n| bitmaps.get(n)) else {
                 report.skip("bitmap fills of missing bitmaps");
                 return None;
             };
@@ -316,9 +344,9 @@ fn paint(def: &X, bitmaps: &HashMap<String, BitmapId>, report: &mut Report) -> O
             let matrix = Affine { m: [m[0] / TWIPS, m[1] / TWIPS, m[2] / TWIPS, m[3] / TWIPS, m[4], m[5]] };
             // Animate repeats a bitmap fill unless it is clipped (then the edge pixels extend,
             // which AniCraft draws as the image shown once).
-            Some(Paint::Bitmap { bitmap, repeat: !def.bool("bitmapIsClipped").unwrap_or(false), matrix })
+            Some(Paint::Bitmap { bitmap, repeat: !fill.bitmap_is_clipped().unwrap_or(false), matrix })
         }
-        _ => None,
+        craft_xfl::shape::FillKind::Other => None,
     }
 }
 
@@ -326,39 +354,42 @@ fn paint(def: &X, bitmaps: &HashMap<String, BitmapId>, report: &mut Report) -> O
 /// joints and miter limit, and the dashes of `DashedStroke` and dots of `DottedStroke`
 /// (ADR 0046). Ragged, stipple and hatched strokes are drawn solid.
 pub(crate) fn stroke(def: &X, bitmaps: &HashMap<String, BitmapId>, report: &mut Report) -> Option<Stroke> {
-    if !matches!(def.name.as_str(), "SolidStroke" | "DashedStroke" | "DottedStroke" | "RaggedStroke" | "StippleStroke" | "HatchedStroke") {
+    let native = craft_xfl::shape::Stroke::new(def);
+    use craft_xfl::shape::StrokeKind as NativeStroke;
+    if native.kind() == NativeStroke::Other {
         return None;
     }
     // Round caps and joints are the format's default, and a miter limit of 3.
-    let cap = match def.attr("caps").map(str::trim) {
+    let cap = match native.caps().map(str::trim) {
         Some("none") => Cap::Butt,
         Some("square") => Cap::Square,
         _ => Cap::Round,
     };
-    let join = match def.attr("joints").map(str::trim) {
+    let join = match native.joints().map(str::trim) {
         Some("miter") => Join::Miter,
         Some("bevel") => Join::Bevel,
         _ => Join::Round,
     };
-    let miter_limit = def.f32("miterLimit").unwrap_or(anicraft_doc::stroke_style::DEFAULT_MITER_LIMIT);
-    let dash = match def.name.as_str() {
-        "DashedStroke" => Dash::dashed(def.f32("dash1").unwrap_or(6.0), def.f32("dash2").unwrap_or(3.0)),
-        "DottedStroke" => Dash::dotted(def.f32("dotSpace").unwrap_or(3.0)),
-        "SolidStroke" => None,
+    let miter_limit = native.miter_limit().unwrap_or(anicraft_doc::stroke_style::DEFAULT_MITER_LIMIT);
+    let dash = match native.kind() {
+        NativeStroke::Dashed => Dash::dashed(native.dash1().unwrap_or(6.0), native.dash2().unwrap_or(3.0)),
+        NativeStroke::Dotted => Dash::dotted(native.dot_space().unwrap_or(3.0)),
+        NativeStroke::Solid => None,
         _ => {
             report.skip("ragged, stipple and hatched strokes (drawn solid)");
             None
         }
     };
     let style = StrokeStyle { cap, join, miter_limit, dash };
-    let width = def.f32("weight").unwrap_or(1.0).clamp(0.05, 1000.0);
-    let fill = def.child("fill").and_then(|f| f.children.first());
+    let width = native.weight().unwrap_or(1.0).clamp(0.05, 1000.0);
+    let fill = native.fill();
     let c = fill.map_or(Rgba::BLACK, |f| {
-        if f.name == "SolidColor" {
-            color(f, "color", "alpha")
+        if f.kind() == craft_xfl::shape::FillKind::SolidColor {
+            let value = f.color_value();
+            Rgba::hex(value.rgb).with_alpha(value.alpha)
         } else {
             report.skip("gradient and bitmap strokes (drawn in one colour)");
-            paint(f, bitmaps, report).map_or(Rgba::BLACK, |p| p.primary_color())
+            paint(f.element(), bitmaps, report).map_or(Rgba::BLACK, |p| p.primary_color())
         }
     });
     Some(Stroke::new(c, width).with_style(style))
@@ -374,16 +405,23 @@ impl<'a> Builder<'a> {
     /// not a drawing object) is raw artwork: its shapes are marked to merge (ADR 0042), and the
     /// engine merges each keyframe's raw shapes into one drawing when it opens the file.
     fn shape(&mut self, el: &X, parent: &Affine, out: &mut Vec<Arc<Element>>, loose: bool) {
+        let Some(schema) = craft_xfl::shape::Shape::new(el) else { return };
         let m = parent.mul(&matrix(el));
-        let merge = loose && !el.bool("isDrawingObject").unwrap_or(false);
-        let fills: Vec<(u32, Option<Paint>)> = el.list("fills").iter().map(|f| (f.u32("index").unwrap_or(0), f.children.first().and_then(|d| paint(d, &self.bitmaps, &mut self.report)))).collect();
-        let strokes: Vec<(u32, Option<Stroke>)> = el.list("strokes").iter().map(|s| (s.u32("index").unwrap_or(0), s.children.first().and_then(|d| stroke(d, &self.bitmaps, &mut self.report)))).collect();
-        let edges: Vec<Edge> = el
-            .list("edges")
-            .iter()
-            .filter(|e| e.name == "Edge")
-            .map(|e| Edge { fill_left: e.u32("fillStyle0").unwrap_or(0), fill_right: e.u32("fillStyle1").unwrap_or(0), stroke: e.u32("strokeStyle").unwrap_or(0), segs: e.attr("edges").map(edges::parse).unwrap_or_default() })
-            .collect();
+        let merge = loose && !schema.is_drawing_object().unwrap_or(false);
+        let fills: Vec<(u32, Option<Paint>)> = schema.fills().map(|style| {
+            let paint = style.definition().and_then(|definition| paint(definition.element(), &self.bitmaps, &mut self.report));
+            (style.index().unwrap_or(0), paint)
+        }).collect();
+        let strokes: Vec<(u32, Option<Stroke>)> = schema.strokes().map(|style| {
+            let stroke = style.definition().and_then(|definition| stroke(definition.element(), &self.bitmaps, &mut self.report));
+            (style.index().unwrap_or(0), stroke)
+        }).collect();
+        let edges: Vec<Edge> = schema.edges().map(|edge| Edge {
+            fill_left: edge.fill_style0().unwrap_or(0),
+            fill_right: edge.fill_style1().unwrap_or(0),
+            stroke: edge.stroke_style().unwrap_or(0),
+            segs: edge.encoded_segments().map(edges::parse).unwrap_or_default(),
+        }).collect();
         for (index, p) in fills {
             let (Some(p), true) = (p, index > 0) else { continue };
             let path = edges::fill_path(&edges, index);
@@ -402,16 +440,22 @@ impl<'a> Builder<'a> {
 
     /// Rectangle and oval primitives.
     fn primitive(&mut self, el: &X, parent: &Affine, out: &mut Vec<Arc<Element>>) {
-        let (x, y) = (el.f32("x").unwrap_or(0.0), el.f32("y").unwrap_or(0.0));
-        let (w, h) = (el.f32("objectWidth").unwrap_or(0.0), el.f32("objectHeight").unwrap_or(0.0));
+        let Some(primitive) = craft_xfl::shape::Primitive::new(el) else { return };
+        let (x, y) = (primitive.x().unwrap_or(0.0), primitive.y().unwrap_or(0.0));
+        let (w, h) = (primitive.width().unwrap_or(0.0), primitive.height().unwrap_or(0.0));
         if !(w > 0.0 && h > 0.0) {
             return;
         }
-        let path = if el.name == "DOMOvalObject" { Path::ellipse(x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0) } else { Path::rounded_rect(x, y, w, h, el.f32("topLeftRadius").unwrap_or(0.0).max(0.0)) };
-        let fill = el.child("fill").and_then(|f| f.children.first()).and_then(|d| paint(d, &self.bitmaps, &mut self.report));
-        let stroke = el.child("stroke").and_then(|s| s.children.first()).and_then(|d| stroke(d, &self.bitmaps, &mut self.report));
+        let path = if primitive.kind() == craft_xfl::shape::PrimitiveKind::Oval {
+            Path::ellipse(x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0)
+        } else {
+            Path::rounded_rect(x, y, w, h, primitive.top_left_radius().unwrap_or(0.0).max(0.0))
+        };
+        let fill = primitive.fill().and_then(|definition| paint(definition.element(), &self.bitmaps, &mut self.report));
+        let stroke = primitive.stroke().and_then(|definition| stroke(definition.element(), &self.bitmaps, &mut self.report));
         if fill.is_some() || stroke.is_some() {
-            let m = parent.mul(&matrix(el));
+            let native = primitive.matrix();
+            let m = parent.mul(&Affine { m: [native.a, native.b, native.c, native.d, native.tx, native.ty] });
             out.push(self.element(ElementKind::Shape(Shape { path: Arc::new(path), fill, stroke, fill_rule: FillRule::NonZero, merge: false, warp: None }), m, ColorEffect::default()));
         }
     }
@@ -619,64 +663,67 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn timeline(&mut self, tl: &X) -> Timeline {
+    fn timeline(&mut self, tl: &X, schema: &craft_xfl::document::TimelineModel) -> Timeline {
         let mut layers = Vec::new();
         // Layers by their position in the file's layer list: `parentLayerIndex` points at a
         // layer's folder or mask. Links that don't fit AniCraft's rules are dropped by
         // `repair_masks` below.
         let mut by_index: Vec<LayerId> = Vec::new();
-        for l in tl.list("layers").iter().filter(|l| l.name == "DOMLayer").take(MAX_LAYERS) {
-            let kind = match l.attr("layerType") {
-                Some("folder") => LayerKind::Folder,
-                Some("guide") => LayerKind::Guide,
-                Some("mask") => LayerKind::Mask,
-                _ => LayerKind::Normal,
+        for (l, schema_layer) in tl.list("layers").iter().filter(|l| l.name == "DOMLayer").take(MAX_LAYERS).zip(&schema.layers) {
+            let kind = match schema_layer.layer_type {
+                craft_xfl::document::LayerType::Folder => LayerKind::Folder,
+                craft_xfl::document::LayerType::Guide => LayerKind::Guide,
+                craft_xfl::document::LayerType::Mask => LayerKind::Mask,
+                craft_xfl::document::LayerType::Normal | craft_xfl::document::LayerType::Other => LayerKind::Normal,
             };
             let id = LayerId(self.doc.alloc_id());
             by_index.push(id);
             let mut layer = Layer::new(id, l.attr("name").unwrap_or("Layer"));
             layer.kind = kind;
-            layer.parent = l.u32("parentLayerIndex").and_then(|i| by_index.get(i as usize).copied()).filter(|p| *p != id);
+            layer.parent = schema_layer.parent_layer_index.and_then(|i| by_index.get(i as usize).copied()).filter(|p| *p != id);
             if kind == LayerKind::Folder {
                 // A folder holds layers, never frames.
                 layer.keyframes.clear();
-                layer.visible = l.bool("visible").unwrap_or(true);
-                layer.locked = l.bool("locked").unwrap_or(false);
+                layer.visible = schema_layer.visible.unwrap_or(true);
+                layer.locked = schema_layer.locked.unwrap_or(false);
                 layer.color = color(l, "color", "__none");
                 layers.push(Arc::new(layer));
                 continue;
             }
-            layer.visible = l.bool("visible").unwrap_or(true);
-            layer.locked = l.bool("locked").unwrap_or(false);
-            layer.outline = l.bool("outline").unwrap_or(false);
+            layer.visible = schema_layer.visible.unwrap_or(true);
+            layer.locked = schema_layer.locked.unwrap_or(false);
+            layer.outline = schema_layer.outline.unwrap_or(false);
             layer.color = color(l, "color", "__none");
             // Layer Properties' height, 100 / 200 / 300 % (ADR 0061), as a multiple of a row.
-            layer.height_rows = l.u32("heightMultiplier").map_or(1, |h| h.clamp(1, u32::from(anicraft_doc::MAX_LAYER_HEIGHT)) as u8);
+            layer.height_rows = schema_layer.height_multiplier.map_or(1, |h| h.clamp(1, u32::from(anicraft_doc::MAX_LAYER_HEIGHT)) as u8);
             let mut keys = Vec::new();
             let mut raw_hints: HashMap<u32, Vec<RawHint>> = HashMap::new();
-            for f in l.list("frames").iter().filter(|f| f.name == "DOMFrame") {
-                let start = f.u32("index").unwrap_or(0).min(MAX_FRAME);
-                let duration = f.u32("duration").unwrap_or(1).clamp(1, MAX_FRAME);
+            for (f, schema_frame) in l.list("frames").iter().filter(|f| f.name == "DOMFrame").zip(&schema_layer.frames) {
+                let start = schema_frame.index.unwrap_or(0).min(MAX_FRAME);
+                let duration = schema_frame.duration.unwrap_or(1).clamp(1, MAX_FRAME);
                 let mut k = Keyframe::new(start, duration);
                 // A frame's name is a label (or an anchor, a label too); a comment is a note
                 // to the animator that nothing can go to, which AniCraft has no place for yet.
-                if f.attr("labelType").map(str::trim) == Some("comment") {
+                if schema_frame.is_comment {
                     self.report.skip("frame comments");
                 } else {
                     k.label = f.attr("name").unwrap_or("").chars().take(256).collect();
                 }
-                match f.attr("tweenType") {
-                    Some(t @ ("motion" | "shape")) => {
-                        let kind = if t == "shape" { TweenKind::Shape } else { TweenKind::Classic };
+                match schema_frame.tween_type {
+                    craft_xfl::document::TweenType::Motion | craft_xfl::document::TweenType::Shape => {
+                        let kind =
+                            if schema_frame.tween_type == craft_xfl::document::TweenType::Shape { TweenKind::Shape } else { TweenKind::Classic };
                         let orient = f.bool("motionTweenOrientToPath").unwrap_or(false);
-                        if kind == TweenKind::Classic && f.attr("motionTweenRotate").is_some_and(|r| matches!(r.trim(), "clockwise" | "counter-clockwise")) {
+                        if kind == TweenKind::Classic
+                            && f.attr("motionTweenRotate").is_some_and(|r| matches!(r.trim(), "clockwise" | "counter-clockwise"))
+                        {
                             self.report.skip("tween spins (turned the shortest way)");
                         }
                         let (easing, groups) = self.easing(f);
                         k.tween = Some(Tween { easing, kind, orient, groups });
                     }
-                    Some("motion object") => self.report.skip("motion tweens (kept as keyframes)"),
-                    _ => {}
+                    craft_xfl::document::TweenType::MotionObject => self.report.skip("motion tweens (kept as keyframes)"),
+                    craft_xfl::document::TweenType::Other => {}
                 }
                 // Shape hints sit on both keyframes of a shape tween; they are paired up below.
                 if let Some(h) = f.child("shapeHints").filter(|h| !h.children.is_empty()) {
@@ -869,14 +916,14 @@ impl<'a> Builder<'a> {
     /// `bin/`; either is used when it is a PNG or JPEG. Animate's own encodings of the data
     /// file are not public, so those bitmaps are reported instead.
     fn register_bitmaps(&mut self, root: &X) -> Result<(), XflError> {
-        for item in root.list("media").iter().filter(|i| i.name == "DOMBitmapItem").take(MAX_BITMAPS) {
-            let Some(name) = item.attr("name").filter(|n| !self.bitmaps.contains_key(*n)) else { continue };
+        for item in craft_xfl::media::Catalog::new(root).bitmaps().take(MAX_BITMAPS) {
+            let Some(name) = item.name().filter(|n| !self.bitmaps.contains_key(*n)) else { continue };
             let mut candidates = Vec::new();
-            if let Some(href) = item.attr("href") {
-                candidates.push(format!("LIBRARY/{href}"));
+            if let Some(href) = item.href() {
+                candidates.push(craft_xfl::media::library_member(href));
             }
-            if let Some(data) = item.attr("bitmapDataHRef") {
-                candidates.push(format!("bin/{data}"));
+            if let Some(data) = item.data_href() {
+                candidates.push(craft_xfl::media::data_member(data));
             }
             let short: String = name.rsplit('/').next().unwrap_or(name).chars().take(256).collect();
             let (mut found_data, mut unreadable) = (false, false);
@@ -902,7 +949,7 @@ impl<'a> Builder<'a> {
                 Some(mut b) => {
                     b.id = BitmapId(self.doc.alloc_id());
                     // Animate leaves out the default (smoothing on in current versions).
-                    b.smoothing = item.bool("allowSmoothing").unwrap_or(true);
+                    b.smoothing = item.allow_smoothing().unwrap_or(true);
                     self.place_in_folder(name, anicraft_doc::LibraryItem::Bitmap(b.id));
                     self.bitmaps.insert(name.to_string(), b.id);
                     self.doc.bitmaps.push(Arc::new(b));
@@ -921,14 +968,14 @@ impl<'a> Builder<'a> {
     /// own encoding of the data file is not public, so those sounds are reported by name, as is
     /// every other sound that doesn't come across, with its format and why (ADR 0039).
     fn register_sounds(&mut self, root: &X) -> Result<(), XflError> {
-        for item in root.list("media").iter().filter(|i| i.name == "DOMSoundItem").take(MAX_SOUNDS) {
-            let Some(name) = item.attr("name").filter(|n| !self.sounds.contains_key(*n)) else { continue };
+        for item in craft_xfl::media::Catalog::new(root).sounds().take(MAX_SOUNDS) {
+            let Some(name) = item.name().filter(|n| !self.sounds.contains_key(*n)) else { continue };
             let mut candidates = Vec::new();
-            if let Some(href) = item.attr("href") {
-                candidates.push((format!("LIBRARY/{href}"), false));
+            if let Some(href) = item.href() {
+                candidates.push((craft_xfl::media::library_member(href), false));
             }
-            if let Some(data) = item.attr("soundDataHRef") {
-                candidates.push((format!("bin/{data}"), true));
+            if let Some(data) = item.data_href() {
+                candidates.push((craft_xfl::media::data_member(data), true));
             }
             let short: String = name.rsplit('/').next().unwrap_or(name).chars().take(256).collect();
             let shown: String = name.chars().take(256).collect();
@@ -981,17 +1028,17 @@ impl<'a> Builder<'a> {
     /// original file (`href`, or `sourceExternalFilepath` inside the package) in `LIBRARY/`, then
     /// as its data file in `bin/` (`videoDataHRef`).
     fn register_videos(&mut self, root: &X) {
-        for item in root.list("media").iter().filter(|i| i.name == "DOMVideoItem").take(MAX_VIDEOS) {
-            let Some(name) = item.attr("name").filter(|n| !self.videos.contains_key(*n)) else { continue };
+        for item in craft_xfl::media::Catalog::new(root).videos().take(MAX_VIDEOS) {
+            let Some(name) = item.name().filter(|n| !self.videos.contains_key(*n)) else { continue };
             let mut candidates = Vec::new();
-            if let Some(href) = item.attr("href") {
-                candidates.push(format!("LIBRARY/{href}"));
+            if let Some(href) = item.href() {
+                candidates.push(craft_xfl::media::library_member(href));
             }
-            if let Some(src) = item.attr("sourceExternalFilepath").and_then(|p| p.strip_prefix("./")) {
-                candidates.push(src.replace('\\', "/"));
+            if let Some(path) = item.external_path().and_then(craft_xfl::media::packaged_external_member) {
+                candidates.push(path);
             }
-            if let Some(data) = item.attr("videoDataHRef") {
-                candidates.push(format!("bin/{data}"));
+            if let Some(data) = item.data_href() {
+                candidates.push(craft_xfl::media::data_member(data));
             }
             let shown: String = name.chars().take(256).collect();
             let short: String = name.rsplit('/').next().unwrap_or(name).chars().take(240).collect();
@@ -1018,8 +1065,8 @@ impl<'a> Builder<'a> {
                 }
             }
             // Its length as the item gives it (seconds), else from its frames and rate.
-            let seconds = item.f32("length").filter(|s| s.is_finite() && *s >= 0.0).or_else(|| {
-                let (frames, fps) = (item.f32("frameCount")?, item.f32("fps")?);
+            let seconds = item.length().filter(|s| *s >= 0.0).or_else(|| {
+                let (frames, fps) = (item.frame_count()?, item.frames_per_second()?);
                 (frames.is_finite() && fps.is_finite() && fps > 0.0).then(|| frames.max(0.0) / fps)
             });
             let length = seconds.map(|s| format!(", {:.1} s", s.min(1.0e7))).unwrap_or_default();
@@ -1124,13 +1171,28 @@ impl<'a> Builder<'a> {
             }
             // A damaged symbol file is left out (its instances with it), not the whole
             // document (#226).
-            let item = match (self.read)(&format!("LIBRARY/{href}")).map(|b| b.map(|b| xml::parse(&b))) {
-                Ok(Some(Ok(item))) => item,
+            let bytes = match (self.read)(&format!("LIBRARY/{href}")) {
+                Ok(Some(bytes)) => bytes,
                 Ok(None) => {
                     self.report.skip("missing library files");
                     continue;
                 }
-                Err(_) | Ok(Some(Err(_))) => {
+                Err(_) => {
+                    self.report.skip("library files that couldn't be read");
+                    continue;
+                }
+            };
+            let parsed = match craft_xfl::document::Document::parse(&bytes) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    self.report.skip("library files that couldn't be read");
+                    continue;
+                }
+            };
+            let (model, xml_root) = parsed.into_parts(craft_xfl::document::ModelLimits { max_timelines: 0, max_layers_per_timeline: MAX_LAYERS });
+            let item = match xml::from_craft_xml_owned_local_names(xml_root) {
+                Ok(item) => item,
+                Err(_) => {
                     self.report.skip("library files that couldn't be read");
                     continue;
                 }
@@ -1149,7 +1211,7 @@ impl<'a> Builder<'a> {
             let id = SymbolId(self.doc.alloc_id());
             let linkage = self.linkage(&item);
             self.ids.insert(name.clone(), id);
-            self.pending.push((id, name, kind, linkage, item));
+            self.pending.push(PendingSymbol { id, name, kind, linkage, item, timeline: model.symbol_timeline });
         }
         Ok(())
     }
@@ -1199,18 +1261,15 @@ impl<'a> Builder<'a> {
     fn publish_settings(&mut self) -> Result<(), XflError> {
         // Optional: settings that can't be read leave the defaults (#226).
         let Ok(Some(bytes)) = (self.read)("PublishSettings.xml") else { return Ok(()) };
-        let Ok(root) = xml::parse(&bytes) else { return Ok(()) };
-        let profiles: Vec<&X> = root.children.iter().filter(|c| c.name == "flash_profile").collect();
-        let profile = profiles.iter().find(|p| p.bool("current") == Some(true)).or(profiles.first()).copied().unwrap_or(&root);
-        let flash = profile.child("PublishFlashProperties").unwrap_or(profile);
-        let text = |name: &str| flash.child(name).map(|e| e.text.trim().to_string()).filter(|t| !t.is_empty());
-        self.language = match text("ActionScriptVersion").as_deref() {
+        let Ok(document) = craft_xfl::document::Document::parse(&bytes) else { return Ok(()) };
+        let settings = document.publish_settings();
+        self.language = match settings.action_script_version.as_deref() {
             Some("1" | "2") => Language::ActionScript1or2,
             _ => Language::ActionScript3,
         };
-        if let Some(class) = text("DocumentClass") {
+        if let Some(class) = settings.document_class {
             if anicraft_doc::actions::valid_class_name(&class) {
-                self.doc.document_class = class;
+                self.doc.document_class = class.to_string();
                 self.report.keep("document class");
             } else {
                 self.report.skip("document classes that aren't class names (left out)");
@@ -1220,9 +1279,9 @@ impl<'a> Builder<'a> {
     }
 
     fn build_symbols(&mut self) {
-        for (id, name, kind, linkage, item) in std::mem::take(&mut self.pending) {
-            let timeline = match item.child("timeline").and_then(|t| t.child("DOMTimeline")) {
-                Some(tl) => self.timeline(tl),
+        for PendingSymbol { id, name, kind, linkage, item, timeline: schema_timeline } in std::mem::take(&mut self.pending) {
+            let timeline = match item.child("timeline").and_then(|t| t.child("DOMTimeline")).zip(schema_timeline.as_ref()) {
+                Some((tl, schema)) => self.timeline(tl, schema),
                 None => Timeline { layers: vec![Arc::new(Layer::new(LayerId(self.doc.alloc_id()), "Layer 1"))] },
             };
             let short = name.rsplit('/').next().unwrap_or(&name).to_string();
@@ -1267,11 +1326,26 @@ pub fn import_with_fonts(read: &Reader<'_>, fonts: &Fonts) -> Result<(Document, 
 
 fn import_from<'a>(read: &'a Reader<'a>, fonts: Option<&'a Fonts>) -> Result<(Document, Report), XflError> {
     let bytes = read("DOMDocument.xml")?.ok_or_else(|| XflError::NotXfl("no DOMDocument.xml".into()))?;
-    let root = xml::parse(&bytes)?;
+    let parsed = craft_xfl::document::Document::parse(&bytes).map_err(xml::from_craft_error)?;
+    let (schema, xml_root) =
+        parsed.into_parts(craft_xfl::document::ModelLimits { max_timelines: anicraft_doc::MAX_SCENES, max_layers_per_timeline: MAX_LAYERS });
+    let root = xml::from_craft_xml_owned_local_names(xml_root)?;
     if root.name != "DOMDocument" {
         return Err(XflError::NotXfl(format!("the root element is <{}>", root.name)));
     }
-    let mut b = Builder { doc: Document::default(), read, ids: HashMap::new(), pending: Vec::new(), language: Language::ActionScript3, bitmaps: HashMap::new(), sounds: HashMap::new(), videos: HashMap::new(), report: Report::default(), fonts, faces: HashMap::new() };
+    let mut b = Builder {
+        doc: Document::default(),
+        read,
+        ids: HashMap::new(),
+        pending: Vec::new(),
+        language: Language::ActionScript3,
+        bitmaps: HashMap::new(),
+        sounds: HashMap::new(),
+        videos: HashMap::new(),
+        report: Report::default(),
+        fonts,
+        faces: HashMap::new(),
+    };
     b.publish_settings()?;
     // Only symbols keep a script class yet.
     for _ in root.list("media").iter().filter(|m| m.attr("linkageClassName").is_some_and(|c| !c.trim().is_empty())) {
@@ -1279,12 +1353,13 @@ fn import_from<'a>(read: &'a Reader<'a>, fonts: Option<&'a Fonts>) -> Result<(Do
     }
     b.doc.library.clear();
     b.doc.scenes.clear();
+    let stage = schema.stage;
     b.doc.stage = Stage {
-        width: root.f32("width").unwrap_or(550.0).clamp(1.0, 8192.0) as u32,
-        height: root.f32("height").unwrap_or(400.0).clamp(1.0, 8192.0) as u32,
-        fps: root.f32("frameRate").unwrap_or(24.0).clamp(1.0, 120.0),
+        width: stage.width.unwrap_or(550.0).clamp(1.0, 8192.0) as u32,
+        height: stage.height.unwrap_or(400.0).clamp(1.0, 8192.0) as u32,
+        fps: stage.frame_rate.unwrap_or(24.0).clamp(1.0, 120.0),
         // Animate leaves the default, white, out of the file (#163).
-        background: if root.attr("backgroundColor").is_some() { color(&root, "backgroundColor", "__none") } else { Rgba::WHITE },
+        background: if stage.has_background_color { color(&root, "backgroundColor", "__none") } else { Rgba::WHITE },
     };
     b.register_folders(&root);
     b.register_bitmaps(&root)?;
@@ -1294,9 +1369,10 @@ fn import_from<'a>(read: &'a Reader<'a>, fonts: Option<&'a Fonts>) -> Result<(Do
     b.build_symbols();
     // Every DOMTimeline is a scene, in order.
     let scenes: Vec<&X> = root.list("timelines").iter().filter(|t| t.name == "DOMTimeline").take(anicraft_doc::MAX_SCENES).collect();
-    for (i, tl) in scenes.iter().enumerate() {
-        let name: String = tl.attr("name").filter(|n| !n.trim().is_empty()).map_or_else(|| format!("Scene {}", i + 1), |n| n.chars().take(256).collect());
-        let timeline = b.timeline(tl);
+    for (i, (tl, schema_timeline)) in scenes.iter().zip(&schema.timelines).enumerate() {
+        let name: String =
+            tl.attr("name").filter(|n| !n.trim().is_empty()).map_or_else(|| format!("Scene {}", i + 1), |n| n.chars().take(256).collect());
+        let timeline = b.timeline(tl, schema_timeline);
         b.doc.scenes.push(Arc::new(Scene { name, timeline, guides: Vec::new() }));
     }
     if !b.doc.library_tree.folders.is_empty() {
@@ -1332,7 +1408,9 @@ fn fla_from(data: &[u8], fonts: Option<&Fonts>) -> Result<(Document, Report), Xf
         return Err(XflError::NotXfl("the file is too large".into()));
     }
     if data.starts_with(&OLE_MAGIC) {
-        return Err(XflError::NotXfl("this .fla was saved by Flash CS4 or earlier, in a format AniCraft can't read: open it in Animate and save it again".into()));
+        return Err(XflError::NotXfl(
+            "this .fla was saved by Flash CS4 or earlier, in a format AniCraft can't read: open it in Animate and save it again".into(),
+        ));
     }
     let archive = crate::zip::Archive::open(data)?;
     let root = package_root(&archive)?;
@@ -1345,15 +1423,10 @@ fn fla_from(data: &[u8], fonts: Option<&Fonts>) -> Result<(Document, Report), Xf
 /// `__MACOSX` folder some zip tools add beside it is ignored. An archive holding several
 /// documents in top folders is refused with their names rather than one picked.
 fn package_root(archive: &crate::zip::Archive<'_>) -> Result<String, XflError> {
-    if archive.names().any(|n| n == "DOMDocument.xml") {
-        return Ok(String::new());
-    }
-    let mut tops: Vec<&str> = archive.names().filter_map(|n| n.strip_suffix("/DOMDocument.xml")).filter(|top| !top.contains('/') && *top != "__MACOSX").collect();
-    tops.sort_unstable();
-    match tops.as_slice() {
-        [] => Ok(String::new()),
-        [top] => Ok(format!("{top}/")),
-        many => {
+    match archive.xfl_package_root() {
+        crate::zip::XflPackageRoot::Document | crate::zip::XflPackageRoot::Missing => Ok(String::new()),
+        crate::zip::XflPackageRoot::Folder(top) => Ok(format!("{top}/")),
+        crate::zip::XflPackageRoot::Multiple(many) => {
             let names: Vec<String> = many.iter().take(5).map(|t| t.chars().take(80).collect()).collect();
             let more = if many.len() > 5 { format!(" and {} more", many.len() - 5) } else { String::new() };
             Err(XflError::NotXfl(format!("the archive holds {} Animate documents ({}{more}): unzip it and open one of them", many.len(), names.join(", "))))

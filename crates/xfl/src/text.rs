@@ -12,7 +12,7 @@
 //! instance that scripts and the viewer use, so it takes its main style, keeps its instance name,
 //! line type, border, selectability and maximum length, and the report counts them as running.
 
-use crate::import::{Report, color};
+use crate::import::Report;
 use crate::xml::Element as X;
 use anicraft_doc::{LineType, Rgba, TextAlign, TextBlock, TextField, TextKind};
 use anicraft_geom::Vec2;
@@ -48,12 +48,12 @@ pub struct Placed {
     pub offset: Vec2,
 }
 
-fn run_style(attrs: Option<&X>, flags: &mut Flags) -> RunStyle {
+fn run_style(attrs: Option<craft_xfl::text::TextStyle<'_, X>>, flags: &mut Flags) -> RunStyle {
     let Some(a) = attrs else {
         return RunStyle { face: String::new(), size: 12.0, bold: false, italic: false, color: Rgba::BLACK, align: TextAlign::Left, letter_spacing: 0.0, line_spacing: 0.0, left_margin: 0.0, right_margin: 0.0 };
     };
-    let num = |k: &str, lo: f32, hi: f32| a.f32(k).unwrap_or(0.0).clamp(lo, hi);
-    let align = match a.attr("alignment") {
+    let clamp = |number: Option<f32>, lo: f32, hi: f32| number.unwrap_or(0.0).clamp(lo, hi);
+    let align = match a.alignment() {
         Some("center") => TextAlign::Center,
         Some("right") => TextAlign::Right,
         Some(j) if j.starts_with("justify") => {
@@ -62,23 +62,24 @@ fn run_style(attrs: Option<&X>, flags: &mut Flags) -> RunStyle {
         }
         _ => TextAlign::Left,
     };
-    if a.f32("indent").is_some_and(|i| i != 0.0) {
+    if a.indent().is_some_and(|i| i != 0.0) {
         flags.indented = true;
     }
-    if a.attr("characterPosition").is_some_and(|p| p != "normal") {
+    if a.character_position().is_some_and(|p| p != "normal") {
         flags.shifted = true;
     }
+    let color = a.color();
     RunStyle {
-        face: a.attr("face").unwrap_or("").chars().take(256).collect(),
-        size: a.f32("size").unwrap_or(12.0).clamp(1.0, 2000.0),
-        bold: a.bool("bold").unwrap_or(false),
-        italic: a.bool("italic").unwrap_or(false),
-        color: if a.attr("fillColor").is_some() { color(a, "fillColor", "alpha") } else { Rgba::BLACK.with_alpha(a.f32("alpha").unwrap_or(1.0).clamp(0.0, 1.0)) },
+        face: a.face().unwrap_or("").chars().take(256).collect(),
+        size: a.size().unwrap_or(12.0).clamp(1.0, 2000.0),
+        bold: a.bold().unwrap_or(false),
+        italic: a.italic().unwrap_or(false),
+        color: Rgba::hex(color.rgb).with_alpha(color.alpha),
         align,
-        letter_spacing: num("letterSpacing", -1000.0, 1000.0),
-        line_spacing: num("lineSpacing", -1000.0, 1000.0),
-        left_margin: num("leftMargin", 0.0, 10_000.0),
-        right_margin: num("rightMargin", 0.0, 10_000.0),
+        letter_spacing: clamp(a.letter_spacing(), -1000.0, 1000.0),
+        line_spacing: clamp(a.line_spacing(), -1000.0, 1000.0),
+        left_margin: clamp(a.left_margin(), 0.0, 10_000.0),
+        right_margin: clamp(a.right_margin(), 0.0, 10_000.0),
     }
 }
 
@@ -131,20 +132,20 @@ fn main_style(line: &Line) -> (usize, bool) {
 /// Lays out one text field. Fonts are looked up once per face name (`faces`); missing ones go
 /// into the report.
 pub fn field(el: &X, fonts: &Fonts, faces: &mut HashMap<String, FaceMatch>, report: &mut Report) -> Vec<Placed> {
-    if el.attr("orientation").is_some_and(|o| o != "horizontal") {
+    let Some(field) = craft_xfl::text::TextField::new(el) else { return Vec::new() };
+    if field.orientation().is_some_and(|o| o != "horizontal") {
         report.skip("vertical text (drawn horizontal)");
     }
-    if !el.list("filters").is_empty() {
+    if field.has_filters() {
         report.skip("filters on text");
     }
     let mut flags = Flags::default();
     let mut styles: Vec<RunStyle> = Vec::new();
     let mut lines: Vec<Line> = vec![Vec::new()];
     let mut chars = 0usize;
-    let runs = el.list("textRuns");
-    let mut cut = runs.len() > MAX_RUNS;
-    for run in runs.iter().filter(|r| r.name == "DOMTextRun").take(MAX_RUNS) {
-        let style = run_style(run.child("textAttrs").and_then(|t| t.child("DOMTextAttrs")), &mut flags);
+    let mut cut = field.run_entries_count() > MAX_RUNS;
+    for run in field.runs().take(MAX_RUNS) {
+        let style = run_style(run.style(), &mut flags);
         let s = match styles.iter().position(|x| *x == style) {
             Some(i) => i,
             None => {
@@ -152,7 +153,7 @@ pub fn field(el: &X, fonts: &Fonts, faces: &mut HashMap<String, FaceMatch>, repo
                 styles.len() - 1
             }
         };
-        let text = run.child("characters").map_or("", |c| c.text.as_str());
+        let text = run.characters();
         // Animate ends lines with a carriage return; any line break starts a new line here.
         let text = text.replace("\r\n", "\n").replace(['\r', '\u{2028}', '\u{2029}'], "\n");
         for (i, piece) in text.split('\n').enumerate() {
@@ -178,9 +179,9 @@ pub fn field(el: &X, fonts: &Fonts, faces: &mut HashMap<String, FaceMatch>, repo
     if cut {
         report.skip("text cut to 100,000 characters per field");
     }
-    if el.name != "DOMStaticText" {
+    if field.kind() != craft_xfl::text::TextFieldKind::Static {
         flags.report(report);
-        return text_field(el, fonts, faces, report, &lines, &styles).into_iter().collect();
+        return text_field(field, fonts, faces, report, &lines, &styles).into_iter().collect();
     }
     // Trailing empty lines draw nothing.
     while lines.last().is_some_and(|l| l.iter().all(|(t, _)| t.trim().is_empty())) {
@@ -208,9 +209,9 @@ pub fn field(el: &X, fonts: &Fonts, faces: &mut HashMap<String, FaceMatch>, repo
         }
     }
 
-    let auto = el.bool("autoExpand").unwrap_or(false);
-    let field_width = el.f32("width").filter(|w| *w > 0.0).map(|w| w.min(100_000.0));
-    let origin = Vec2::new(el.f32("left").unwrap_or(0.0) + GUTTER, el.f32("top").unwrap_or(0.0) + GUTTER);
+    let auto = field.auto_expand().unwrap_or(false);
+    let field_width = field.width().filter(|w| *w > 0.0).map(|w| w.min(100_000.0));
+    let origin = Vec2::new(field.left().unwrap_or(0.0) + GUTTER, field.top().unwrap_or(0.0) + GUTTER);
     let mut out: Vec<Placed> = Vec::new();
     let mut y = 0.0f32;
     for (s, text) in blocks {
@@ -286,8 +287,15 @@ pub fn field(el: &X, fonts: &Fonts, faces: &mut HashMap<String, FaceMatch>, repo
 /// A dynamic or input field (ADR 0066): one block in the field's main style, its box from the
 /// field's `width` and `height` (or the text's size, for an auto-size field), its text laid out
 /// inside the gutter. Empty fields are kept (an empty input field is the usual kind).
-fn text_field(el: &X, fonts: &Fonts, faces: &mut HashMap<String, FaceMatch>, report: &mut Report, lines: &[Line], styles: &[RunStyle]) -> Option<Placed> {
-    let kind = if el.name == "DOMInputText" { TextKind::Input } else { TextKind::Dynamic };
+fn text_field(
+    native: craft_xfl::text::TextField<'_, X>,
+    fonts: &Fonts,
+    faces: &mut HashMap<String, FaceMatch>,
+    report: &mut Report,
+    lines: &[Line],
+    styles: &[RunStyle],
+) -> Option<Placed> {
+    let kind = if native.kind() == craft_xfl::text::TextFieldKind::Input { TextKind::Input } else { TextKind::Dynamic };
     report.run(if kind == TextKind::Input { "input text fields" } else { "dynamic text fields" });
     let all: Line = lines.iter().flatten().cloned().collect();
     let (s, mixed) = main_style(&all);
@@ -297,25 +305,25 @@ fn text_field(el: &X, fonts: &Fonts, faces: &mut HashMap<String, FaceMatch>, rep
     let st = styles.get(s).cloned().unwrap_or_else(|| run_style(None, &mut Flags::default()));
     let text: String = lines.iter().map(|l| l.iter().map(|(t, _)| t.as_str()).collect::<String>()).collect::<Vec<_>>().join("\n");
     let text = text.trim_end_matches('\n').to_string();
-    let line_type = match el.attr("lineType") {
+    let line_type = match native.line_type() {
         Some("multiline") => LineType::Multiline,
         Some("multiline no wrap") => LineType::MultilineNoWrap,
         Some("password") if kind == TextKind::Input => LineType::Password,
         _ => LineType::Single,
     };
-    let border = el.bool("border").unwrap_or(false);
-    let variable: String = el.attr("variableName").unwrap_or("").trim().chars().take(anicraft_doc::MAX_FIELD_NAME).collect();
+    let border = native.border().unwrap_or(false);
+    let variable: String = native.variable_name().unwrap_or("").trim().chars().take(anicraft_doc::MAX_FIELD_NAME).collect();
     if !variable.is_empty() {
         report.keep("text field variables (ActionScript 1.0 and 2.0)");
     }
-    if el.bool("renderAsHTML").unwrap_or(false) {
+    if native.render_as_html().unwrap_or(false) {
         report.skip("text fields rendered as HTML (drawn as plain text)");
     }
-    let max_chars = el.f32("maxCharacters").filter(|n| n.is_finite() && *n > 0.0).map_or(0, |n| n.min(anicraft_doc::MAX_FIELD_CHARS as f32) as u32);
+    let max_chars = native.max_characters().filter(|n| *n > 0.0).map_or(0, |n| n.min(anicraft_doc::MAX_FIELD_CHARS as f32) as u32);
     // Animate's "show border" draws a black line round a white box.
-    let field = TextField { lines: line_type, selectable: el.bool("isSelectable").unwrap_or(true), border, background: border, max_chars, variable, ..TextField::new(kind) };
-    let auto = el.bool("autoExpand").unwrap_or(false);
-    let width = el.f32("width").filter(|w| w.is_finite() && *w > 0.0).map(|w| w.min(100_000.0));
+    let field = TextField { lines: line_type, selectable: native.is_selectable().unwrap_or(true), border, background: border, max_chars, variable, ..TextField::new(kind) };
+    let auto = native.auto_expand().unwrap_or(false);
+    let width = native.width().filter(|w| *w > 0.0).map(|w| w.min(100_000.0));
     let face = faces.entry(st.face.clone()).or_insert_with(|| fonts.find_face(&st.face)).clone();
     let wrap = width.and_then(|w| field.wrap_width(w - st.left_margin - st.right_margin));
     let style = anicraft_text::Style {
@@ -352,7 +360,7 @@ fn text_field(el: &X, fonts: &Fonts, faces: &mut HashMap<String, FaceMatch>, rep
         (Some(w), true) => w.max(tw + 2.0 * GUTTER),
         (None, _) => tw + 2.0 * GUTTER,
     };
-    let box_height = el.f32("height").filter(|h| h.is_finite() && *h > 0.0).map_or(th + 2.0 * GUTTER, |h| h.min(100_000.0));
+    let box_height = native.height().filter(|h| *h > 0.0).map_or(th + 2.0 * GUTTER, |h| h.min(100_000.0));
     let block = TextBlock {
         text,
         font: family,
@@ -370,5 +378,5 @@ fn text_field(el: &X, fonts: &Fonts, faces: &mut HashMap<String, FaceMatch>, rep
         field: Some(field),
         on_path: None,
     };
-    Some(Placed { block, offset: Vec2::new(el.f32("left").unwrap_or(0.0), el.f32("top").unwrap_or(0.0)) })
+    Some(Placed { block, offset: Vec2::new(native.left().unwrap_or(0.0), native.top().unwrap_or(0.0)) })
 }
