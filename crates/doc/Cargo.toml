@@ -8,6 +8,7 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
+craft-mime.workspace = true
 anicraft-geom.workspace = true
 serde = { workspace = true, features = ["rc"] }
 # Bitmaps are decoded and encoded via craft-image-codecs.

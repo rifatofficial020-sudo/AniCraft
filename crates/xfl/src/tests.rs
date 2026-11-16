@@ -1,7 +1,7 @@
 //! Import tests on a small, self-authored XFL package.
 
 use crate::import::{XflError, import_with};
-use anicraft_doc::{ElementKind, LayerKind, LoopMode, Paint, Rgba, SymbolKind, evaluate};
+use anicraft_doc::{ColorEffect, ColorTransform, ElementKind, LayerKind, LoopMode, Paint, Rgba, SymbolKind, evaluate};
 use std::collections::HashMap;
 
 #[test]
@@ -209,6 +209,50 @@ fn symbols_instances_and_the_tween_between_them() {
     let ball = dl.items.iter().find(|i| matches!(i.fill, Some(Paint::Solid(c)) if c == Rgba::hex(0xff0000))).expect("the ball renders");
     let x = ball.transform.translation().x;
     assert!(x > 100.0 && x < 300.0, "{x}");
+}
+
+#[test]
+fn shared_native_color_effect_view_preserves_anicraft_style_mapping() {
+    let document = r##"<DOMDocument>
+      <symbols><Include href="Target.xml"/></symbols>
+      <timelines><DOMTimeline name="Scene 1"><layers><DOMLayer name="Layer 1"><frames><DOMFrame index="0"><elements>
+        <DOMSymbolInstance libraryItemName="Target" name="Tint"><color><Color tintMultiplier=".25" tintColor="#336699" brightness=".8" alphaMultiplier=".5"/></color></DOMSymbolInstance>
+        <DOMSymbolInstance libraryItemName="Target" name="Bright"><color><Color brightness="-.25" alphaMultiplier=".75"/></color></DOMSymbolInstance>
+        <DOMSymbolInstance libraryItemName="Target" name="Advanced"><color><Color redMultiplier="2" greenMultiplier="bad" blueMultiplier="-.5" alphaMultiplier=".5" redOffset="255" greenOffset="-127.5" alphaOffset="128"/></color></DOMSymbolInstance>
+      </elements></DOMFrame></frames></DOMLayer></layers></DOMTimeline></timelines>
+    </DOMDocument>"##;
+    let symbol = r#"<DOMSymbolItem name="Target"><timeline><DOMTimeline name="Target"/></timeline></DOMSymbolItem>"#;
+    let files = HashMap::from([("DOMDocument.xml", document), ("LIBRARY/Target.xml", symbol)]);
+    let (doc, _) = import(&files).unwrap();
+    let elements = &doc.timeline(0).layers[0].keyframes[0].elements;
+
+    let mut tint = ColorTransform::tint(Rgba::hex(0x336699), 0.25);
+    tint.mul[3] = 0.5;
+    assert_eq!(elements[0].name, "Tint");
+    assert_eq!(elements[0].color, ColorEffect::Advanced(tint).sanitized(), "tint keeps precedence over brightness and composes alpha");
+
+    let bright = ColorEffect::Brightness(-0.25).with_alpha(0.75);
+    assert_eq!(elements[1].name, "Bright");
+    assert_eq!(elements[1].color, bright.sanitized());
+
+    let advanced = ColorTransform { mul: [2.0, 1.0, -0.5, 0.5], add: [1.0, -0.5, 0.0, 128.0 / 255.0] };
+    assert_eq!(elements[2].name, "Advanced");
+    assert_eq!(
+        elements[2].color,
+        ColorEffect::Advanced(advanced).sanitized(),
+        "invalid multipliers default to identity and offsets stay in XFL byte units until mapping"
+    );
+}
+
+#[test]
+fn bevel_filter_keeps_white_highlight_when_only_alpha_is_stored() {
+    let mut files = package();
+    let document = Box::leak(DOC.replace("<filters>", "<filters><BevelFilter highlightAlpha=\"0.4\"/>").into_boxed_str());
+    files.insert("DOMDocument.xml", document);
+    let (doc, _) = import(&files).unwrap();
+    let ElementKind::Symbol { filters, .. } = &doc.timeline(0).layers[0].keyframes[0].elements[0].kind else { panic!("a symbol instance") };
+    let anicraft_doc::Filter::Bevel { highlight_color, .. } = filters[0].filter else { panic!("a bevel filter") };
+    assert_eq!(highlight_color, Rgba::WHITE.with_alpha(0.4));
 }
 
 #[test]
@@ -489,6 +533,38 @@ trace(n);]]></script></Actionscript><elements><DOMSymbolInstance libraryItemName
     assert!(d.document_class.is_empty() && !report.kept.contains_key("document class"));
     // Read as ActionScript 3.0, its variable and `?:` are in the subset now (ADR 0052).
     assert!(report.runs.contains_key("frame scripts in ActionScript 3.0"));
+}
+
+#[test]
+fn shared_symbol_metadata_views_keep_prefixed_library_mapping_and_defaults() {
+    let document = r#"<x:DOMDocument xmlns:x="http://ns.adobe.com/xfl/2008/">
+      <x:symbols>
+        <x:Extension href="Missing.xml"/>
+        <x:Include href="Ui/Panel.xml"/>
+        <x:Include href="Ui/Panel.xml"/>
+      </x:symbols>
+      <x:folders><x:Extension name="Ignored"/><x:DOMFolderItem name="Empty"/></x:folders>
+      <x:timelines><x:DOMTimeline name="Scene 1"><x:layers/></x:DOMTimeline></x:timelines>
+    </x:DOMDocument>"#;
+    let symbol = r#"<x:DOMSymbolItem xmlns:x="http://ns.adobe.com/xfl/2008/" name="Ui/Panel" symbolType="button"
+        linkageExportForAS="true" linkageClassName=" " linkageIdentifier="ui.Panel"
+        linkageBaseClass="flash.display.MovieClip"
+        scaleGridLeft="90" scaleGridRight="10" scaleGridTop="30" scaleGridBottom="10">
+      <x:timeline><x:DOMTimeline name="Panel"><x:layers/></x:DOMTimeline></x:timeline>
+    </x:DOMSymbolItem>"#;
+    let files = HashMap::from([("DOMDocument.xml", document), ("LIBRARY/Ui/Panel.xml", symbol)]);
+    let (doc, report) = import(&files).unwrap();
+
+    assert_eq!(doc.library.len(), 1, "repeated Include paths still register one library symbol");
+    let panel = &doc.library[0];
+    assert_eq!(panel.name, "Panel");
+    assert_eq!(panel.kind, SymbolKind::Button);
+    assert_eq!(panel.linkage.as_ref().map(|linkage| (linkage.class.as_str(), linkage.base.as_str())), Some(("ui.Panel", "flash.display.MovieClip")));
+    let grid = panel.scale_grid.expect("all four finite guide attributes form a grid");
+    assert_eq!((grid.left, grid.right, grid.top, grid.bottom), (10.0, 90.0, 10.0, 30.0));
+    let folder_paths: Vec<String> = doc.library_tree.folders.iter().map(|folder| doc.entry_path(anicraft_doc::LibraryEntry::Folder(folder.id))).collect();
+    assert_eq!(folder_paths, ["Empty", "Ui"]);
+    assert!(!report.skipped.contains_key("missing library files"), "non-Include extension nodes are ignored");
 }
 
 #[test]

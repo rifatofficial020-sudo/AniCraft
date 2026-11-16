@@ -167,19 +167,7 @@ pub(crate) mod base64_bytes {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     pub fn encode(data: &[u8]) -> String {
-        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-        for chunk in data.chunks(3) {
-            let b = [chunk.first().copied().unwrap_or(0), chunk.get(1).copied().unwrap_or(0), chunk.get(2).copied().unwrap_or(0)];
-            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-            for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
-                if i <= chunk.len() {
-                    out.push(ALPHABET[((n >> shift) & 63) as usize] as char);
-                } else {
-                    out.push('=');
-                }
-            }
-        }
-        out
+        craft_mime::base64::STANDARD.encode(data)
     }
 
     pub fn decode(text: &str) -> Option<Vec<u8>> {
@@ -226,6 +214,22 @@ mod tests {
 
     fn png_of(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
         encode_png(w, h, rgba).unwrap()
+    }
+
+    #[test]
+    fn shared_base64_encoder_preserves_all_byte_remainders() {
+        for (input, expected) in
+            [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("fooba", "Zm9vYmE="), ("foobar", "Zm9vYmFy")]
+        {
+            assert_eq!(base64_bytes::encode(input.as_bytes()), expected);
+        }
+        let all: Vec<u8> = (0..=255).cycle().take(513).collect();
+        for len in 0..=all.len() {
+            let encoded = base64_bytes::encode(&all[..len]);
+            assert_eq!(encoded.len(), len.div_ceil(3) * 4);
+            assert_eq!(encoded.bytes().rev().take_while(|b| *b == b'=').count(), (3 - len % 3) % 3);
+            assert_eq!(base64_bytes::decode(&encoded).as_deref(), Some(&all[..len]));
+        }
     }
 
     #[test]

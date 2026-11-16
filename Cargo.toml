@@ -28,12 +28,15 @@ anicraft-audio = { path = "crates/audio" }
 anicraft-gpu = { path = "crates/gpu" }
 anicraft-guide = { path = "crates/guide" }
 craft-anicraft-format = { git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18" }
+craft-mime = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18" }
 craft-audio = { git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18", default-features = false, features = ["decode", "pcm-encode"] }
 craft-gif = { git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18" }
+# Isolate the already-merged APNG container from the existing raster-codec pin.
+craft-apng-container = { package = "craft-image-codecs", version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "55b1d7f3c598b600a130ae63f4a40334a230ae7b", default-features = false }
 craft-image-codecs = { git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18" }
-craft-webp = { git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18" }
-craft-xfl = { git = "https://github.com/storytold/craft-libs", rev = "7f3fdc0dfebd03f33a241f91f916e9a78d3e5c93" }
-craft-xml = { git = "https://github.com/storytold/craft-libs", rev = "7f3fdc0dfebd03f33a241f91f916e9a78d3e5c93" }
+craft-webp = { git = "https://github.com/storytold/craft-libs", rev = "0c144b7d983899d4b5b281046dd03a8b1ab35fbb" }
+craft-xfl = { git = "https://github.com/storytold/craft-libs", rev = "b67b9f90c50091a3090f93fa054c34e409edba11" }
+craft-xml = { git = "https://github.com/storytold/craft-libs", rev = "b67b9f90c50091a3090f93fa054c34e409edba11" }
 # The GPU stage (ADR 0019) uses the wgpu that eframe's egui-wgpu brings, with the same
 # (default) features, so the tree keeps one wgpu build.
 wgpu = "30"

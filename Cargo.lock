@@ -295,7 +295,8 @@ dependencies = [
  "anicraft-actions",
  "anicraft-audio",
  "anicraft-geom",
- "craft-image-codecs",
+ "craft-image-codecs 0.1.0 (git+https://github.com/storytold/craft-libs?rev=f0f4758c01581d79577b9bf5046c06f4e77b1f18)",
+ "craft-mime",
  "serde",
  "serde_json",
 ]
@@ -313,7 +314,8 @@ dependencies = [
  "anicraft-xfl",
  "craft-anicraft-format",
  "craft-gif",
- "craft-image-codecs",
+ "craft-image-codecs 0.1.0 (git+https://github.com/storytold/craft-libs?rev=55b1d7f3c598b600a130ae63f4a40334a230ae7b)",
+ "craft-image-codecs 0.1.0 (git+https://github.com/storytold/craft-libs?rev=f0f4758c01581d79577b9bf5046c06f4e77b1f18)",
  "craft-webp",
  "miniz_oxide 0.8.9",
  "rayon",
@@ -375,7 +377,7 @@ dependencies = [
  "anicraft-doc",
  "anicraft-geom",
  "boa_engine",
- "craft-image-codecs",
+ "craft-image-codecs 0.1.0 (git+https://github.com/storytold/craft-libs?rev=f0f4758c01581d79577b9bf5046c06f4e77b1f18)",
  "rayon",
  "serde_json",
  "thiserror 2.0.21",
@@ -410,7 +412,7 @@ dependencies = [
  "anicraft-geom",
  "anicraft-text",
  "anicraft-xml",
- "craft-image-codecs",
+ "craft-image-codecs 0.1.0 (git+https://github.com/storytold/craft-libs?rev=f0f4758c01581d79577b9bf5046c06f4e77b1f18)",
  "craft-xfl",
  "miniz_oxide 0.8.9",
  "thiserror 2.0.21",
@@ -1124,6 +1126,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "core_detect"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
+
+[[package]]
 name = "core_maths"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1216,6 +1224,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-codepage"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=f0f4758c01581d79577b9bf5046c06f4e77b1f18#f0f4758c01581d79577b9bf5046c06f4e77b1f18"
+
+[[package]]
 name = "craft-gif"
 version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=f0f4758c01581d79577b9bf5046c06f4e77b1f18#f0f4758c01581d79577b9bf5046c06f4e77b1f18"
@@ -1226,10 +1239,35 @@ dependencies = [
 [[package]]
 name = "craft-image-codecs"
 version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=55b1d7f3c598b600a130ae63f4a40334a230ae7b#55b1d7f3c598b600a130ae63f4a40334a230ae7b"
+dependencies = [
+ "craft-jpeg 0.1.0 (git+https://github.com/storytold/craft-libs?rev=55b1d7f3c598b600a130ae63f4a40334a230ae7b)",
+ "craft-metadata 0.1.0 (git+https://github.com/storytold/craft-libs?rev=55b1d7f3c598b600a130ae63f4a40334a230ae7b)",
+ "crc32fast",
+ "exr",
+ "flate2",
+ "half",
+ "hayro-jpeg2000",
+ "image",
+ "image-webp",
+ "jpeg-encoder",
+ "png",
+ "rayon",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tiff",
+ "zune-core",
+ "zune-jpeg",
+ "zune-jpegxl",
+]
+
+[[package]]
+name = "craft-image-codecs"
+version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=f0f4758c01581d79577b9bf5046c06f4e77b1f18#f0f4758c01581d79577b9bf5046c06f4e77b1f18"
 dependencies = [
- "craft-jpeg",
- "craft-metadata",
+ "craft-jpeg 0.1.0 (git+https://github.com/storytold/craft-libs?rev=f0f4758c01581d79577b9bf5046c06f4e77b1f18)",
+ "craft-metadata 0.1.0 (git+https://github.com/storytold/craft-libs?rev=f0f4758c01581d79577b9bf5046c06f4e77b1f18)",
  "exr",
  "flate2",
  "half",
@@ -1244,6 +1282,14 @@ dependencies = [
  "zune-core",
  "zune-jpeg",
  "zune-jpegxl",
+]
+
+[[package]]
+name = "craft-jpeg"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=55b1d7f3c598b600a130ae63f4a40334a230ae7b#55b1d7f3c598b600a130ae63f4a40334a230ae7b"
+dependencies = [
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1265,13 +1311,44 @@ dependencies = [
 [[package]]
 name = "craft-metadata"
 version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=55b1d7f3c598b600a130ae63f4a40334a230ae7b#55b1d7f3c598b600a130ae63f4a40334a230ae7b"
+dependencies = [
+ "brotli-decompressor",
+ "chrono",
+ "craft-tiff 0.1.0 (git+https://github.com/storytold/craft-libs?rev=55b1d7f3c598b600a130ae63f4a40334a230ae7b)",
+ "quick-xml 0.41.0",
+ "serde",
+]
+
+[[package]]
+name = "craft-metadata"
+version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=f0f4758c01581d79577b9bf5046c06f4e77b1f18#f0f4758c01581d79577b9bf5046c06f4e77b1f18"
 dependencies = [
  "brotli-decompressor",
  "chrono",
- "craft-tiff",
+ "craft-tiff 0.1.0 (git+https://github.com/storytold/craft-libs?rev=f0f4758c01581d79577b9bf5046c06f4e77b1f18)",
  "quick-xml 0.41.0",
  "serde",
+]
+
+[[package]]
+name = "craft-mime"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=f0f4758c01581d79577b9bf5046c06f4e77b1f18#f0f4758c01581d79577b9bf5046c06f4e77b1f18"
+dependencies = [
+ "chrono",
+ "craft-codepage",
+ "encoding_rs",
+]
+
+[[package]]
+name = "craft-tiff"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=55b1d7f3c598b600a130ae63f4a40334a230ae7b#55b1d7f3c598b600a130ae63f4a40334a230ae7b"
+dependencies = [
+ "serde",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1311,7 +1388,7 @@ dependencies = [
 [[package]]
 name = "craft-webp"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=f0f4758c01581d79577b9bf5046c06f4e77b1f18#f0f4758c01581d79577b9bf5046c06f4e77b1f18"
+source = "git+https://github.com/storytold/craft-libs?rev=0c144b7d983899d4b5b281046dd03a8b1ab35fbb#0c144b7d983899d4b5b281046dd03a8b1ab35fbb"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -1319,7 +1396,7 @@ dependencies = [
 [[package]]
 name = "craft-xfl"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=7f3fdc0dfebd03f33a241f91f916e9a78d3e5c93#7f3fdc0dfebd03f33a241f91f916e9a78d3e5c93"
+source = "git+https://github.com/storytold/craft-libs?rev=b67b9f90c50091a3090f93fa054c34e409edba11#b67b9f90c50091a3090f93fa054c34e409edba11"
 dependencies = [
  "craft-xml",
  "miniz_oxide 0.8.9",
@@ -1329,7 +1406,7 @@ dependencies = [
 [[package]]
 name = "craft-xml"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=7f3fdc0dfebd03f33a241f91f916e9a78d3e5c93#7f3fdc0dfebd03f33a241f91f916e9a78d3e5c93"
+source = "git+https://github.com/storytold/craft-libs?rev=b67b9f90c50091a3090f93fa054c34e409edba11#b67b9f90c50091a3090f93fa054c34e409edba11"
 dependencies = [
  "quick-xml 0.41.0",
  "serde",
@@ -1648,6 +1725,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52c8d4141cf0f60fb2f7aefaf352d3ffa5171ef0ab09731c64391801e95e48f1"
 dependencies = [
  "bytemuck",
+]
+
+[[package]]
+name = "encoding_rs"
+version = "0.8.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89253175e704ab869b04f9db224d38630e0211a53841a79181deae0889e169f5"
+dependencies = [
+ "cfg-if",
+ "core_detect",
+ "multiversion_no_op",
+ "rustversion",
+ "scopeguard",
+ "simdutf8",
 ]
 
 [[package]]
@@ -2279,6 +2370,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hayro-jpeg2000"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c75ab947623ef4ccaa7acf0579edf7cbb5a73838e3839a7be73335e522f433a1"
+dependencies = [
+ "fearless_simd",
+]
+
+[[package]]
 name = "hermit-abi"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2790,6 +2890,12 @@ dependencies = [
  "syn 2.0.119",
  "target-features",
 ]
+
+[[package]]
+name = "multiversion_no_op"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "naga"
