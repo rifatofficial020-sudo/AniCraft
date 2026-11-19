@@ -214,6 +214,8 @@ struct Anchor {
     /// The pass that drew it: a panel that stopped drawing (the timeline while the Motion
     /// Editor shows) has no anchor.
     pass: u64,
+    /// The layer it is drawn on: a docked panel under a floating window isn't the one pointed at.
+    layer: egui::LayerId,
 }
 
 /// Registers `resp` as the anchor of `region`, which covers `area` on screen. While a surface's
@@ -221,7 +223,7 @@ struct Anchor {
 /// of moving focus to the neighbouring widget.
 pub fn anchor(ui: &egui::Ui, region: Region, area: Rect, resp: &Response) {
     let pass = ui.ctx().cumulative_pass_nr();
-    ui.ctx().data_mut(|d| d.insert_temp(region.key(), Anchor { id: resp.id, rect: area, pass }));
+    ui.ctx().data_mut(|d| d.insert_temp(region.key(), Anchor { id: resp.id, rect: area, pass, layer: ui.layer_id() }));
     if region.is_surface() && resp.has_focus() {
         let filter = egui::EventFilter { horizontal_arrows: true, vertical_arrows: true, ..Default::default() };
         ui.memory_mut(|m| m.set_focus_lock_filter(resp.id, filter));
@@ -232,6 +234,21 @@ pub fn anchor(ui: &egui::Ui, region: Region, area: Rect, resp: &Response) {
 fn anchor_of(ctx: &egui::Context, region: Region) -> Option<Anchor> {
     let now = ctx.cumulative_pass_nr();
     ctx.data(|d| d.get_temp::<Anchor>(region.key())).filter(|a| a.pass + 1 >= now)
+}
+
+/// The panel under the pointer at `pos`, if any (context help, ADR 0096): the one drawn on the
+/// topmost layer there.
+pub fn region_at(ctx: &egui::Context, pos: egui::Pos2) -> Option<Region> {
+    let top = ctx.layer_id_at(pos);
+    let order = order(ctx);
+    let hits: Vec<(Region, Anchor)> = order.into_iter().filter_map(|r| anchor_of(ctx, r).map(|a| (r, a))).filter(|(_, a)| a.rect.contains(pos)).collect();
+    hits.iter().find(|(_, a)| Some(a.layer) == top).or(hits.first()).map(|(r, _)| *r)
+}
+
+/// Where a panel was drawn this pass or the one before.
+#[cfg(test)]
+pub fn region_rect(ctx: &egui::Context, region: Region) -> Option<Rect> {
+    anchor_of(ctx, region).map(|a| a.rect)
 }
 
 /// The panel holding the focused widget, if any.
@@ -426,7 +443,7 @@ mod tests {
         for tool in [Tool::Bone, Tool::Bind, Tool::Warp, Tool::Rect, Tool::Star, Tool::Text, Tool::Pencil, Tool::Brush, Tool::PaintBrush, Tool::Eraser, Tool::PaintBucket, Tool::InkBottle, Tool::Eyedropper, Tool::Pen] {
             found.extend(check(&format!("{tool:?} tool"), |a, _| a.tool = tool));
         }
-        for panel in ["select", "motion", "motionspan", "motionpath", "motionpoints", "motionedit", "motionpins", "motionpinsspan", "rawsub", "camera", "cameraview", "bones", "springbones", "shapebones", "shapeweights", "warp", "sound", "envelope", "prefs", "shortcuts", "palette", "about", "files", "licenses", "confirm", "recovery", "frames", "actions", "script", "scriptproblems", "testscript", "onion", "onionmenu", "editmultiple", "library", "librarymenu", "edittransform", "onionsymbol", "layerprops", "frameview", "layercolour", "timelinepolish", "convert", "mixed", "bitmap", "nineslice", "nineslicedit", "find", "explorer", "publish", "publishreport", "publishanim", "start", "drop", "droplibrary", "testmovie", "testmovieinside", "templates", "savetemplate", "droptimeline", "textfields", "testtext", "softmask", "pathtext", "gradient", "gradientbucket", "swatches", "swatchpanel", "brushlibrary", "brushcurve", "paintbrush"] {
+        for panel in ["select", "motion", "motionspan", "motionpath", "motionpoints", "motionedit", "motionpins", "motionpinsspan", "rawsub", "camera", "cameraview", "bones", "springbones", "shapebones", "shapeweights", "mixedbones", "warp", "sound", "envelope", "audiokeys", "audiokeysevent", "lipsync", "prefs", "shortcuts", "palette", "about", "files", "licenses", "confirm", "recovery", "frames", "actions", "script", "scriptproblems", "testscript", "onion", "onionmenu", "editmultiple", "library", "librarymenu", "edittransform", "onionsymbol", "layerprops", "layeropacity", "pivot", "frameview", "layercolour", "timelinepolish", "convert", "mixed", "bitmap", "nineslice", "nineslicedit", "find", "explorer", "publish", "publishreport", "publishanim", "start", "drop", "droplibrary", "testmovie", "testmovieinside", "templates", "savetemplate", "droptimeline", "textfields", "testtext", "richtext", "softmask", "pathtext", "gradient", "gradientbucket", "swatches", "swatchpanel", "brushlibrary", "brushcurve", "paintbrush"] {
             found.extend(check(panel, |a, _| a.open_panel(Some(panel))));
         }
         // Every panel in front where it docks, and floating (ADR 0075); the other workspaces.
@@ -454,6 +471,7 @@ mod tests {
             a.open_panel(Some("testmovie"));
         }));
         // The layer depth row shows on artwork layers once the scene has a camera.
+        found.extend(check("parenting view", |a, _| a.open_panel(Some("parenting"))));
         found.extend(check("layer depth", |a, _| {
             a.open_panel(Some("camera"));
             a.run("layer.select", serde_json::json!({"index": 1}));
@@ -797,6 +815,89 @@ mod tests {
         app.set_prefs(&ctx, crate::prefs::Prefs { theme: Palette::Light, theme_follows_system: Some(false), ..app.prefs.clone() });
         assert_eq!(ctx.global_style().visuals.widgets.inactive.bg_stroke.color, LIGHT.border);
         crate::theme::apply_palette(&egui::Context::default(), Palette::Graphite);
+    }
+
+    /// Your own themes (ADR 0117), end to end: listed in Preferences with what was refused and
+    /// why, chosen, changed on disk and reloaded in the same frame, never applied in part, and
+    /// exported to start a new one from.
+    #[test]
+    fn your_own_themes_are_listed_chosen_reloaded_and_exported() {
+        use crate::theme::{GRAPHITE, Palette, T, role_colour};
+        let dir = std::env::temp_dir().join(format!("anicraft-themes-shell-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a folder");
+        let plum = |accent: &str| format!(r##"{{"anicraft_theme": 1, "name": "Plum", "author": "Sam", "colors": {{"accent": "{accent}", "icon_accent": "#9a3ce04d"}}}}"##);
+        std::fs::write(dir.join("plum.json"), plum("#9a3ce0")).expect("written");
+        std::fs::write(dir.join("faint.json"), r##"{"anicraft_theme": 1, "name": "Faint", "colors": {"text_dim": "#666670"}}"##).expect("written");
+        let folder = dir.clone();
+        let (t, mut app, ctx) = tree(move |a, ctx| {
+            a.themes_dir = Some(folder);
+            a.reload_themes(ctx);
+            a.open_panel(Some("prefs"));
+        });
+        // Preferences lists both, each named; the refused one can't be picked and says why,
+        // naming the roles; the folder's buttons are there. Everything passes the audit.
+        let says = |t: &TreeUpdate, what: &str| t.nodes.iter().any(|(_, n)| n.label().is_some_and(|l| l.contains(what)) || n.value().is_some_and(|v| v.contains(what)));
+        let named = |t: &TreeUpdate, label: &str| t.nodes.iter().map(|(_, n)| n).find(|n| n.label() == Some(label)).unwrap_or_else(|| panic!("no node named {label}")).clone();
+        assert_eq!(named(&t, "Plum").role(), Role::RadioButton);
+        assert!(!named(&t, "Plum").is_disabled() && named(&t, "faint (refused)").is_disabled());
+        assert!(says(&t, "Your theme, by Sam, from plum.json."));
+        assert!(says(&t, "faint.json is not used. text_dim on panel has a contrast of") && says(&t, "it needs 4.5:1"));
+        for button in ["Open Themes Folder", "Reload", "Export Current Theme"] {
+            assert_eq!(named(&t, button).role(), Role::Button, "{button}");
+        }
+        assert_eq!(audit(&t), Vec::<String>::new());
+        assert!(app.status.as_ref().is_some_and(|s| s.error && s.text.contains("1 refused")), "{:?}", app.status.as_ref().map(|s| &s.text));
+        // Chosen: every token read from here on is the theme's, over its base.
+        let choose = |app: &mut App, ctx: &egui::Context, id: &str| app.set_prefs(ctx, crate::prefs::Prefs { theme_file: Some(id.into()), theme_follows_system: Some(false), ..app.prefs.clone() });
+        choose(&mut app, &ctx, "plum");
+        assert!(crate::theme::user_theme_active());
+        assert_eq!((T.accent, T.accent_end, T.panel), (role_colour(0x9a, 0x3c, 0xe0, 255), role_colour(0x9a, 0x3c, 0xe0, 255), GRAPHITE.panel));
+        assert_eq!(ctx.global_style().visuals.selection.stroke.color, T.accent);
+        // The file changes; Reload shows it at once.
+        std::fs::write(dir.join("plum.json"), plum("#a13fe0")).expect("written");
+        app.reload_themes(&ctx);
+        assert_eq!(T.accent, role_colour(0xa1, 0x3f, 0xe0, 255));
+        // The file breaks: nothing of it is applied, the built-in palette it was based on shows,
+        // and the reason is said. The choice is kept, so mending the file brings it back.
+        std::fs::write(dir.join("plum.json"), plum("#24242a")).expect("written");
+        app.reload_themes(&ctx);
+        assert!(!crate::theme::user_theme_active());
+        assert_eq!(*T, GRAPHITE);
+        assert!(app.status.as_ref().is_some_and(|s| s.error), "the refusal is said");
+        assert_eq!(app.prefs.theme_file.as_deref(), Some("plum"));
+        std::fs::write(dir.join("plum.json"), plum("#9a3ce0")).expect("written");
+        app.reload_themes(&ctx);
+        assert!(crate::theme::user_theme_active() && T.accent == role_colour(0x9a, 0x3c, 0xe0, 255));
+        // Export Current Theme writes every role of the look in use, and lists the file.
+        app.export_theme(&ctx);
+        let exported = crate::theme_file::read(&dir.join("my-theme.json")).expect("the export is a theme");
+        assert_eq!((exported.tokens, exported.name.as_deref()), (*T, Some("Copy of Plum")));
+        assert!(app.themes.get("my-theme").is_some_and(|e| e.theme.is_ok()));
+        app.export_theme(&ctx);
+        assert!(dir.join("my-theme-2.json").is_file(), "a second export never overwrites the first");
+        // A refused theme can't become the look, whatever the preferences say.
+        choose(&mut app, &ctx, "faint");
+        assert!(!crate::theme::user_theme_active());
+        assert!(app.status.as_ref().is_some_and(|s| s.error && s.text.contains("text_dim on panel")), "{:?}", app.status.as_ref().map(|s| &s.text));
+        // A file that is gone: the palette it was based on, and a message.
+        choose(&mut app, &ctx, "plum");
+        std::fs::remove_file(dir.join("plum.json")).expect("removed");
+        app.reload_themes(&ctx);
+        assert!(!crate::theme::user_theme_active() && *T == GRAPHITE);
+        assert!(app.status.as_ref().is_some_and(|s| s.error && s.text.contains("not in the themes folder")));
+        // A built-in palette chosen again forgets the file.
+        let mut p = app.prefs.clone();
+        p.theme = Palette::Light;
+        p.theme_file = None;
+        app.set_prefs(&ctx, p);
+        assert_eq!((crate::theme::palette(), crate::theme::user_theme_active()), (Palette::Light, false));
+        // No folder (a browser, a test): the buttons say so instead of doing anything.
+        app.themes_dir = None;
+        app.export_theme(&ctx);
+        assert!(app.status.as_ref().is_some_and(|s| s.error));
+        crate::theme::apply_palette(&egui::Context::default(), Palette::Graphite);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

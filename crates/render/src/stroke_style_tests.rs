@@ -2,6 +2,7 @@
 
 use super::*;
 
+/// The area the loops cover (holes count against).
 fn area(polys: &[Vec<Vec2>]) -> f32 {
     polys.iter().map(|p| signed_area(p)).sum()
 }
@@ -9,7 +10,7 @@ fn area(polys: &[Vec<Vec2>]) -> f32 {
 fn styled(points: &[(f32, f32)], closed: bool, hw: f32, o: &Outline) -> Vec<Vec<Vec2>> {
     let pl = Polyline { points: points.iter().map(|&(x, y)| Vec2::new(x, y)).collect(), closed };
     let polys = styled_polygons(&[pl], hw, o, None, None, false);
-    assert!(polys.iter().all(|p| signed_area(p) >= 0.0 && p.iter().all(|q| q.is_finite())), "positive and finite");
+    assert!(polys.iter().flatten().all(|q| q.is_finite()), "finite");
     polys
 }
 
@@ -17,21 +18,9 @@ fn outline(cap: Cap, join: Join) -> Outline<'static> {
     Outline { cap, join, ..Outline::ROUND }
 }
 
-/// Whether `q` is inside the union (non-zero winding over every polygon).
+/// Whether `q` is inside the stroke.
 fn covered(polys: &[Vec<Vec2>], q: Vec2) -> bool {
-    let mut wn = 0i32;
-    for p in polys {
-        for (i, &a) in p.iter().enumerate() {
-            let b = p[(i + 1) % p.len()];
-            let side = (b - a).cross(q - a);
-            if a.y <= q.y && b.y > q.y && side > 0.0 {
-                wn += 1;
-            } else if a.y > q.y && b.y <= q.y && side < 0.0 {
-                wn -= 1;
-            }
-        }
-    }
-    wn != 0
+    super::tests::winding(polys, q) != 0
 }
 
 /// The union's area by sampling a grid `step` apart over `[x0, x1] × [y0, y1]`.
@@ -72,8 +61,10 @@ fn miter_bevel_and_round_corners() {
     let l = [(0.0, 0.0), (50.0, 0.0), (50.0, 50.0)];
     let corner = |join| {
         let polys = styled(&l, false, 5.0, &outline(Cap::Butt, join));
-        // The corner piece alone: everything but the two segment rectangles.
-        area(&polys) - 2.0 * 500.0
+        assert_eq!(polys.len(), 1);
+        // The corner piece alone: everything but the two segment rectangles, which share a
+        // 5 × 5 square on the inside of the bend.
+        area(&polys) - (2.0 * 500.0 - 25.0)
     };
     assert!((corner(Join::Miter) - 25.0).abs() < 1e-3, "a 5 × 5 square: {}", corner(Join::Miter));
     assert!((corner(Join::Bevel) - 12.5).abs() < 1e-3, "half of it: {}", corner(Join::Bevel));
@@ -99,7 +90,8 @@ fn the_miter_limit_bevels_sharp_corners() {
     let ratio = 1.0 / 10f32.to_radians().sin();
     let reach = |limit: f32| {
         let o = Outline { miter_limit: limit, ..outline(Cap::Butt, Join::Miter) };
-        styled(&l, false, 2.0, &o).iter().flatten().map(|q| q.distance(Vec2::new(50.0, 0.0))).filter(|d| *d < 20.0).fold(0.0f32, f32::max)
+        // (On the outside of the bend: right of the corner.)
+        styled(&l, false, 2.0, &o).iter().flatten().filter(|q| q.x > 50.0).map(|q| q.distance(Vec2::new(50.0, 0.0))).fold(0.0f32, f32::max)
     };
     assert!((reach(6.0) - ratio * 2.0).abs() < 1e-3, "under the limit: a point {} px out", reach(6.0));
     assert!(reach(5.5) < 2.0 + 1e-3, "over the limit: bevelled, {} px out", reach(5.5));
@@ -158,7 +150,6 @@ fn dashes_keep_the_width_profile_of_their_place() {
     let pattern = [10.0, 10.0];
     let o = Outline { dash: Some((&pattern, 0.0)), ..outline(Cap::Butt, Join::Round) };
     let polys = styled_polygons(std::slice::from_ref(&line), 5.0, &o, Some(&taper), None, false);
-    assert!(polys.iter().all(|p| signed_area(p) >= 0.0));
     // In the dash from 40 to 50 the half-width is the profile's there; 50..60 is a gap.
     for x in [42.0f32, 45.0, 48.0] {
         let want = taper.at(x / 100.0).0 * 5.0;
@@ -173,8 +164,8 @@ fn dots_are_discs_one_width_across() {
     let o = Outline { dash: Some((&pattern, 0.0)), ..outline(Cap::Round, Join::Round) };
     let line = [(0.0, 0.0), (100.0, 0.0)];
     let polys = styled(&line, false, 2.0, &o);
-    // Eleven dots (0, 10, … 100), each two half discs of radius 2.
-    assert_eq!(polys.len(), 22);
+    // Eleven dots (0, 10, … 100), each a disc of radius 2.
+    assert_eq!(polys.len(), 11);
     let want = 11.0 * std::f32::consts::PI * 4.0;
     assert!((area(&polys) - want).abs() < 0.08 * want, "within the arc tolerance: {} vs {want}", area(&polys));
     assert!(covered(&polys, Vec2::new(30.0, 1.5)) && !covered(&polys, Vec2::new(35.0, 0.0)));
@@ -186,7 +177,7 @@ fn dots_are_discs_one_width_across() {
 }
 
 #[test]
-fn round_solid_strokes_take_the_old_paths_exactly() {
+fn round_solid_strokes_are_the_plain_strokers() {
     let pl = Polyline { points: vec![Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), Vec2::new(10.0, 10.0)], closed: false };
     assert_eq!(styled_polygons(std::slice::from_ref(&pl), 2.0, &Outline::ROUND, None, None, false), stroke_polygons(std::slice::from_ref(&pl), 2.0));
     let taper = anicraft_doc::ProfilePreset::TaperEnd.profile().unwrap();

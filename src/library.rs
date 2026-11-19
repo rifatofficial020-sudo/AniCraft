@@ -510,7 +510,7 @@ fn list_ui(app: &mut App, ui: &mut egui::Ui, list: &[Row], unused: &HashSet<Libr
                 p.rect_filled(r, T.rc(), if selected { T.accent_dim } else { T.hover });
             }
             if selected {
-                p.rect_filled(Rect::from_min_size(r.left_top(), vec2(3.0, r.height())), 0.0, T.accent);
+                crate::theme::accent_bar(p, Rect::from_min_size(r.left_top(), vec2(3.0, r.height())));
             }
             let indent = 6.0 + row.depth as f32 * 14.0;
             let chevron = Rect::from_center_size(pos2(r.left() + indent + 6.0, r.center().y), vec2(12.0, 12.0));
@@ -794,7 +794,7 @@ fn properties(app: &mut App, ui: &mut egui::Ui) {
                     .width(crate::theme::fit(ui, 150.0))
                     .selected_text(crate::panels::symbol_kind_label(kind))
                     .show_ui(ui, |ui| {
-                        for (k, key) in [(SymbolKind::Graphic, "graphic"), (SymbolKind::MovieClip, "movie_clip"), (SymbolKind::Button, "button")] {
+                        for (k, key) in [(SymbolKind::MovieClip, "movie_clip"), (SymbolKind::Button, "button"), (SymbolKind::Graphic, "graphic")] {
                             if ui.selectable_label(kind == k, crate::panels::symbol_kind_label(k)).clicked() && kind != k {
                                 app.run("symbol.set_kind", json!({"symbol": id.0, "kind": key}));
                             }
@@ -931,7 +931,7 @@ fn symbol_frame(doc: &Document, id: anicraft_engine::doc::SymbolId) -> anicraft_
             name: String::new(),
             transform: Default::default(),
             color: Default::default(),
-            kind: ElementKind::Symbol { symbol: id, loop_mode: LoopMode::SingleFrame, first_frame: 0, blend: Default::default(), filters: Vec::new(), events: Vec::new() },
+            kind: ElementKind::Symbol { symbol: id, loop_mode: LoopMode::SingleFrame, first_frame: 0, blend: Default::default(), filters: Vec::new(), events: Vec::new(), pivot: None },
         })];
     }
     let mut scene = Scene::new("");

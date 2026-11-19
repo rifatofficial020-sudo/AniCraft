@@ -122,7 +122,9 @@ fn all_keys() -> BTreeSet<Key> {
     }
     add(&doc::Easing::Linear.label());
     doc::Property::ALL.iter().for_each(|p| add(p.label()));
-    doc::FilterParam::ALL.iter().for_each(|p| add(p.label()));
+    doc::FilterParam::all().iter().for_each(|p| add(p.label()));
+    [doc::FilterColor::Color, doc::FilterColor::Shadow, doc::FilterColor::Highlight, doc::FilterColor::Stop(0)].iter().for_each(|c| add(c.label()));
+    anicraft_engine::filter_library::BUILTIN_NAMES.iter().for_each(|n| add(n));
     add("Filters");
     add("Filter");
     doc::ColorStyle::ALL.iter().for_each(|s| add(s.label()));
@@ -309,6 +311,37 @@ fn offered_languages_have_their_own_catalog_and_a_ready_script() {
 }
 
 #[test]
+fn georgian_is_offered_only_when_its_face_is_embedded() {
+    let ka = [("ka", "", "@id\tlanguage.name\tქართული\n")];
+    let offered = |face: bool| Languages::new(&ka, &ready_with(face)).0.list.iter().any(|l| l.code == "ka");
+    assert!(!offered(false), "no face, no Georgian");
+    assert!(offered(true));
+    // The real build agrees with its own face.
+    assert_eq!(ready_codes().contains(&"ka"), crate::theme::georgian_font().is_some());
+    // CRAFT_FONTS_REQUIRED=1 (release builds, CI with craft-fonts) makes a missing face a failure.
+    let face = crate::theme::georgian_font();
+    if std::env::var("CRAFT_FONTS_REQUIRED").is_ok_and(|v| v == "1") {
+        assert!(face.is_some(), "CRAFT_FONTS_REQUIRED=1 but this build embeds no valid NotoSansGeorgian.ttf (craft-fonts `Geor`)");
+    }
+    let Some(face) = face else {
+        println!("georgian face test: skipped, this build embeds no Georgian face");
+        return;
+    };
+    let letters: String = ('\u{10D0}'..='\u{10FA}').collect();
+    let fonts = anicraft_engine::text::Fonts::from_faces([face.to_vec()]);
+    let laid = fonts.layout(&letters, &anicraft_engine::text::Style::default()).expect("layout");
+    assert_eq!(laid.missing, 0, "the face lacks some of U+10D0..U+10FA");
+    // ... and through the Proportional family install_fonts builds. Not Monospace: epaint's
+    // has_glyph is a false negative there (the Georgian face is that chain's replacement-glyph face).
+    let ctx = egui::Context::default();
+    crate::theme::install_fonts(&ctx, None, None);
+    ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear(); // fonts apply at the start of a frame
+    let prop = egui::FontId::proportional(14.0);
+    assert!(ctx.fonts_mut(|f| f.has_glyphs(&prop, &letters)), "Proportional lacks Georgian letters");
+    println!("georgian face test: ran, {} letters covered", letters.chars().count());
+}
+
+#[test]
 fn lookups_fall_back_from_app_to_shared_to_base_language_to_english() {
     let l = fixture();
     let (de, pt_br, ru) = (1, 2, 3);
@@ -327,6 +360,24 @@ fn lookups_fall_back_from_app_to_shared_to_base_language_to_english() {
     assert_eq!([1, 3, 5, 21].map(|n| l.plural(ru, "{n} frame", "{n} frames", n)), ["{n} кадр", "{n} кадра", "{n} кадров", "{n} кадр"]);
     assert_eq!(l.plural(ru, "{n} layer", "{n} layers", 5), "{n} layers", "two forms for Russian: skipped");
     assert_eq!(l.plural(0, "{n} frame", "{n} frames", 1), "{n} frame");
+}
+
+#[test]
+fn hebrew_two_uses_the_second_catalog_plural_form() {
+    // Hebrew is not offered in production until RTL is supported; this exercises its
+    // existing parser and runtime by explicitly enabling the locale for this unit test.
+    let he_app = "@plural\t{n} frame|{n} frames\t{n} פריים|{n} פריימים (זוג)|{n} פריימים\n";
+    let (languages, problems) = Languages::new(&[("he", "", he_app)], &["he"]);
+    assert!(problems.is_empty(), "{problems:?}");
+    let he = languages.find("he").expect("fixture Hebrew should be offered");
+    let get = |n| languages.plural(he, "{n} frame", "{n} frames", n);
+    assert_eq!(get(0), "{n} פריימים");
+    assert_eq!(get(1), "{n} פריים");
+    assert_eq!(get(2), "{n} פריימים (זוג)", "n=2 must not fall through to other");
+    assert_eq!(get(3), "{n} פריימים");
+    assert_eq!(get(21), "{n} פריימים");
+    let n = 2u64;
+    assert_eq!(fill(get(n), &[("n", &n as &dyn std::fmt::Display)]), "2 פריימים (זוג)");
 }
 
 #[test]
@@ -482,6 +533,21 @@ fn screen() -> egui::RawInput {
     egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 940.0))), ..Default::default() }
 }
 
+// AniCraft is a product identifier, not an untranslated English UI label. Keep the
+// exemption exact: a label like "AniCraft settings" must still be checked.
+fn pseudo_name_is_translated_or_exempt(name: &str) -> bool {
+    name.chars().any(pseudo::is_accented) || EGUI_OWN.contains(&name) || name == "AniCraft"
+}
+
+#[test]
+fn pseudo_a11y_name_exception_is_only_the_product_name() {
+    assert!(pseudo_name_is_translated_or_exempt("AniCraft"));
+    assert!(pseudo_name_is_translated_or_exempt("[Šàvé ~~]"));
+    assert!(!pseudo_name_is_translated_or_exempt("Save"));
+    assert!(!pseudo_name_is_translated_or_exempt("AniCraft settings"));
+    assert!(!pseudo_name_is_translated_or_exempt("Save AniCraft"));
+}
+
 /// Names in `nodes` that are ours and still plain English.
 fn plain_names(what: &str, app: &crate::app::App, nodes: Vec<(egui::accesskit::NodeId, egui::accesskit::Node)>) -> Vec<String> {
     // Document text is the document's (layer, symbol and scene names): not ours to translate.
@@ -495,7 +561,7 @@ fn plain_names(what: &str, app: &crate::app::App, nodes: Vec<(egui::accesskit::N
             // egui names its own window close button; it offers no way to name it ourselves
             // (docs/localisation.md › Not yet). The product name stays as it is in every
             // language (the macOS app menu is titled with it, ADR 0006), as the source scan allows.
-            let translated = name.chars().any(pseudo::is_accented) || EGUI_OWN.contains(&name) || name == "AniCraft";
+            let translated = pseudo_name_is_translated_or_exempt(name);
             let ours = scan::is_prose(name) && !doc_text.contains(name) && !doc_text.iter().any(|d| name.contains(d.as_str()));
             if ours && !translated {
                 found.insert(format!("[{what}] {:?} {name:?}", n.role()));
@@ -602,7 +668,7 @@ fn every_control_can_be_used_in_the_pseudo_locale() {
             a.run("element.set_color_effect", serde_json::json!({"style": style}));
         }));
     }
-    for panel in ["sound", "camera", "springbones", "shapebones", "shapeweights", "warp", "motion", "motionpins", "actions", "script", "prefs", "envelope", "onionmenu", "editmultiple", "edittransform", "onionsymbol", "find", "explorer", "publish", "publishreport", "publishanim", "start", "testmovie", "testmovieinside", "templates", "savetemplate", "brushlibrary", "brushcurve"] {
+    for panel in ["sound", "camera", "springbones", "shapebones", "shapeweights", "warp", "motion", "motionpins", "actions", "script", "prefs", "envelope", "audiokeys", "lipsync", "onionmenu", "editmultiple", "edittransform", "onionsymbol", "find", "explorer", "publish", "publishreport", "publishanim", "start", "testmovie", "testmovieinside", "templates", "savetemplate", "brushlibrary", "brushcurve"] {
         found.extend(click_everything(panel, |a, _| a.open_panel(Some(panel))));
     }
     // Test Movie in a window of its own (ADR 0062; egui stands in for the window system here).
@@ -792,12 +858,12 @@ fn screen_reader_names_are_translated_too() {
     }
     found.extend(untranslated_names("close guard", |a, _| {
         a.run("layer.new", serde_json::json!({}));
-        a.close_dialog = true;
+        crate::tabs::quit(a);
     }));
     found.extend(untranslated_names("library item", |a, _| {
         a.library_sel = a.s.doc.library.first().map(|s| crate::app::LibraryItem::Symbol(s.id));
     }));
-    for panel in ["start", "drop", "droplibrary", "select", "motion", "motionspan", "motionpath", "motionedit", "camera", "sound", "prefs", "shortcuts", "palette", "about", "files", "licenses", "confirm", "recovery", "frames", "filters", "plugins", "actions", "script", "scriptproblems", "testmovie", "testmovieinside", "testscript", "exporthtml", "envelope", "templates", "savetemplate", "droptimeline"] {
+    for panel in ["start", "drop", "droplibrary", "select", "motion", "motionspan", "motionpath", "motionedit", "camera", "sound", "prefs", "shortcuts", "palette", "about", "files", "licenses", "confirm", "recovery", "frames", "filters", "plugins", "actions", "script", "scriptproblems", "testmovie", "testmovieinside", "testscript", "exporthtml", "envelope", "audiokeys", "lipsync", "templates", "savetemplate", "droptimeline"] {
         found.extend(untranslated_names(panel, |a, _| a.open_panel(Some(panel))));
     }
     assert!(found.is_empty(), "{} screen-reader names not translated in the pseudo-locale:\n{}", found.len(), found.join("\n"));

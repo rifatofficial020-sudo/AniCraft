@@ -35,8 +35,9 @@ To turn artwork into a symbol:
 1. Select the artwork. It can be on several layers.
 2. Choose **Modify › Convert to Symbol…** (**F8**), or click **Convert to Symbol** at the
    bottom of Properties.
-3. Type a **Name**, choose a **Type** (Graphic, Movie clip or Button), and choose the Library
-   **Folder** it goes into.
+3. Type a **Name**, choose a **Type** (Movie clip, Button or Graphic), and choose the Library
+   **Folder** it goes into. The first time, the type is Movie clip, as in Animate; after that
+   the dialog offers the type and folder you chose last.
 4. Press **OK**.
 
 The artwork is replaced by an instance of the new symbol. If you selected artwork on several
@@ -185,6 +186,26 @@ Symbols with a linkage class count as used. In the **More** menu:
 * **Delete Unused Items…** removes them in one go, after asking. One pass clears a whole
   unused branch, such as a symbol and the symbols only it used.
 
+## Copying between documents
+
+To use a symbol in another document, copy an instance of it and paste it there:
+
+1. Select the artwork on the stage and choose **Edit › Copy** (**Ctrl+C**).
+2. Click the other document's tab (see [Document tabs](workspace.md#document-tabs)).
+3. Choose **Edit › Paste** (**Ctrl+V**).
+
+Everything the artwork uses comes along into the other document's Library: its symbols, the
+symbols inside them, images that fill its shapes, and sounds on the symbols' frames. Copied
+frames (**Copy Frames** and **Paste Frames**) bring their Library items in the same way.
+
+* If the other Library already has an item with the same name, the one that comes is renamed:
+  "Ball" becomes "Ball 2". Your own "Ball" is left as it is.
+* Paste the same symbol again and AniCraft uses the item it already brought, as long as
+  neither copy has been changed since.
+* An image or sound the other document already has, with the same name and contents, isn't
+  added twice.
+* **Undo** takes away the pasted artwork and the Library items that came with it.
+
 ## Importing into the Library
 
 To add files to the Library without putting them on the stage:
@@ -241,8 +262,9 @@ and its report says so.
 
 ## Not there yet
 
-* Shared libraries, and importing Library items from another document (you can still copy
-  and paste instances between documents, and their symbols come with them).
+* Shared libraries, and dragging items out of another open document's Library (copy and paste
+  an instance instead: see [Copying between documents](#copying-between-documents)).
+* A choice to replace your item instead of renaming the one that comes, when names clash.
 * Linkage on bitmaps and sounds, and bitmap compression settings.
 * Swapping a bitmap everywhere it's used, from the Library.
 * A picture of the item while you drag it from the Library.

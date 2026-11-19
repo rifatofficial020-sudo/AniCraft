@@ -10,7 +10,7 @@ use std::sync::Arc;
 pub fn specs() -> Vec<CommandSpec> {
     let c = |id, label, menu, shortcut, params, mutates, run| CommandSpec { id, label, menu, shortcut, params, mutates, run };
     vec![
-        c("scene.new", "Scene", "Insert", None, "{name?}", true, new_scene as crate::RunFn),
+        c("scene.new", "New Scene", "Insert", None, "{name?}", true, new_scene as crate::RunFn),
         c("scene.duplicate", "Duplicate Scene", "Modify/Scene", None, "{scene?}", true, duplicate_scene),
         c("scene.rename", "Rename Scene", "Modify/Scene", None, "{name, scene?}", true, rename_scene),
         c("scene.delete", "Delete Scene", "Modify/Scene", None, "{scene?}", true, delete_scene),

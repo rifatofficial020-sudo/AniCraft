@@ -2,11 +2,11 @@
 //!
 //! Lucide icons are 24 × 24 outlines made of a few SVG shapes. Rather than pull in an SVG
 //! rasterizer, the shapes are parsed once with the engine's own SVG path reader
-//! (`geom::svg`) and stroked as vectors at the exact on-screen size, so they stay crisp at any
+//! (`anicraft_svg::parse_path_data`, on craft-svg) and stroked as vectors at the exact on-screen size, so they stay crisp at any
 //! interface scale and cost nothing in build size. Only icons the app uses are embedded; add a
 //! file to `assets/icons/` and a variant here to use another.
 
-use anicraft_engine::geom::svg::parse_path_data;
+use anicraft_engine::svg::parse_path_data;
 use anicraft_engine::geom::{Affine, Path, Vec2};
 use egui::{Color32, Pos2, Rect, Stroke, pos2};
 use std::collections::HashMap;
@@ -73,6 +73,7 @@ pub enum Icon {
     Warp,
     EditMultiple,
     Layer,
+    Parent,
     InsertFrame,
     InsertKeyframe,
     InsertBlankKeyframe,
@@ -92,7 +93,7 @@ pub enum Icon {
 
 impl Icon {
     #[cfg(test)]
-    pub const ALL: [Icon; 74] = [
+    pub const ALL: [Icon; 75] = [
         Icon::PanelProperties,
         Icon::PanelSwatches,
         Icon::PanelLibrary,
@@ -111,6 +112,7 @@ impl Icon {
         Icon::InsertBlankKeyframe,
         Icon::Bind,
         Icon::Layer,
+        Icon::Parent,
         Icon::EditMultiple,
         Icon::Bone,
         Icon::Magnet,
@@ -257,6 +259,9 @@ impl Icon {
             Icon::FolderOpen => ("folder-open", false),
             // A layer: a row with a keyframe and its span (AniCraft original, on Lucide's grid).
             Icon::Layer => ("anicraft-layer", false),
+            // A layer's dot joined to the layers that follow it (AniCraft original, on Lucide's
+            // grid): the timeline's parenting view (ADR 0113).
+            Icon::Parent => ("anicraft-parent", false),
             // Insert Frame / Keyframe / Blank Keyframe: the timeline's own marks (a frame cell, a
             // filled keyframe dot, a hollow blank-keyframe dot), each with a plus (AniCraft
             // originals, on Lucide's grid).
@@ -343,6 +348,7 @@ static FILES: &[(&str, &str)] = &[
     ("anicraft-camera", include_str!("../assets/icons/anicraft-camera.svg")),
     ("anicraft-bone", include_str!("../assets/icons/anicraft-bone.svg")),
     ("anicraft-bind", include_str!("../assets/icons/anicraft-bind.svg")),
+    ("anicraft-parent", include_str!("../assets/icons/anicraft-parent.svg")),
     ("anicraft-warp", include_str!("../assets/icons/anicraft-warp.svg")),
     ("anicraft-edit-multiple", include_str!("../assets/icons/anicraft-edit-multiple.svg")),
     ("folder", include_str!("../assets/icons/folder.svg")),
@@ -439,12 +445,15 @@ pub fn paint(p: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
     let w = ((1.75 * s * ppp).round().max(1.0)) / ppp;
     let stroke = Stroke::new(w, color);
     let solid = icon.solid();
+    let tint = accent_fill(color);
     for path in paths {
         for pl in path.flatten(&m, 0.08) {
             let pts: Vec<Pos2> = pl.points.iter().map(|q| pos2(q.x, q.y)).collect();
             if pl.closed {
                 if solid {
                     fill_polygon(p, &pts, color);
+                } else if let Some(tint) = tint {
+                    fill_polygon(p, &pts, tint);
                 }
                 p.add(egui::Shape::closed_line(pts, stroke));
             } else {
@@ -456,6 +465,15 @@ pub fn paint(p: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             }
         }
     }
+}
+
+/// The tint inside an icon's closed shapes (ADR 0117), when the palette has one (`icon_accent`)
+/// and the icon is drawn in one of the icon roles: at rest, under the pointer, or on the active
+/// tool's block. Icons drawn as text marks (chevrons, a disabled button) stay outlines. The
+/// built-in palettes have no tint, so they draw exactly as before.
+fn accent_fill(color: Color32) -> Option<Color32> {
+    let t = &*crate::theme::T;
+    (t.icon_accent.a() > 0 && [t.icon, t.icon_hot, t.on_active].contains(&color)).then_some(t.icon_accent)
 }
 
 /// Fills a simple (possibly concave) polygon by ear clipping. Icon outlines have a few dozen
@@ -562,6 +580,38 @@ mod tests {
         let outline = library().get(name).unwrap()[0].flatten(&Affine::IDENTITY, 0.08);
         let pts: Vec<Pos2> = outline[0].points.iter().map(|q| pos2(q.x, q.y)).collect();
         assert!(!triangulate(&pts).1.is_empty());
+    }
+
+    #[test]
+    fn icons_are_tinted_only_by_a_palette_that_has_a_tint() {
+        use crate::theme::{GRAPHITE, Palette, T};
+        let ctx = egui::Context::default();
+        let shapes = |ctx: &egui::Context, color: Color32| {
+            let mut n = 0;
+            let mut out = ctx.run_ui(Default::default(), |ui| {
+                let p = ui.painter().clone();
+                let before = p.add(egui::Shape::Noop).0;
+                paint(&p, Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(24.0, 24.0)), Icon::Lock, color);
+                n = p.add(egui::Shape::Noop).0 - before;
+            });
+            out.textures_delta.clear();
+            n
+        };
+        // The built-in palettes: outlines only, the same shapes whatever the colour.
+        crate::theme::apply_palette(&ctx, Palette::Graphite);
+        assert_eq!(accent_fill(T.icon), None);
+        let plain = shapes(&ctx, T.icon);
+        // A theme with a tint: closed shapes gain a fill under icons in the icon roles only.
+        let mut tinted = GRAPHITE;
+        tinted.set_colour("icon_accent", T.accent.gamma_multiply(0.4));
+        crate::theme::apply_user_theme(&ctx, Palette::Graphite, tinted);
+        assert_eq!(accent_fill(T.icon), Some(tinted.icon_accent));
+        assert_eq!(accent_fill(T.on_active), Some(tinted.icon_accent));
+        assert_eq!(accent_fill(T.text_faint), None, "a disabled icon stays an outline");
+        assert!(shapes(&ctx, T.icon) > plain, "the lock's body is filled");
+        assert_eq!(shapes(&ctx, T.text_faint), plain);
+        crate::theme::apply_palette(&ctx, Palette::Graphite);
+        assert_eq!(shapes(&ctx, T.icon), plain);
     }
 
     #[test]

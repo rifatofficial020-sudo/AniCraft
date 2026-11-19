@@ -18,11 +18,23 @@ pub struct ConvertDialog {
     focus: bool,
 }
 
+/// The symbol types in the order every Type list offers them: Animate's, with Movie Clip first
+/// (#419).
+pub const KINDS: [SymbolKind; 3] = [SymbolKind::MovieClip, SymbolKind::Button, SymbolKind::Graphic];
+
 /// What the last conversion chose (kept for the next one).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Last {
     pub folder: Option<FolderId>,
     pub kind: SymbolKind,
+}
+
+impl Default for Last {
+    /// The first conversion offers a movie clip at the top level, as Animate does (#419). The
+    /// command's own default stays a graphic, so scripts keep making what they made.
+    fn default() -> Self {
+        Last { folder: None, kind: SymbolKind::MovieClip }
+    }
 }
 
 /// The folder to offer: the one used last, while it is still in the Library.
@@ -69,12 +81,12 @@ pub fn window(app: &mut App, ctx: &egui::Context) {
     folders.sort_by_key(|(_, p)| p.to_lowercase());
     let (mut submit, mut cancel) = (false, false);
     let title = tr!("Convert to Symbol");
-    egui::Window::new(title).id(egui::Id::new("convert_symbol")).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, -80.0]).show(ctx, |ui| {
+    crate::windows::new(ctx, title).id(egui::Id::new("convert_symbol")).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, -80.0]).show(ctx, |ui| {
         ui.set_min_width(380.0);
         form_row(ui, FORM_LABEL_DOCK, tr!("Name"), |ui| {
             let r = ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(f32::INFINITY)).named(tr!("Symbol name"));
             if d.focus {
-                r.request_focus();
+                crate::theme::focus_selected(ui, &r, &d.name);
                 d.focus = false;
             }
             if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
@@ -86,7 +98,7 @@ pub fn window(app: &mut App, ctx: &egui::Context) {
                 .width(200.0)
                 .selected_text(crate::panels::symbol_kind_label(d.kind))
                 .show_ui(ui, |ui| {
-                    for k in [SymbolKind::Graphic, SymbolKind::MovieClip, SymbolKind::Button] {
+                    for k in KINDS {
                         if ui.selectable_label(d.kind == k, crate::panels::symbol_kind_label(k)).clicked() {
                             d.kind = k;
                         }
@@ -183,6 +195,8 @@ mod tests {
         open(&mut app);
         let d = app.convert.as_mut().expect("the dialog opens");
         assert_eq!(d.folder, None, "the top level the first time");
+        assert_eq!(d.kind, SymbolKind::MovieClip, "a movie clip the first time, as in Animate (#419)");
+        assert_eq!(KINDS, [SymbolKind::MovieClip, SymbolKind::Button, SymbolKind::Graphic], "Animate's order");
         assert!(d.name.starts_with("Symbol "));
         d.folder = Some(f);
         d.kind = SymbolKind::Button;

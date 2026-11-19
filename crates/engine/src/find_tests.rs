@@ -38,7 +38,7 @@ impl Build {
         self.doc.alloc_id()
     }
     pub fn text(&mut self, t: &str, color: Rgba) -> Element {
-        let block = TextBlock { text: t.into(), font: "Test Sans".into(), size: 20.0, bold: false, italic: false, color, align: TextAlign::Left, letter_spacing: 0.0, line_spacing: 0.0, width: None, outline: Arc::new(Path::new()), box_width: 10.0, box_height: 10.0, field: None, on_path: None };
+        let block = TextBlock { text: t.into(), font: "Test Sans".into(), size: 20.0, bold: false, italic: false, color, align: TextAlign::Left, letter_spacing: 0.0, line_spacing: 0.0, width: None, outline: Arc::new(Path::new()), box_width: 10.0, box_height: 10.0, field: None, on_path: None, ..Default::default() };
         Element { id: ElementId(self.id()), name: String::new(), transform: Affine::IDENTITY, color: ColorEffect::default(), kind: ElementKind::Text(Arc::new(block)) }
     }
     pub fn rect(&mut self, fill: Paint, stroke: Option<Rgba>) -> Element {
@@ -54,7 +54,7 @@ impl Build {
             name: name.into(),
             transform: Affine::translate(100.0, 50.0),
             color: ColorEffect::default(),
-            kind: ElementKind::Symbol { symbol, loop_mode: LoopMode::Loop, first_frame: 0, blend: Default::default(), filters: Vec::new(), events: Vec::new() },
+            kind: ElementKind::Symbol { symbol, loop_mode: LoopMode::Loop, first_frame: 0, blend: Default::default(), filters: Vec::new(), events: Vec::new(), pivot: None },
         }
     }
     /// A layer with keyframes `(start, duration, label, elements)`.

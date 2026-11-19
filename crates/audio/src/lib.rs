@@ -13,6 +13,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable, clippy::indexing_slicing)]
 
 pub mod mix;
+pub mod analysis;
 mod peaks;
 mod player;
 pub mod wav;

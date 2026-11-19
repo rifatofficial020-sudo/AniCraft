@@ -13,7 +13,6 @@ use anicraft_engine::plugin_export::{self, Job};
 use anicraft_engine::plugins::Plugin;
 use anicraft_engine::publish::Control;
 use serde_json::{Map, Value, json};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 /// The open export window.
@@ -29,6 +28,9 @@ pub struct Export {
     asking: bool,
     running: Option<Running>,
     error: Option<String>,
+    /// Browse… was clicked: the save dialog is shown at the end of the frame, then its answer to come.
+    browse: bool,
+    answer: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
 }
 
 /// What the worker gives back: the export's result, or whether it was cancelled and why not.
@@ -73,7 +75,7 @@ pub fn open(app: &mut App, id: &str) {
     let dir = app.s.path.as_deref().and_then(std::path::Path::parent).map(std::path::Path::to_path_buf).unwrap_or_default();
     let path = dir.join(format!("{stem}.{ext}")).display().to_string();
     app.playing = false;
-    app.plugin_export = Some(Export { id: id.to_string(), values: p.manifest().defaults(), from: 0, to: app.s.doc.frame_count().saturating_sub(1), path, asking: false, running: None, error: None });
+    app.plugin_export = Some(Export { id: id.to_string(), values: p.manifest().defaults(), from: 0, to: app.s.doc.frame_count().saturating_sub(1), path, asking: false, running: None, error: None, browse: false, answer: None });
 }
 
 fn params(e: &Export, confirm: bool) -> Value {
@@ -145,25 +147,40 @@ pub fn tick(app: &mut App, ctx: &egui::Context) {
     }
 }
 
-/// Picks the file with the platform's dialog.
-fn browse(e: &mut Export, plugin: &Plugin) {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let (name, ext) = format_of(plugin);
-        let current = PathBuf::from(&e.path);
-        let file = current.file_name().map_or_else(|| format!("animation.{ext}"), |f| f.to_string_lossy().into_owned());
-        if let Some(p) = crate::platform::save_dialog(&tr!("Export {format}", format = name), &name, &ext, current.parent(), &file) {
-            e.path = p.display().to_string();
-        }
+/// Whether a Browse… save dialog is asked for or still waiting for its answer.
+pub fn sheet_pending(app: &App) -> bool {
+    app.plugin_export.as_ref().is_some_and(|e| e.browse || e.answer.is_some())
+}
+
+/// Shows the save dialog Browse… asked for, from the end of the frame, where it has the window
+/// (on macOS a sheet: a dialog run inside the frame aborts the app, see `start_file_dialog`).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn start_browse(app: &mut App, frame: &eframe::Frame, ctx: &egui::Context) {
+    let Some(e) = app.plugin_export.as_mut().filter(|e| e.browse) else { return };
+    e.browse = false;
+    let Some(p) = app.s.plugins.get(&e.id) else { return };
+    let (name, ext) = format_of(&p);
+    let current = std::path::PathBuf::from(&e.path);
+    let file = current.file_name().map_or_else(|| format!("animation.{ext}"), |f| f.to_string_lossy().into_owned());
+    e.answer = crate::platform::start_save_dialog(&tr!("Export {format}", format = name), &name, &ext, current.parent(), &file, frame, ctx.clone());
+    if e.answer.is_none() {
+        e.error = Some(tr!("The file dialog could not be shown").to_string());
     }
-    #[cfg(target_arch = "wasm32")]
-    let _ = (e, plugin);
 }
 
 /// The export window, when open.
 pub fn show(app: &mut App, ctx: &egui::Context) {
     tick(app, ctx);
     let Some(mut e) = app.plugin_export.take() else { return };
+    match e.answer.as_ref().map(std::sync::mpsc::Receiver::try_recv) {
+        Some(Ok(Some(path))) => {
+            e.path = path.display().to_string();
+            e.answer = None;
+            e.asking = false;
+        }
+        Some(Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected)) => e.answer = None,
+        _ => {}
+    }
     let Some(p) = app.s.plugins.get(&e.id) else { return };
     let (name, _) = format_of(&p);
     let frames = app.s.doc.frame_count().max(1);
@@ -172,7 +189,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     let (mut go, mut replace, mut close) = (false, false, false);
     let running = e.running.is_some();
     let at = ctx.content_rect().center() - egui::vec2(200.0, 180.0);
-    let shown = egui::Window::new(title.clone()).id(egui::Id::new("plugin_export")).open(&mut open).default_pos(at).default_width(400.0).resizable(false).collapsible(false).show(ctx, |ui| {
+    let shown = crate::windows::new(ctx, title.clone()).id(egui::Id::new("plugin_export")).open(&mut open).default_pos(at).default_width(400.0).resizable(false).collapsible(false).show(ctx, |ui| {
         let m = p.manifest();
         let by = [m.author.as_str(), m.version.as_str()].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join(" · ");
         ui.label(text(Type::Caption, if by.is_empty() { tr!("Plug-in").to_string() } else { tr!("Plug-in · {by}", by = by) }));
@@ -204,7 +221,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                     e.asking = false;
                 }
                 if !crate::platform::WEB && ui.button(tr!("Browse…")).clicked() {
-                    browse(&mut e, &p);
+                    e.browse = e.answer.is_none();
                 }
             });
         });

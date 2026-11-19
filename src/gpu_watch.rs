@@ -56,6 +56,48 @@ struct Health {
     noticed_at: Option<f64>,
 }
 
+impl Health {
+    /// Notes an error the driver reported; how many there have been.
+    fn error(&mut self, text: &str) -> u32 {
+        self.errors = self.errors.saturating_add(1);
+        self.last_error = Some(text.chars().take(2000).collect());
+        self.unseen = true;
+        self.errors
+    }
+
+    /// Notes the device's loss, keeping the first reason; whether this was the first.
+    fn lose(&mut self, why: &str) -> bool {
+        let first = self.lost.is_none();
+        self.lost.get_or_insert_with(|| why.chars().take(2000).collect());
+        first
+    }
+
+    /// What happened since the app last looked, as of `now`: each error and the loss once.
+    fn news(&mut self, now: Instant) -> News {
+        let error = if std::mem::take(&mut self.unseen) { self.last_error.clone() } else { None };
+        let failing = self.last_failure.is_some_and(|t| now.saturating_duration_since(t) <= STREAK_GAP);
+        let stuck = failing && self.failing_since.is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() >= STUCK_SECS);
+        let gone_now = self.lost.clone().or_else(|| stuck.then(|| format!("the window's surface kept failing for {STUCK_SECS} s"))); // i18n-exempt: log text
+        let gone = if self.handled { None } else { gone_now };
+        if gone.is_some() {
+            self.handled = true;
+        }
+        News { error, gone, failing }
+    }
+
+    /// Whether the status bar should say so at app time `at` (at most once a minute).
+    fn notice_due(&mut self, at: f64) -> bool {
+        let due = self.noticed_at.is_none_or(|t| at - t >= NOTICE_EVERY_SECS || at < t);
+        if due {
+            self.noticed_at = Some(at);
+        }
+        due
+    }
+}
+
+/// The window's graphics health: one per process, as there is one window device. Everything
+/// that decides anything is a method of [`Health`], so a test works on a `Health` of its own:
+/// this one is read by every app frame ([`tick`]), on whichever thread an app is running.
 static HEALTH: Mutex<Option<Health>> = Mutex::new(None);
 
 fn with<R>(f: impl FnOnce(&mut Health) -> R) -> R {
@@ -65,12 +107,7 @@ fn with<R>(f: impl FnOnce(&mut Health) -> R) -> R {
 
 /// Notes an error the driver reported (never panics; the log gets the first ones in full).
 pub fn record_error(text: &str) {
-    let n = with(|h| {
-        h.errors = h.errors.saturating_add(1);
-        h.last_error = Some(text.chars().take(2000).collect());
-        h.unseen = true;
-        h.errors
-    });
+    let n = with(|h| h.error(text));
     if n <= LOG_FIRST || n.is_multiple_of(LOG_EVERY) {
         crate::startup::line(&format!("graphics error {n} (AniCraft carried on): {}", text.trim()));
     }
@@ -78,12 +115,7 @@ pub fn record_error(text: &str) {
 
 /// Notes that the device was lost (a driver reset, or the GPU taken away).
 pub fn record_lost(why: &str) {
-    let first = with(|h| {
-        let first = h.lost.is_none();
-        h.lost.get_or_insert_with(|| why.chars().take(2000).collect());
-        first
-    });
-    if first {
+    if with(|h| h.lose(why)) {
         crate::startup::line(&format!("the window's graphics device was lost: {}", why.trim()));
     }
 }
@@ -195,28 +227,12 @@ pub struct News {
 /// The news for this frame.
 pub fn take_news() -> News {
     let now = Instant::now();
-    with(|h| {
-        let error = if std::mem::take(&mut h.unseen) { h.last_error.clone() } else { None };
-        let failing = h.last_failure.is_some_and(|t| now.duration_since(t) <= STREAK_GAP);
-        let stuck = failing && h.failing_since.is_some_and(|t| now.duration_since(t).as_secs_f32() >= STUCK_SECS);
-        let gone_now = h.lost.clone().or_else(|| stuck.then(|| format!("the window's surface kept failing for {STUCK_SECS} s"))); // i18n-exempt: log text
-        let gone = if h.handled { None } else { gone_now };
-        if gone.is_some() {
-            h.handled = true;
-        }
-        News { error, gone, failing }
-    })
+    with(|h| h.news(now))
 }
 
 /// Whether the status bar should say so now (at most once a minute).
 fn notice_due(at: f64) -> bool {
-    with(|h| {
-        let due = h.noticed_at.is_none_or(|t| at - t >= NOTICE_EVERY_SECS || at < t);
-        if due {
-            h.noticed_at = Some(at);
-        }
-        due
-    })
+    with(|h| h.notice_due(at))
 }
 
 /// Per frame (desktop): acts on the news. A reported error autosaves at once and says so; a
@@ -225,7 +241,7 @@ fn notice_due(at: f64) -> bool {
 pub fn tick(app: &mut crate::app::App, ctx: &egui::Context) {
     let news = take_news();
     if news.error.is_some() || news.failing {
-        app.recovery.write_now(&app.s);
+        app.recovery.doc.write_now(&app.s);
     }
     if news.failing {
         ctx.request_repaint_after(Duration::from_millis(500));
@@ -236,7 +252,7 @@ pub fn tick(app: &mut crate::app::App, ctx: &egui::Context) {
     let Some(why) = news.gone else { return };
     crate::startup::line(&format!("closing the window to open it again another way ({why})"));
     // The work goes to the recovery folder for the next window (the lock goes, so it finds it).
-    app.recovery.finish(&app.s, false);
+    crate::tabs::finish_all(app, false);
     crate::startup::lost_mid_session();
     // A saved document opens again as it was; unsaved work is offered back.
     let file = app.s.path.clone().filter(|_| !app.s.is_dirty());
@@ -245,15 +261,9 @@ pub fn tick(app: &mut crate::app::App, ctx: &egui::Context) {
     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
 }
 
-/// Tests that touch the process's graphics health take turns.
+/// Tests that share the stage renderer's test doubles take turns (`gpu_stage`).
 #[cfg(test)]
 pub static TEST_LOCK: Mutex<()> = Mutex::new(());
-
-/// Tests: forget everything (the state is the process's).
-#[cfg(test)]
-pub fn reset() {
-    *HEALTH.lock().unwrap_or_else(PoisonError::into_inner) = None;
-}
 
 #[cfg(test)]
 mod tests {
@@ -273,24 +283,50 @@ mod tests {
     }
 
     /// Errors and the device's loss are written down, never a panic; the app hears of each
-    /// once.
+    /// once. On a `Health` of its own: the process's is read by every app frame, so a test
+    /// running an app on another thread took this test's news between its lines (and could be
+    /// told by this test's loss to close its window).
     #[test]
     fn errors_and_the_loss_come_to_the_app_once() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-        reset();
-        assert_eq!(take_news(), News::default());
-        record_error("Failed to wait for GPU to come idle before reconfiguring the Surface");
-        let n = take_news();
+        let mut h = Health::default();
+        let now = Instant::now();
+        assert_eq!(h.news(now), News::default());
+        assert_eq!(h.error("Failed to wait for GPU to come idle before reconfiguring the Surface"), 1);
+        let n = h.news(now);
         assert!(n.error.as_deref().is_some_and(|e| e.contains("come idle")) && n.gone.is_none());
-        assert_eq!(take_news().error, None, "said once");
-        assert_eq!(lost(), None);
-        record_lost("Device lost: DXGI_ERROR_DEVICE_HUNG");
-        record_lost("a second loss keeps the first reason");
-        assert_eq!(lost().as_deref(), Some("Device lost: DXGI_ERROR_DEVICE_HUNG"));
-        assert!(take_news().gone.is_some());
-        assert_eq!(take_news().gone, None, "the app acts once");
+        assert_eq!(h.news(now).error, None, "said once");
+        assert_eq!(h.lost, None);
+        assert!(h.lose("Device lost: DXGI_ERROR_DEVICE_HUNG"));
+        assert!(!h.lose("a second loss keeps the first reason"));
+        assert_eq!(h.lost.as_deref(), Some("Device lost: DXGI_ERROR_DEVICE_HUNG"));
+        assert!(h.news(now).gone.is_some());
+        assert_eq!(h.news(now).gone, None, "the app acts once");
         // The notice comes at most once a minute.
-        assert!(notice_due(10.0) && !notice_due(30.0) && notice_due(75.0));
-        reset();
+        assert!(h.notice_due(10.0) && !h.notice_due(30.0) && h.notice_due(75.0));
+    }
+
+    /// A surface failing without a pause for [`STUCK_SECS`] counts as the device gone; one
+    /// that drew again since does not.
+    #[test]
+    fn a_surface_stuck_failing_counts_as_gone() {
+        let start = Instant::now();
+        let later = start + Duration::from_secs(9);
+        let mut h = Health { failing_since: Some(start), last_failure: Some(later), ..Health::default() };
+        let n = h.news(later);
+        assert!(n.failing && n.gone.is_some_and(|why| why.contains("kept failing")));
+        let mut h = Health { failing_since: Some(start), last_failure: Some(start + Duration::from_secs(1)), ..Health::default() };
+        let n = h.news(later);
+        assert!(!n.failing && n.gone.is_none(), "it drew again since");
+    }
+
+    /// The process's health is read by app frames on any thread while this module's tests
+    /// run: what they take from it is no longer anything a test here asserts on.
+    #[test]
+    fn app_frames_on_other_threads_do_not_disturb_the_tests() {
+        let readers: Vec<_> = (0..4).map(|_| std::thread::spawn(|| (0..200).for_each(|_| drop(take_news())))).collect();
+        for _ in 0..200 {
+            errors_and_the_loss_come_to_the_app_once();
+        }
+        assert!(readers.into_iter().all(|t| t.join().is_ok()));
     }
 }

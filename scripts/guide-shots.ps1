@@ -28,7 +28,9 @@ $Shots = @(
   @("motion-editor", "motion"),
   @("test-movie", "testmovieinside"),
   @("publish-settings", "publish"),
-  @("preferences", "prefs")
+  @("preferences", "prefs"),
+  @("audio-to-keyframes", "audiokeys"),
+  @("lip-sync", "lipsynced")
 )
 New-Item -ItemType Directory -Force $Out | Out-Null
 foreach ($s in $Shots) {

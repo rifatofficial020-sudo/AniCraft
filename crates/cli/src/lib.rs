@@ -2,6 +2,8 @@
 //! server (`mcp`). Every operation goes through the engine's command registry.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod control;
 pub mod mcp;
 
 use anicraft_engine::{Session, commands, format};
@@ -30,9 +32,14 @@ USAGE:
   anicraft-cli formats                   lists every export format, plug-ins included (JSON)
   anicraft-cli commands
   anicraft-cli run <file|--sample> <script.json> [--save <out.anicraft>]
+                                         a JSON array of {cmd, params}, or a saved command
+                                         (one undo step; nothing changes if a step fails)
   anicraft-cli exec <file|--sample> <command.id> [<json-params>] [--save <out.anicraft>]
   anicraft-cli new --out <file.anicraft> [--width W] [--height H] [--fps F]
   anicraft-cli guide --out <folder>      writes the user guide as HTML pages (open index.html)
+  anicraft-cli guide search <words> [--limit N] [--json yes]
+                                         searches the user guide: chapter, heading, page and a
+                                         passage for each result, best first (as its search page)
   anicraft-cli bench [--layers N] [--shapes N] [--frames N]   performance probe (use --release)
   anicraft-cli bench --check yes         the default scenario against the budgets in
                                          docs/performance.md; fails when one is missed
@@ -40,13 +47,18 @@ USAGE:
         {\"id\":1,\"cmd\":\"draw.rect\",\"params\":{\"x\":10,\"y\":10,\"w\":50,\"h\":50}}
   anicraft-cli mcp [file|--sample]       Model Context Protocol server on stdin/stdout,
                                          for AI assistants (see docs/mcp.md)
+  anicraft-cli mcp --bridge <port>       the same tools, acting live on the AniCraft window
+                                         started with `anicraft --control <port>`
+                                         (docs/control-protocol.md)
   anicraft-cli --version
 
   --plugins <folder>   loads the WebAssembly plug-ins in a folder first (also the
                        ANICRAFT_PLUGINS environment variable); see docs/plugins.md.
                        Without it, headless runs use no plug-ins, so they are repeatable.
 
-Frames on the command line are 1-based, as in the timeline.";
+Frame flags on the command line (--frame, --from, --to) are 1-based, as in the
+timeline. Frame numbers inside JSON params, scripts and command results are
+0-based, as everywhere in the engine.";
 
 /// Parsed flags: positional args plus `--key value` pairs.
 pub struct Args {
@@ -124,13 +136,42 @@ fn one_based(a: &Args, k: &str) -> Result<Option<u32>, String> {
     }
 }
 
+/// The usage of one subcommand, under `USAGE:`: its entries in [`USAGE`] with their
+/// continuation lines, so the two never drift apart. `None` for a name [`USAGE`] doesn't list.
+pub fn subcommand_usage(cmd: &str) -> Option<String> {
+    const ENTRY: &str = "  anicraft-cli ";
+    let mut out = String::new();
+    let mut taking = false;
+    // The entries are the block after `USAGE:`, up to the first blank line.
+    for line in USAGE.lines().skip_while(|l| *l != "USAGE:").skip(1).take_while(|l| !l.trim().is_empty()) {
+        if let Some(rest) = line.strip_prefix(ENTRY) {
+            // `apng|webp` names two subcommands; `--version` is also `version`.
+            let names = rest.split_whitespace().next().unwrap_or("");
+            taking = names.split('|').any(|n| n == cmd || n.strip_prefix("--") == Some(cmd));
+        }
+        if taking {
+            out.push('\n');
+            out.push_str(line);
+        }
+    }
+    (!out.is_empty()).then(|| format!("USAGE:{out}"))
+}
+
 /// Runs the CLI; returns the text to print on success.
 pub fn run(argv: &[String]) -> Result<String, String> {
     let Some((cmd, rest)) = argv.split_first() else { return Ok(USAGE.to_string()) };
+    if cmd == "help" || cmd == "--help" || cmd == "-h" {
+        if let Some(sub) = rest.first().filter(|s| *s != "--help" && *s != "-h") {
+            return subcommand_usage(sub).ok_or_else(|| format!("unknown subcommand '{sub}'\n\n{USAGE}"));
+        }
+        return Ok(USAGE.to_string());
+    }
+    if rest.iter().any(|a| a == "--help" || a == "-h") {
+        return subcommand_usage(cmd).ok_or_else(|| format!("unknown subcommand '{cmd}'\n\n{USAGE}"));
+    }
     let a = Args::parse(rest)?;
     let src = a.positional.first().map(String::as_str);
     match cmd.as_str() {
-        "help" | "--help" | "-h" => Ok(USAGE.to_string()),
         // The release packaging smoke-tests every build with this (packaging/, ADR 0026).
         "version" | "--version" | "-V" => Ok(format!("anicraft-cli {}", env!("CARGO_PKG_VERSION"))),
         "commands" => {
@@ -138,8 +179,26 @@ pub fn run(argv: &[String]) -> Result<String, String> {
             serde_json::to_string_pretty(&list).map_err(|e| e.to_string())
         }
         // The user guide as the static HTML book Help › User Guide opens (ADR 0069).
+        // Searching it, with the ranking the book's search page uses (ADR 0096).
+        "guide" if src == Some("search") => {
+            let words = a.positional.get(1..).unwrap_or_default().join(" ");
+            if anicraft_guide::search::terms(&words).is_empty() {
+                return Err("guide search needs words to look for, e.g. anicraft-cli guide search onion skin".into());
+            }
+            let limit = a.num::<usize>("limit")?.unwrap_or(10).clamp(1, 100);
+            let hits = anicraft_guide::search::search(anicraft_guide::PAGES, &anicraft_guide::search::sections(anicraft_guide::PAGES), &words, limit);
+            if a.flag("json").is_some_and(|v| v == "yes") {
+                let list: Vec<Value> = hits.iter().map(|h| json!({"chapter": h.chapter, "heading": h.heading, "url": h.url, "snippet": h.snippet, "score": h.score})).collect();
+                return serde_json::to_string_pretty(&list).map_err(|e| e.to_string());
+            }
+            if hits.is_empty() {
+                return Ok(format!("nothing in the user guide matches “{}”", words.trim()));
+            }
+            let lines: Vec<String> = hits.iter().enumerate().map(|(i, h)| format!("{}. {} · {}\n   {}\n   {}", i + 1, h.heading, h.chapter, h.url, h.snippet)).collect();
+            Ok(lines.join("\n\n"))
+        }
         "guide" => {
-            let out = a.flag("out").ok_or("guide needs --out <folder>")?;
+            let out = a.flag("out").ok_or("guide needs --out <folder>, or search <words>")?;
             let n = anicraft_guide::write_site(std::path::Path::new(out)).map_err(|e| format!("{out}: {e}"))?;
             Ok(format!("wrote {n} files of the user guide to {out}; open {out}/index.html"))
         }
@@ -239,7 +298,16 @@ pub fn run(argv: &[String]) -> Result<String, String> {
             let script = a.positional.get(1).ok_or("run needs a script.json")?;
             let text = std::fs::read_to_string(script).map_err(|e| format!("{script}: {e}"))?;
             // Windows editors often save UTF-8 with a byte-order mark; JSON parsers reject it.
-            let steps: Vec<Value> = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| format!("{script}: expected a JSON array of {{cmd, params}}: {e}"))?;
+            let parsed: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| format!("{script}: expected a JSON array of {{cmd, params}} or a saved command: {e}"))?;
+            // A saved command (ADR 0097) runs as one transactional step, as in the app.
+            if parsed.is_object() {
+                let v = exec(&mut s, "macro.run", &json!({"path": script}))?;
+                if let Some(out) = a.flag("save") {
+                    exec(&mut s, "file.save", &json!({"path": out}))?;
+                }
+                return serde_json::to_string_pretty(&v).map_err(|e| e.to_string());
+            }
+            let steps: Vec<Value> = serde_json::from_value(parsed).map_err(|e| format!("{script}: expected a JSON array of {{cmd, params}}: {e}"))?;
             let mut results = Vec::new();
             for (i, step) in steps.iter().enumerate() {
                 let id = step.get("cmd").and_then(Value::as_str).ok_or_else(|| format!("step {}: missing \"cmd\"", i + 1))?;
@@ -260,6 +328,24 @@ pub fn run(argv: &[String]) -> Result<String, String> {
             Ok(String::new())
         }
         "mcp" => {
+            if let Some(target) = a.flag("bridge") {
+                if src.is_some() || a.flag("plugins").is_some() {
+                    return Err("mcp --bridge acts on the open AniCraft window: it takes no file or --plugins".into());
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = target;
+                    return Err("mcp --bridge needs sockets, which this build doesn't have".into());
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let mut b = control::Bridge::new(control::parse_bridge_target(target)?);
+                    let stdin = std::io::stdin();
+                    let mut stdout = std::io::stdout();
+                    mcp::serve(&mut b, stdin.lock(), &mut stdout).map_err(|e| e.to_string())?;
+                    return Ok(String::new());
+                }
+            }
             let mut s = session(&a, src)?;
             let stdin = std::io::stdin();
             let mut stdout = std::io::stdout();
@@ -700,11 +786,124 @@ mod tests {
     }
 
     #[test]
+    fn run_takes_a_saved_command_file() {
+        let dir = std::env::temp_dir().join(format!("anicraft-cli-macro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Spin.json");
+        std::fs::write(&file, r#"{"format": "anicraft-command", "version": 1, "steps": [{"cmd": "edit.select_all"}, {"cmd": "modify.rotate_cw"}]}"#).unwrap();
+        let out = run(&["run".into(), "--sample".into(), file.display().to_string()]).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!((v["name"].as_str(), v["steps"].as_u64()), (Some("Spin"), Some(2)), "{out}");
+        // A failing step names itself and leaves nothing behind.
+        std::fs::write(&file, r#"{"steps": [{"cmd": "edit.select_all"}, {"cmd": "modify.rotate_cw"}, {"cmd": "layer.set_height", "params": {"height": 7}}]}"#).unwrap();
+        let e = run(&["run".into(), "--sample".into(), file.display().to_string()]).unwrap_err();
+        assert!(e.contains("stopped at step 3 of 3"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn usage_and_errors() {
         assert!(run(&[]).unwrap().contains("USAGE"));
         assert!(run(&["bogus".into()]).is_err());
         assert!(run(&["info".into()]).is_err());
         assert!(run(&["commands".into()]).unwrap().contains("timeline.insert_keyframe"));
         assert!(run(&["guide".into()]).is_err());
+    }
+
+    #[test]
+    fn guide_search_prints_chapter_heading_page_and_passage() {
+        let s = |v: &[&str]| run(&v.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+        let out = s(&["guide", "search", "onion", "skin"]).unwrap();
+        let first = out.lines().next().unwrap_or("");
+        assert_eq!(first, "1. Onion skin · The timeline", "{out}");
+        assert!(out.contains("timeline.html#onion-skin"), "{out}");
+        let json: Value = serde_json::from_str(&s(&["guide", "search", "export", "gif", "--json", "yes", "--limit", "3"]).unwrap()).unwrap();
+        let list = json.as_array().unwrap();
+        assert!(list.len() <= 3 && list[0]["url"] == "getting-started.html#export-a-gif-or-a-video", "{json}");
+        assert!(s(&["guide", "search", "zzzzqqq"]).unwrap().starts_with("nothing in the user guide matches"));
+        assert!(s(&["guide", "search"]).is_err() && s(&["guide", "search", "?!"]).is_err());
+        assert!(s(&["guide", "search", "pen", "--limit", "x"]).is_err());
+    }
+
+    #[test]
+    fn usage_clarifies_frame_numbering_split() {
+        let help = run(&["help".into()]).unwrap();
+        assert!(help.contains("0-based"), "CLI usage should clarify that JSON command frame numbers are 0-based");
+        assert!(help.contains("1-based"), "CLI usage should clarify that command-line frame flags are 1-based");
+
+        let dir = std::env::temp_dir().join(format!("anicraft-cli-frame-split-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out_cli = dir.join("cli.png");
+        let out_exec = dir.join("exec.png");
+
+        let res_cli: serde_json::Value = serde_json::from_str(
+            &run(&["render".into(), "--sample".into(), "--frame".into(), "1".into(), "--out".into(), out_cli.to_str().unwrap().into()]).unwrap(),
+        )
+        .unwrap();
+
+        let res_exec: serde_json::Value = serde_json::from_str(
+            &run(&[
+                "exec".into(),
+                "--sample".into(),
+                "file.export_png".into(),
+                format!(r#"{{"path": "{}", "frame": 0}}"#, out_exec.to_str().unwrap().replace('\\', "/")),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(res_cli["frame"], 0);
+        assert_eq!(res_exec["frame"], 0);
+        assert_eq!(std::fs::read(&out_cli).unwrap(), std::fs::read(&out_exec).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subcommand_help_prints_usage() {
+        let subcommands = ["info", "render", "render-seq", "gif", "apng", "webp", "export", "formats", "commands", "run", "exec", "new", "guide", "bench", "serve", "mcp"];
+        for sub in subcommands {
+            let out_long = run(&[sub.to_string(), "--help".to_string()]).unwrap();
+            assert!(out_long.contains("USAGE:"), "help for {sub} should contain USAGE:");
+            assert!(out_long.contains(sub), "help for {sub} should mention {sub}");
+
+            let out_short = run(&[sub.to_string(), "-h".to_string()]).unwrap();
+            assert_eq!(out_long, out_short);
+
+            let out_help = run(&["help".to_string(), sub.to_string()]).unwrap();
+            assert_eq!(out_long, out_help);
+        }
+
+        // Subcommand help with other arguments present
+        assert_eq!(
+            run(&["render".into(), "--scale".into(), "2".into(), "--help".into()]).unwrap(),
+            run(&["render".into(), "--help".into()]).unwrap()
+        );
+
+        // Unknown subcommand with --help or help still reports unknown
+        assert!(run(&["bogus".into(), "--help".into()]).is_err());
+        assert!(run(&["help".into(), "bogus".into()]).is_err());
+    }
+
+    #[test]
+    fn subcommand_usage_matches_usage_text() {
+        let subcommands =
+            ["info", "render", "render-seq", "gif", "apng", "webp", "export", "formats", "commands", "run", "exec", "new", "guide", "bench", "serve", "mcp", "version"];
+        for sub in subcommands {
+            let u = subcommand_usage(sub).expect("subcommand_usage should exist");
+            let body = u.strip_prefix("USAGE:\n").expect("should start with USAGE:\n");
+            assert!(USAGE.contains(body), "USAGE should contain body for {sub}");
+        }
+        assert_eq!(subcommand_usage("bogus"), None);
+        // Every entry of a subcommand with several comes along, with its continuation lines.
+        let guide = subcommand_usage("guide").unwrap_or_default();
+        assert!(guide.contains("guide --out") && guide.contains("guide search") && guide.contains("best first"), "{guide}");
+        assert!(!guide.contains("bench"), "{guide}");
+        let export = subcommand_usage("export").unwrap_or_default();
+        assert!(export.contains("--options") && export.contains("exporter plug-ins"), "{export}");
+        // Words inside an entry are not subcommands.
+        for word in ["anicraft-cli", "--sample", "file", "", "apng|webp", "--plugins"] {
+            assert_eq!(subcommand_usage(word), None, "{word:?}");
+        }
     }
 }

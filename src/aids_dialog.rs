@@ -137,7 +137,7 @@ pub fn window(app: &mut App, ctx: &egui::Context) {
 fn grid_window(app: &mut App, ctx: &egui::Context) {
     let Some(d) = &mut app.aids_dialogs.grid else { return };
     let (mut ok, mut cancel) = (false, false);
-    egui::Window::new(tr!("Edit Grid")).id(egui::Id::new("edit_grid")).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, -80.0]).show(ctx, |ui| {
+    crate::windows::new(ctx, tr!("Edit Grid")).id(egui::Id::new("edit_grid")).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, -80.0]).show(ctx, |ui| {
         ui.set_min_width(380.0);
         form_row(ui, FORM_LABEL_DIALOG, tr!("Colour"), |ui| {
             crate::colour::button_alpha(ui, &mut d.color).named(tr!("Grid colour"));
@@ -171,7 +171,7 @@ pub fn accept_grid(app: &mut App) {
 fn guides_window(app: &mut App, ctx: &egui::Context) {
     let Some(d) = &mut app.aids_dialogs.guides else { return };
     let (mut ok, mut cancel) = (false, false);
-    egui::Window::new(tr!("Edit Guides")).id(egui::Id::new("edit_guides")).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, -80.0]).show(ctx, |ui| {
+    crate::windows::new(ctx, tr!("Edit Guides")).id(egui::Id::new("edit_guides")).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, -80.0]).show(ctx, |ui| {
         ui.set_min_width(420.0);
         form_row(ui, FORM_LABEL_DIALOG, tr!("Colour"), |ui| {
             crate::colour::button_alpha(ui, &mut d.color).named(tr!("Guide colour"));

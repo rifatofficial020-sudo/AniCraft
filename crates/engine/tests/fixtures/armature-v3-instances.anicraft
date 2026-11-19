@@ -1,0 +1,465 @@
+{
+  "format": "anicraft",
+  "version": 3,
+  "generator": "AniCraft 0.3.0",
+  "paths": [
+    "M0 0L20 0L20 20L0 20Z",
+    "M0 -5L100 -5L100 5L0 5Z"
+  ],
+  "document": {
+    "stage": {
+      "width": 500,
+      "height": 300,
+      "fps": 24.0,
+      "background": {
+        "r": 1.0,
+        "g": 1.0,
+        "b": 1.0,
+        "a": 1.0
+      }
+    },
+    "scenes": [
+      {
+        "name": "Scene 1",
+        "timeline": {
+          "layers": [
+            {
+              "id": 101,
+              "name": "Armature_1",
+              "kind": "Armature",
+              "visible": true,
+              "locked": false,
+              "outline": false,
+              "color": {
+                "r": 0.18431373,
+                "g": 0.7137255,
+                "b": 0.4862745,
+                "a": 1.0
+              },
+              "keyframes": [
+                {
+                  "start": 0,
+                  "duration": 12,
+                  "elements": [
+                    {
+                      "id": 10,
+                      "name": "",
+                      "transform": {
+                        "m": [
+                          1.0,
+                          0.0,
+                          0.0,
+                          1.0,
+                          100.0,
+                          100.0
+                        ]
+                      },
+                      "color": {
+                        "alpha": 1.0,
+                        "tint": {
+                          "r": 1.0,
+                          "g": 1.0,
+                          "b": 1.0,
+                          "a": 1.0
+                        },
+                        "tint_amount": 0.0
+                      },
+                      "kind": {
+                        "Symbol": {
+                          "symbol": 1,
+                          "loop_mode": "Loop",
+                          "first_frame": 0
+                        }
+                      }
+                    },
+                    {
+                      "id": 11,
+                      "name": "",
+                      "transform": {
+                        "m": [
+                          0.8660254,
+                          0.5,
+                          -0.5,
+                          0.8660254,
+                          200.0,
+                          100.0
+                        ]
+                      },
+                      "color": {
+                        "alpha": 1.0,
+                        "tint": {
+                          "r": 1.0,
+                          "g": 1.0,
+                          "b": 1.0,
+                          "a": 1.0
+                        },
+                        "tint_amount": 0.0
+                      },
+                      "kind": {
+                        "Symbol": {
+                          "symbol": 1,
+                          "loop_mode": "Loop",
+                          "first_frame": 0
+                        }
+                      }
+                    },
+                    {
+                      "id": 12,
+                      "name": "",
+                      "transform": {
+                        "m": [
+                          0.8660254,
+                          0.5,
+                          -0.5,
+                          0.8660254,
+                          286.60254,
+                          150.0
+                        ]
+                      },
+                      "color": {
+                        "alpha": 1.0,
+                        "tint": {
+                          "r": 1.0,
+                          "g": 1.0,
+                          "b": 1.0,
+                          "a": 1.0
+                        },
+                        "tint_amount": 0.0
+                      },
+                      "kind": {
+                        "Symbol": {
+                          "symbol": 1,
+                          "loop_mode": "Loop",
+                          "first_frame": 0
+                        }
+                      }
+                    }
+                  ],
+                  "tween": {
+                    "easing": "Linear"
+                  },
+                  "label": "",
+                  "pose": [
+                    {
+                      "bone": 100,
+                      "angle": 0.5235988
+                    },
+                    {
+                      "bone": 102,
+                      "angle": 0.0
+                    }
+                  ]
+                },
+                {
+                  "start": 12,
+                  "duration": 8,
+                  "elements": [
+                    {
+                      "id": 10,
+                      "name": "",
+                      "transform": {
+                        "m": [
+                          1.0,
+                          0.0,
+                          0.0,
+                          1.0,
+                          100.0,
+                          100.0
+                        ]
+                      },
+                      "color": {
+                        "alpha": 1.0,
+                        "tint": {
+                          "r": 1.0,
+                          "g": 1.0,
+                          "b": 1.0,
+                          "a": 1.0
+                        },
+                        "tint_amount": 0.0
+                      },
+                      "kind": {
+                        "Symbol": {
+                          "symbol": 1,
+                          "loop_mode": "Loop",
+                          "first_frame": 0
+                        }
+                      }
+                    },
+                    {
+                      "id": 11,
+                      "name": "",
+                      "transform": {
+                        "m": [
+                          0.8660254,
+                          0.5,
+                          -0.5,
+                          0.8660254,
+                          200.0,
+                          100.0
+                        ]
+                      },
+                      "color": {
+                        "alpha": 1.0,
+                        "tint": {
+                          "r": 1.0,
+                          "g": 1.0,
+                          "b": 1.0,
+                          "a": 1.0
+                        },
+                        "tint_amount": 0.0
+                      },
+                      "kind": {
+                        "Symbol": {
+                          "symbol": 1,
+                          "loop_mode": "Loop",
+                          "first_frame": 0
+                        }
+                      }
+                    },
+                    {
+                      "id": 12,
+                      "name": "",
+                      "transform": {
+                        "m": [
+                          0.9659258,
+                          -0.258819,
+                          0.258819,
+                          0.9659258,
+                          286.60254,
+                          150.0
+                        ]
+                      },
+                      "color": {
+                        "alpha": 1.0,
+                        "tint": {
+                          "r": 1.0,
+                          "g": 1.0,
+                          "b": 1.0,
+                          "a": 1.0
+                        },
+                        "tint_amount": 0.0
+                      },
+                      "kind": {
+                        "Symbol": {
+                          "symbol": 1,
+                          "loop_mode": "Loop",
+                          "first_frame": 0
+                        }
+                      }
+                    }
+                  ],
+                  "tween": {
+                    "easing": "Linear"
+                  },
+                  "label": "",
+                  "pose": [
+                    {
+                      "bone": 100,
+                      "angle": 0.5235988
+                    },
+                    {
+                      "bone": 102,
+                      "angle": -0.7853982
+                    }
+                  ]
+                }
+              ],
+              "armature": {
+                "bones": [
+                  {
+                    "id": 100,
+                    "parent": 10,
+                    "child": 11,
+                    "head": {
+                      "x": 100.0,
+                      "y": 0.0
+                    },
+                    "tail": {
+                      "x": 100.0,
+                      "y": 0.0
+                    },
+                    "rest": {
+                      "m": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        100.0,
+                        0.0
+                      ]
+                    }
+                  },
+                  {
+                    "id": 102,
+                    "parent": 11,
+                    "child": 12,
+                    "head": {
+                      "x": 100.0,
+                      "y": 0.0
+                    },
+                    "tail": {
+                      "x": 100.0,
+                      "y": 0.0
+                    },
+                    "rest": {
+                      "m": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        100.0,
+                        0.0
+                      ]
+                    },
+                    "limits": {
+                      "min": -1.5707964,
+                      "max": 1.5707964
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "id": 1,
+              "name": "Layer 1",
+              "kind": "Normal",
+              "visible": true,
+              "locked": false,
+              "outline": false,
+              "color": {
+                "r": 0.30980393,
+                "g": 0.6392157,
+                "b": 1.0,
+                "a": 1.0
+              },
+              "keyframes": [
+                {
+                  "start": 0,
+                  "duration": 20,
+                  "elements": [
+                    {
+                      "id": 13,
+                      "name": "",
+                      "transform": {
+                        "m": [
+                          1.0,
+                          0.0,
+                          0.0,
+                          1.0,
+                          100.0,
+                          250.0
+                        ]
+                      },
+                      "color": {
+                        "alpha": 1.0,
+                        "tint": {
+                          "r": 1.0,
+                          "g": 1.0,
+                          "b": 1.0,
+                          "a": 1.0
+                        },
+                        "tint_amount": 0.0
+                      },
+                      "kind": {
+                        "Shape": {
+                          "path": 0,
+                          "fill": {
+                            "Solid": {
+                              "r": 0.0,
+                              "g": 0.0,
+                              "b": 0.0,
+                              "a": 1.0
+                            }
+                          },
+                          "stroke": null,
+                          "fill_rule": "NonZero"
+                        }
+                      }
+                    }
+                  ],
+                  "tween": null,
+                  "label": ""
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ],
+    "library": [
+      {
+        "id": 1,
+        "name": "Bar",
+        "kind": "Graphic",
+        "timeline": {
+          "layers": [
+            {
+              "id": 2,
+              "name": "bar",
+              "kind": "Normal",
+              "visible": true,
+              "locked": false,
+              "outline": false,
+              "color": {
+                "r": 0.30980393,
+                "g": 0.6392157,
+                "b": 1.0,
+                "a": 1.0
+              },
+              "keyframes": [
+                {
+                  "start": 0,
+                  "duration": 1,
+                  "elements": [
+                    {
+                      "id": 3,
+                      "name": "",
+                      "transform": {
+                        "m": [
+                          1.0,
+                          0.0,
+                          0.0,
+                          1.0,
+                          0.0,
+                          0.0
+                        ]
+                      },
+                      "color": {
+                        "alpha": 1.0,
+                        "tint": {
+                          "r": 1.0,
+                          "g": 1.0,
+                          "b": 1.0,
+                          "a": 1.0
+                        },
+                        "tint_amount": 0.0
+                      },
+                      "kind": {
+                        "Shape": {
+                          "path": 1,
+                          "fill": {
+                            "Solid": {
+                              "r": 0.0,
+                              "g": 0.0,
+                              "b": 0.0,
+                              "a": 1.0
+                            }
+                          },
+                          "stroke": null,
+                          "fill_rule": "NonZero"
+                        }
+                      }
+                    }
+                  ],
+                  "tween": null,
+                  "label": ""
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ],
+    "next_id": 103
+  }
+}

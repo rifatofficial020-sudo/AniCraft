@@ -28,7 +28,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     }
     let mut open = true;
     let title = tr!("Manage Workspaces");
-    let shown = egui::Window::new(title).id(egui::Id::new("manage_workspaces")).open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+    let shown = crate::windows::new(ctx, title).id(egui::Id::new("manage_workspaces")).open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
         ui.set_min_width(380.0);
         let current = app.prefs.workspaces.current.clone();
         for key in app.prefs.workspaces.keys() {

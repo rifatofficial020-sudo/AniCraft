@@ -50,12 +50,15 @@ pub fn plugin_may_call(id: &str) -> std::result::Result<(), &'static str> {
             // Filter lists are the document's (ADR 0091); copied filters are the artist's
             // clipboard, and the presets their preferences (listing and applying one is fine).
             "filter" if matches!(id, "filter.copy" | "filter.paste") => Err("plug-ins don't use your clipboard"),
-            "filter" if matches!(id, "filter.preset_save" | "filter.preset_rename" | "filter.preset_delete" | "filter.preset_export" | "filter.preset_import") => Err("plug-ins can't change your filter presets or read and write preset files"),
+            "filter" if matches!(id, "filter.preset_save" | "filter.preset_rename" | "filter.preset_delete" | "filter.preset_hide" | "filter.preset_export" | "filter.preset_import") => Err("plug-ins can't change your filter presets or read and write preset files"),
             "filter" => Ok(()),
             // The document's swatches are document data; swatch files are files.
             "swatch" if matches!(id, "swatch.import" | "swatch.export") => Err("plug-ins can't read or write swatch files"),
             "swatch" => Ok(()),
             "plugin" => Err("plug-ins can't install, run or remove plug-ins"),
+            // Saved commands are files in your preferences (ADR 0097), and running one from a
+            // plug-in would let the two call each other.
+            "macro" => Err("plug-ins can't run, save or change saved commands"),
             "desktop" => Err("plug-ins can't change your applications menu or which app opens your files"),
             "control" => Err("plug-ins can't play the movie"),
             // A scene's guides are the document's (ADR 0076); whether rulers, grid and guides

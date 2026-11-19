@@ -132,11 +132,13 @@ impl Bez {
 
     /// The path of [`Bez::flat`] values, as Lottie writes it.
     fn flat_value(closed: bool, f: &[f64]) -> Value {
-        let pts: Vec<Value> = f.chunks(2).map(|c| json!([num(c.first().copied().unwrap_or(0.0)), num(c.get(1).copied().unwrap_or(0.0))])).collect();
+        let pts: Vec<[f64; 2]> = f.chunks(2).map(|c| [c.first().copied().unwrap_or(0.0), c.get(1).copied().unwrap_or(0.0)]).collect();
         let k = pts.len() / 3;
         let (v, rest) = pts.split_at(k.min(pts.len()));
         let (i, o) = rest.split_at(k.min(rest.len()));
-        json!({"c": closed, "v": v, "i": i, "o": o})
+        // Geometry/easing stay application-owned; the shared path schema uses our
+        // existing compact numeric policy without a second rounding pass.
+        craft_lottie::Bezier { closed, vertices: v.to_vec(), in_tangents: i.to_vec(), out_tangents: o.to_vec() }.to_json_with(num)
     }
 }
 
@@ -356,6 +358,16 @@ struct Track {
     frames: Vec<(u32, Sample)>,
     /// Draw position in its first frame (tie-break for the layer order).
     first_index: usize,
+}
+
+/// Keep color sanitation and stop policy local; share only the flat Lottie wire order.
+fn gradient_values(stops: &[(f32, Rgba)]) -> Vec<f64> {
+    let colors = stops.iter().map(|(o, c)| {
+        let c = c.sanitized();
+        (f64::from(o.clamp(0.0, 1.0)), [f64::from(c.r), f64::from(c.g), f64::from(c.b)])
+    });
+    let opacities = stops.iter().map(|(o, c)| (f64::from(o.clamp(0.0, 1.0)), f64::from(c.sanitized().a)));
+    craft_lottie::flat_gradient_values(colors, opacities).collect()
 }
 
 fn rgb(c: Rgba) -> Vec<f64> {
@@ -658,8 +670,13 @@ pub fn to_lottie_keyed(doc: &Document, name: &str, from: u32, to: u32, backgroun
     let mattes = layers.len() - shape_layers;
     if background {
         let bg = doc.stage.background.sanitized();
-        layers.push(json!({"ddd": 0, "ind": shape_layers + mattes + 1, "ty": 1, "nm": "Stage", "sr": 1, "ks": static_ks(), "ao": 0, "ip": 0, "op": frames, "st": 0, "bm": 0,
-            "sc": bg.to_hex(), "sw": doc.stage.width, "sh": doc.stage.height}));
+        // A fully transparent stage has no background layer; otherwise alpha is the layer opacity.
+        if bg.a > 0.0 {
+            let mut ks = static_ks();
+            ks["o"]["k"] = n(bg.a.clamp(0.0, 1.0) * 100.0);
+            layers.push(json!({"ddd": 0, "ind": shape_layers + mattes + 1, "ty": 1, "nm": "Stage", "sr": 1, "ks": ks, "ao": 0, "ip": 0, "op": frames, "st": 0, "bm": 0,
+                "sc": bg.to_hex(), "sw": doc.stage.width, "sh": doc.stage.height}));
+        }
     }
     let root = json!({
         "v": "5.7.0",
@@ -960,16 +977,7 @@ fn layer(tr: &Track, ind: usize, w: &mut Writer<'_>) -> Value {
                     };
                     start.push(vec![f64::from(a.x), f64::from(a.y)]);
                     end.push(vec![f64::from(b.x), f64::from(b.y)]);
-                    // Colour stops, then opacity stops: [offset, r, g, b, …, offset, a, …].
-                    let mut k: Vec<f64> = Vec::with_capacity(count * 6);
-                    for (o, c) in stops {
-                        let c = c.sanitized();
-                        k.extend([f64::from(o.clamp(0.0, 1.0)), f64::from(c.r), f64::from(c.g), f64::from(c.b)]);
-                    }
-                    for (o, c) in stops {
-                        k.extend([f64::from(o.clamp(0.0, 1.0)), f64::from(c.sanitized().a)]);
-                    }
-                    colors.push(k);
+                    colors.push(gradient_values(stops));
                 }
             }
             let (s, e, g) = (w.prop(first, &start, TOL_PX, Enc::Vector), w.prop(first, &end, TOL_PX, Enc::Vector), w.prop(first, &colors, TOL_COLOR, Enc::Vector));
@@ -1069,6 +1077,39 @@ mod tests {
     }
 
     #[test]
+    fn shared_gradient_values_match_legacy_before_keyframe_fitting() {
+        fn legacy(stops: &[(f32, Rgba)]) -> Vec<f64> {
+            let mut k = Vec::with_capacity(stops.len() * 6);
+            for (o, c) in stops {
+                let c = c.sanitized();
+                k.extend([f64::from(o.clamp(0.0, 1.0)), f64::from(c.r), f64::from(c.g), f64::from(c.b)]);
+            }
+            for (o, c) in stops {
+                k.extend([f64::from(o.clamp(0.0, 1.0)), f64::from(c.sanitized().a)]);
+            }
+            k
+        }
+        let cases = [
+            vec![],
+            vec![(0.12345679, Rgba::WHITE), (1.0, Rgba::BLACK)],
+            vec![(0.5, Rgba::new(0.2, 0.4, 0.6, 0.25)), (0.5, Rgba::WHITE)],
+            vec![
+                (-1.0, Rgba { r: f32::NAN, g: f32::INFINITY, b: -1.0, a: 2.0 }),
+                (f32::NAN, Rgba::BLACK),
+                (f32::INFINITY, Rgba::WHITE),
+                (-0.0, Rgba::WHITE),
+            ],
+        ];
+        for stops in cases {
+            let actual = gradient_values(&stops);
+            let expected = legacy(&stops);
+            assert_eq!(actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+            assert_eq!(actual.iter().map(|x| num(*x)).collect::<Vec<_>>(), expected.iter().map(|x| num(*x)).collect::<Vec<_>>());
+            assert_eq!(actual.len(), stops.len() * 6, "opaque alpha stops must survive animated fitting");
+        }
+    }
+
+    #[test]
     fn soft_masks_become_track_mattes() {
         use anicraft_doc::MaskMode;
         for (mode, tt) in [(MaskMode::Alpha, 1), (MaskMode::Luminance, 3)] {
@@ -1089,6 +1130,44 @@ mod tests {
         let v = parse(&to_lottie(&soft_mask_doc(MaskMode::Coverage), "hard", 0, 0, false));
         assert_eq!(v["layers"].as_array().unwrap().len(), 1);
         assert_eq!(v["layers"][0]["hasMask"], true);
+    }
+
+    #[test]
+    fn transparent_stage_background_has_no_solid_layer() {
+        let mut d = sample::demo();
+        d.stage.background = anicraft_doc::Rgba::new(1.0, 0.0, 0.0, 0.0);
+        let v = parse(&to_lottie(&d, "x", 0, 1, true));
+        assert!(v["layers"].as_array().unwrap().iter().all(|l| l["ty"] != 1));
+    }
+
+    #[test]
+    fn semi_transparent_stage_background_sets_layer_opacity() {
+        let mut d = sample::demo();
+        d.stage.background = anicraft_doc::Rgba::new(1.0, 0.0, 0.0, 0.5);
+        let v = parse(&to_lottie(&d, "x", 0, 1, true));
+        let l = v["layers"].as_array().unwrap().iter().find(|l| l["ty"] == 1).unwrap();
+        assert_eq!(l["ks"]["o"]["k"].as_f64(), Some(50.0));
+        assert_eq!(l["sc"], "#ff0000");
+    }
+
+    #[test]
+    fn shared_path_wire_keeps_legacy_values_and_precision() {
+        for closed in [false, true] {
+            for flat in [
+                vec![],
+                vec![1.23456],
+                vec![0.0, -0.0, f64::NAN, f64::INFINITY, 1.23456, -2.34567],
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+                vec![1e303, -1e303, f64::MAX, -f64::MAX, 0.0, 0.0],
+            ] {
+                let pts: Vec<Value> =
+                    flat.chunks(2).map(|c| json!([num(c.first().copied().unwrap_or(0.0)), num(c.get(1).copied().unwrap_or(0.0))])).collect();
+                let k = pts.len() / 3;
+                let (v, rest) = pts.split_at(k);
+                let (i, o) = rest.split_at(k);
+                assert_eq!(Bez::flat_value(closed, &flat), json!({"c": closed, "v": v, "i": i, "o": o}));
+            }
+        }
     }
 
     #[test]
@@ -1196,6 +1275,29 @@ mod tests {
             let x = crate::lottie_keys::value_at(&p, f64::from(f)).unwrap()[0];
             let want = evaluate(&doc, f).items[0].transform.m[4];
             assert!((x - f64::from(want)).abs() < 2e-3, "frame {f}: {x} vs {want}");
+        }
+    }
+
+    #[test]
+    fn a_tween_that_keeps_area_is_baked_frame_by_frame() {
+        // ADR 0115: no cubic ease draws a geometric scale curve, so the check of ADR 0089
+        // refuses eased keys and the export holds every frame's own scale: the area a Lottie
+        // player shows is the one `evaluate` gives, on every frame.
+        use anicraft_doc::Easing;
+        use std::sync::Arc;
+        let mut doc = tweened(Affine::translate(50.0, 60.0), Affine::translate(50.0, 60.0).mul(&Affine::scale(2.0, 0.5)), Easing::Linear, false);
+        let l = Arc::make_mut(&mut doc.timeline_mut(0).layers[0]);
+        Arc::make_mut(&mut l.keyframes[0]).tween.as_mut().unwrap().keep_area = true;
+        let e = to_lottie(&doc, "squash", 0, 14, false);
+        let v = parse(&e);
+        let it = items(&v, 0);
+        let s = keys_of(&it.last().unwrap()["s"]);
+        assert!(s.len() >= 10, "a key a frame: {}", s.len());
+        for f in 0..=14 {
+            let got = crate::lottie_keys::value_at(&s, f64::from(f)).unwrap();
+            let want = evaluate(&doc, f).items[0].transform.decompose();
+            assert!((got[0] - f64::from(want.sx) * 100.0).abs() < 2e-2 && (got[1] - f64::from(want.sy) * 100.0).abs() < 2e-2, "frame {f}: {got:?} vs {want:?}");
+            assert!((got[0] * got[1] - 10_000.0).abs() < 5.0, "frame {f}: the area stays ({got:?})");
         }
     }
 

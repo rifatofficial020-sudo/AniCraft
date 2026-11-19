@@ -105,7 +105,7 @@ keeping `evaluate` pure and drawing the same shape everywhere.
 
 ## Not yet
 
-* Instances and shapes in one armature; more than one shape per armature; reshaping the
+* ~~Instances and shapes in one armature; more than one shape per armature~~ (ADR 0098); reshaping the
   outline after binding (Animate allows Subselection edits on the rest pose).
 * Dragging points onto a bone with the Bind tool (only clicks and boxes for now), painting
   weights, and a falloff setting.

@@ -55,8 +55,9 @@ nothing was copied.
 
 3. **Commands** (namespace `modify`, already allowed to plug-ins):
    * `modify.group` (Modify › Group, **Ctrl+G**): the selected elements on each layer become one
-     group there, at the topmost one's place in the stacking, its transform the identity, so
-     every member keeps its world transform bit for bit (tested).
+     group there, at the topmost one's place in the stacking. The group's registration point is
+     the centre of what was grouped, and each member is stored relative to that point, so the
+     artwork stays where it was (tested). Editing the group in place moves the registration.
    * `modify.ungroup` (Modify › Ungroup, **Ctrl+Shift+G**; Break Apart on a group does the same
      with fresh ids): members go back where the group was, each with `group · member` as its
      transform and the colour effects nested; they keep their ids unless a copy of the group was
@@ -101,12 +102,15 @@ nothing was copied.
 
 6. **XFL import**: a `DOMGroup` now comes in as a group, placed by its matrix, its shapes raw
    inside it and merged with each other on open, as a keyframe's are (before, its members were
-   flattened onto the frame as drawing objects).
+   flattened onto the frame as drawing objects). Animate writes the members in the group's
+   parent space, so they are brought into the group's frame by its inverse (#411).
 
 ## Consequences
 
 * Animate users find Group, Ungroup and Combine Objects where they expect them, with the same
   keys; Animate files keep their groups.
+* A group's registration point starts at the centre of its artwork, not the corner of the stage.
+  Edit the group to put that point somewhere else. The artwork does not jump when the group is made.
 * Measured on 288 raw shapes (12 × 12 outlined, rounded squares; optimised debug build):
 
   | Operation | Time |

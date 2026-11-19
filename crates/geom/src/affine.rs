@@ -67,7 +67,7 @@ impl Affine {
         self.m[0] * self.m[3] - self.m[1] * self.m[2]
     }
 
-    /// Inverse, or `None` for a singular (or non-finite) matrix.
+    /// Inverse, or `None` for a singular matrix or non-finite input or result.
     pub fn inverse(&self) -> Option<Affine> {
         let det = self.determinant();
         if !det.is_finite() || det.abs() < 1e-12 {
@@ -79,7 +79,9 @@ impl Affine {
         let ib = -b * inv;
         let ic = -c * inv;
         let id = a * inv;
-        Some(Affine { m: [ia, ib, ic, id, -(ia * e + ic * f), -(ib * e + id * f)] })
+        let inverse = Affine { m: [ia, ib, ic, id, -(ia * e + ic * f), -(ib * e + id * f)] };
+        // A finite determinant does not cover translation or overflow in the inverse.
+        inverse.is_finite().then_some(inverse)
     }
 
     pub fn translation(&self) -> Vec2 {
@@ -177,6 +179,24 @@ mod tests {
         let inv = m.inverse().unwrap();
         assert!(close(&m.mul(&inv), &Affine::IDENTITY));
         assert!(Affine::scale(0.0, 1.0).inverse().is_none());
+    }
+
+    #[test]
+    fn inverse_rejects_non_finite_coefficients() {
+        for value in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            for index in 0..6 {
+                let mut m = Affine::IDENTITY;
+                m.m[index] = value;
+                assert!(m.inverse().is_none(), "{m:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn inverse_rejects_overflow_from_finite_coefficients() {
+        let m = Affine { m: [0.5, 0.0, 0.0, 0.5, f32::MAX, 0.0] };
+        assert!(m.is_finite());
+        assert!(m.inverse().is_none());
     }
 
     #[test]

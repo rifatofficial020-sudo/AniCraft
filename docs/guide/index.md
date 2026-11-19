@@ -34,12 +34,14 @@ the panels, tools and shortcuts you know to AniCraft's, and lists what works dif
 
 13. [Preferences, shortcuts, accessibility and languages](preferences-shortcuts-accessibility.md).
 14. [Plug-ins](plugins.md): add commands safely.
-15. [Working headless](working-headless.md): the command line and AI assistants, for pipelines.
+15. [Saved commands](saved-commands.md): keep steps from the History panel and run them again on any selection.
+16. [Working headless](working-headless.md): the command line and AI assistants, for pipelines.
 
 ## Help
 
-16. [Troubleshooting and FAQ](troubleshooting-and-faq.md).
-17. [Coming from Animate](coming-from-animate.md).
+17. [Using this guide](using-this-guide.md): searching it, and help for whatever you are working on (**F1**).
+18. [Troubleshooting and FAQ](troubleshooting-and-faq.md).
+19. [Coming from Animate](coming-from-animate.md).
 
 ## Reference
 
@@ -52,7 +54,9 @@ have. On macOS, **Ctrl** in this guide means **⌘** (Command) and **Alt** means
 ## About this guide
 
 The guide comes with AniCraft: **Help › User Guide** opens it in your web browser, and it works
-without an internet connection. You can also read it on
+without an internet connection. Search it from the field at the top of every page, or press
+**F1** in AniCraft to open it at the section for what you are working on; see
+[Using this guide](using-this-guide.md). You can also read it on
 [GitHub](https://github.com/storytold/AniCraft). Found a mistake or something missing? Please
 [open an issue](https://github.com/storytold/AniCraft/issues).
 

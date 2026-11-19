@@ -32,7 +32,7 @@ pub(crate) fn three_bars() -> Session {
         k
     });
     d.library.push(Arc::new(Symbol { id: bar, name: "Bar".into(), kind: SymbolKind::Graphic, linkage: None, scale_grid_kept: None, scale_grid: None, timeline: Timeline { layers: vec![Arc::new(inner)] } }));
-    let inst = |id: u64, x: f32| Arc::new(Element { id: ElementId(id), name: String::new(), transform: Affine::translate(x, 100.0), color: ColorEffect::default(), kind: ElementKind::Symbol { symbol: bar, loop_mode: LoopMode::Loop, first_frame: 0, blend: BlendMode::Normal, filters: Vec::new(), events: Vec::new() } });
+    let inst = |id: u64, x: f32| Arc::new(Element { id: ElementId(id), name: String::new(), transform: Affine::translate(x, 100.0), color: ColorEffect::default(), kind: ElementKind::Symbol { symbol: bar, loop_mode: LoopMode::Loop, first_frame: 0, blend: BlendMode::Normal, filters: Vec::new(), events: Vec::new(), pivot: None } });
     let shape = Arc::new(Element { id: ElementId(SHAPE), name: String::new(), transform: Affine::translate(100.0, 250.0), color: ColorEffect::default(), kind: ElementKind::Shape(Shape::filled(Path::rect(0.0, 0.0, 20.0, 20.0), Paint::Solid(Rgba::BLACK))) });
     let l = Arc::make_mut(&mut d.timeline_mut(0).layers[0]);
     l.keyframes = vec![Arc::new({
@@ -94,7 +94,6 @@ fn bone_add_refuses_what_cant_be_joined() {
     let mut s = three_bars();
     let bad = |s: &mut Session, p: Value| s.execute("bone.add", &p).unwrap_err().to_string();
     assert!(bad(&mut s, json!({"from": ROOT, "to": ROOT})).contains("two different"));
-    assert!(bad(&mut s, json!({"from": ROOT, "to": SHAPE})).contains("symbol"));
     assert!(bad(&mut s, json!({"from": ROOT, "to": 999})).contains("no instance"));
     assert!(bad(&mut s, json!({"from": ROOT})).contains("required"));
     assert!(bad(&mut s, json!({"from": ROOT, "to": ARM, "head": [1, "x"]})).contains("[x, y]"));

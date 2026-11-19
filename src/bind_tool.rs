@@ -1,7 +1,9 @@
 //! The Bind tool (ADR 0071, ADR 0090): which points of a shape follow which of its bones, and
 //! how much.
 //!
-//! With the tool in hand, every shape armature on the stage shows its points: a square for a
+//! With the tool in hand, every shape with bones on the stage shows its points (an armature may
+//! hold several such shapes, next to instances: ADR 0098; a bone binds the points of the shape
+//! it is inside): a square for a
 //! point that follows one bone, a triangle for one that several bones share (as in Animate).
 //! Click a bone to pick it: the points it moves fill in the selection colour. Then a click on a
 //! point makes it follow only that bone, Shift-click shares it with the bones it follows,
@@ -22,7 +24,7 @@ use crate::pathtools::Xf;
 use crate::theme::{T, to_color32};
 use anicraft_engine::doc::skin::points_shown;
 use anicraft_engine::doc::weights::Brush;
-use anicraft_engine::doc::{BoneId, ElementKind, LayerId, LayerKind, evaluate_layer_elements};
+use anicraft_engine::doc::{BoneId, ElementId, ElementKind, LayerId, LayerKind, evaluate_layer_elements};
 use anicraft_engine::geom::{PathCmd, Vec2};
 use egui::{Color32, Pos2, Rect, Stroke, StrokeKind, pos2, vec2};
 use serde_json::json;
@@ -67,9 +69,10 @@ pub fn brush_label(b: Brush) -> (&'static str, &'static str) {
     }
 }
 
-/// One shape armature's points as the stage shows them at the playhead.
+/// The points of one shape with bones as the stage shows them at the playhead.
 struct Points {
     layer: LayerId,
+    shape: ElementId,
     color: Color32,
     locked: bool,
     /// Stage position, the bones it follows with their weights.
@@ -102,11 +105,10 @@ fn shown(app: &App) -> Vec<Points> {
         .iter()
         .enumerate()
         .filter(|(i, l)| l.kind == LayerKind::Armature && l.visible && !tl.hidden_by_folder(*i))
-        .filter_map(|(_, l)| {
-            let arm = l.armature.as_deref()?;
-            let skin = arm.skin.as_ref()?;
-            let (_, els) = evaluate_layer_elements(l, app.s.frame)?;
-            let at = points_shown(arm, &els);
+        .filter_map(|(_, l)| Some((l, l.armature.as_deref()?, evaluate_layer_elements(l, app.s.frame)?.1)))
+        .flat_map(|(l, arm, els)| arm.skins.iter().map(move |skin| (l, skin, els.clone())).collect::<Vec<_>>())
+        .map(|(l, skin, els)| {
+            let at = points_shown(skin, &els);
             let points = at.into_iter().zip(&skin.points).map(|(p, b)| (p, b.bones.iter().map(|i| (i.0, i.1)).collect())).collect();
             // The outline as it shows, segment by segment, with the anchors at its ends.
             let mut outline = Vec::new();
@@ -135,7 +137,7 @@ fn shown(app: &App) -> Vec<Points> {
                     }
                 }
             }
-            Some(Points { layer: l.id, color: to_color32(l.color), locked: l.locked || tl.locked_by_folder(l.id), points, outline })
+            Points { layer: l.id, shape: skin.shape, color: to_color32(l.color), locked: l.locked || tl.locked_by_folder(l.id), points, outline }
         })
         .collect()
 }
@@ -152,16 +154,16 @@ fn mode(shift: bool, command: bool) -> &'static str {
     }
 }
 
-/// The picked bone, when it is inside a shape on layer `layer`.
-fn picked_in(app: &App, layer: LayerId) -> Option<BoneId> {
+/// The picked bone, when it is inside shape `shape` on layer `layer`.
+fn picked_in(app: &App, layer: LayerId, shape: ElementId) -> Option<BoneId> {
     let id = app.bone_sel?;
-    app.s.timeline().layer(layer)?.armature.as_ref().filter(|a| a.skin.is_some() && a.bone(id).is_some()).map(|_| id)
+    app.s.timeline().layer(layer)?.armature.as_ref().filter(|a| a.bone(id).is_some_and(|b| b.shape == Some(shape))).map(|_| id)
 }
 
 /// The picked bone when it is inside a shape (any layer).
 fn picked_shape_bone(app: &App) -> Option<BoneId> {
     let id = app.bone_sel?;
-    app.s.timeline().layers.iter().any(|l| l.armature.as_ref().is_some_and(|a| a.skin.is_some() && a.bone(id).is_some())).then_some(id)
+    app.s.timeline().layers.iter().any(|l| l.armature.as_ref().is_some_and(|a| a.skin_of(id).is_some())).then_some(id)
 }
 
 fn bind(app: &mut App, bone: BoneId, points: Vec<usize>, shift: bool, command: bool) {
@@ -178,9 +180,12 @@ fn bind(app: &mut App, bone: BoneId, points: Vec<usize>, shift: bool, command: b
     }
 }
 
-/// The nearest unlocked shape point within grabbing reach of screen point `p`: its layer and index.
-fn point_at(app: &App, xf: Xf, p: Pos2) -> Option<(LayerId, usize)> {
-    shown(app).into_iter().rev().filter(|s| !s.locked).find_map(|s| s.points.iter().position(|(at, _)| xf.to_screen(*at).distance(p) <= GRAB).map(|i| (s.layer, i)))
+/// The nearest unlocked shape point within grabbing reach of screen point `p`: its layer, its
+/// shape and its index there. The picked bone's shape wins where shapes overlap.
+fn point_at(app: &App, xf: Xf, p: Pos2) -> Option<(LayerId, ElementId, usize)> {
+    let mut all: Vec<Points> = shown(app).into_iter().filter(|s| !s.locked).collect();
+    all.sort_by_key(|s| picked_in(app, s.layer, s.shape).is_some());
+    all.into_iter().rev().find_map(|s| s.points.iter().position(|(at, _)| xf.to_screen(*at).distance(p) <= GRAB).map(|i| (s.layer, s.shape, i)))
 }
 
 /// Sends dabs at stage points `at` with the brush in hand (inside the stroke's gesture).
@@ -206,7 +211,9 @@ pub fn click(app: &mut App, xf: Xf, p: Pos2, shift: bool, command: bool) {
             app.status_ok(tr!("Pick a bone of a shape first (click it), then paint its weights."));
             return;
         };
-        if let Some((_, i)) = hit {
+        if let Some((layer, shape, i)) = hit
+            && picked_in(app, layer, shape).is_some()
+        {
             app.bind.point = Some(i);
         }
         app.s.begin_gesture(tr_noop!("Paint Weights"));
@@ -214,8 +221,8 @@ pub fn click(app: &mut App, xf: Xf, p: Pos2, shift: bool, command: bool) {
         app.s.end_gesture();
         return;
     }
-    if let Some((layer, i)) = hit {
-        match picked_in(app, layer) {
+    if let Some((layer, shape, i)) = hit {
+        match picked_in(app, layer, shape) {
             Some(bone) => {
                 app.bind.point = Some(i);
                 bind(app, bone, vec![i], shift, command);
@@ -270,7 +277,7 @@ pub fn paint_to(app: &mut App, last: Pos2, cur: Pos2) -> Pos2 {
 pub fn paint_end(app: &mut App) {
     app.s.end_gesture();
     if let Some(bone) = picked_shape_bone(app) {
-        let n = app.s.timeline().layers.iter().find_map(|l| l.armature.as_ref().and_then(|a| a.skin.as_ref()).filter(|_| l.armature.as_ref().is_some_and(|a| a.bone(bone).is_some())).map(|k| k.points.iter().filter(|b| b.weight(bone) > 0.0).count()));
+        let n = app.s.timeline().layers.iter().find_map(|l| l.armature.as_ref().filter(|a| a.skin_of(bone).is_some()).map(|a| a.bound_count(bone)));
         if let Some(n) = n {
             app.status_ok(trn!("The bone moves {n} point. {undo} to undo the stroke.", "The bone moves {n} points. {undo} to undo the stroke.", n, undo = app.undo_key()));
         }
@@ -281,7 +288,7 @@ pub fn paint_end(app: &mut App) {
 pub fn drag_end(app: &mut App, start: Pos2, cur: Pos2, shift: bool, command: bool) {
     let r = Rect::from_two_pos(start, cur);
     for s in shown(app).into_iter().filter(|s| !s.locked) {
-        let Some(bone) = picked_in(app, s.layer) else { continue };
+        let Some(bone) = picked_in(app, s.layer, s.shape) else { continue };
         let inside: Vec<usize> = s.points.iter().enumerate().filter(|(_, (at, _))| r.contains(pos2(at.x, at.y))).map(|(i, _)| i).collect();
         if inside.is_empty() {
             app.status_ok(tr!("No points of the bone's shape inside the box."));
@@ -292,14 +299,14 @@ pub fn drag_end(app: &mut App, start: Pos2, cur: Pos2, shift: bool, command: boo
     }
 }
 
-/// Every shape armature's points (with the Bind tool in hand), and the box being dragged; with
+/// The points of every shape with bones (with the Bind tool in hand), and the box being dragged; with
 /// Paint Weights on, the picked bone's weights as a heat map and the brush under the pointer.
 pub fn draw(app: &App, painter: &egui::Painter, xf: Xf) {
     if app.tool != Tool::Bind {
         return;
     }
     for s in shown(app) {
-        let picked = picked_in(app, s.layer);
+        let picked = picked_in(app, s.layer, s.shape);
         let fade = |c: Color32| if s.locked { c.gamma_multiply(0.5) } else { c };
         if let (true, Some(bone)) = (app.bind.paint, picked) {
             let w = |i: usize| s.points.get(i).and_then(|(_, b)| b.iter().find(|x| x.0 == bone)).map_or(0.0, |x| x.1);
@@ -380,7 +387,7 @@ mod tests {
     }
 
     fn weights(app: &App, bone: BoneId) -> Vec<f32> {
-        app.s.timeline().layers.iter().find_map(|l| l.armature.as_ref().and_then(|a| a.skin.as_ref())).map(|k| k.points.iter().map(|b| b.weight(bone)).collect()).unwrap_or_default()
+        app.s.timeline().layers.iter().find_map(|l| l.armature.as_ref().and_then(|a| a.skin_of(bone))).map(|k| k.points.iter().map(|b| b.weight(bone)).collect()).unwrap_or_default()
     }
 
     #[test]

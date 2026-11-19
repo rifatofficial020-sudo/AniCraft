@@ -1,8 +1,10 @@
 //! Shape armatures (ADR 0071): bones drawn inside one shape, whose outline bends with them.
 //!
-//! A shape armature is an [`Armature`] with a [`Skin`]. Its bones join *joint nodes* instead of
-//! symbol instances: the root bones start on the shape itself (its element id) and every other
-//! bone starts on the node of the bone it hangs from. A node is a frame that the bone into it
+//! A shape with bones has a [`Skin`] on its [`Armature`] (one per shape: an armature may hold
+//! several, next to bones that move instances, ADR 0098). The bones inside a shape
+//! ([`crate::armature::Bone::shape`]) join *joint nodes* instead of elements: the first bones
+//! start on the shape itself (its element id) and every other bone starts on the node of the
+//! bone it hangs from. A node is a frame that the bone into it
 //! turns; at rest every node's frame is the shape's own local space, so a bone's head and tail
 //! are points of the shape as it was drawn, and a node's transform under a pose is the bone's
 //! **skinning matrix**. Forward and inverse kinematics are ADR 0043's ([`crate::armature::place`],
@@ -73,8 +75,12 @@ impl Binding {
         self.bones.truncate(MAX_INFLUENCES);
         let sum: f32 = self.bones.iter().map(|i| i.1).sum();
         if sum > 0.0 && sum.is_finite() {
-            for i in &mut self.bones {
-                i.1 /= sum;
+            // Weights that already sum to 1 (to rounding) are left as they are: normalising a
+            // loaded binding again must not move its numbers, or a file would change on re-save.
+            if (sum - 1.0).abs() > 1e-6 {
+                for i in &mut self.bones {
+                    i.1 /= sum;
+                }
             }
         } else {
             self.bones.clear();
@@ -114,16 +120,14 @@ pub fn anchors(path: &Path) -> Vec<Vec2> {
         .collect()
 }
 
-/// Where every bone of a shape armature lies as drawn, in the shape's space: its joint and end.
-pub fn rest_segments(arm: &Armature) -> Vec<(BoneId, Vec2, Vec2)> {
+/// Where every bone inside `shape` lies as drawn, in the shape's space: its joint and end.
+pub fn rest_segments(arm: &Armature, shape: ElementId) -> Vec<(BoneId, Vec2, Vec2)> {
     // Every node's rest frame is the shape's space (`rest` is the identity for shape bones), so
     // composing the rests places each bone; a hand-edited file with other rests still works.
     let mut node: HashMap<ElementId, Affine> = HashMap::new();
-    let root = arm.skin.as_ref().map(|s| s.shape);
-    arm.bones
-        .iter()
+    arm.bones_in(shape)
         .filter_map(|b| {
-            let wp = if Some(b.parent) == root { Affine::IDENTITY } else { *node.get(&b.parent)? };
+            let wp = if b.parent == shape { Affine::IDENTITY } else { *node.get(&b.parent)? };
             let wc = wp.mul(&b.rest);
             node.insert(b.child, wc);
             Some((b.id, wp.apply(b.head), wc.apply(b.tail)))
@@ -164,33 +168,35 @@ pub fn auto_binding(segments: &[(BoneId, Vec2, Vec2)], p: Vec2) -> Binding {
 
 /// Binds every anchor not bound by hand afresh (after the bones changed), and repairs the hand
 /// bound ones: bones that went away leave them, and one left with none goes back to automatic
-/// (an anchor unbound by hand on purpose stays unbound). Keeps one binding per anchor.
+/// (an anchor unbound by hand on purpose stays unbound). Keeps one binding per anchor. Every
+/// skin of the armature, each against the bones inside its own shape.
 pub fn rebind(arm: &mut Armature) {
-    let segments = rest_segments(arm);
-    let ids: Vec<BoneId> = arm.bones.iter().map(|b| b.id).collect();
-    let Some(skin) = arm.skin.as_mut() else { return };
-    let pts = anchors(&skin.rest);
-    skin.points.resize(pts.len(), Binding::default());
-    for (b, &p) in skin.points.iter_mut().zip(&pts) {
-        if b.manual {
-            let had = !b.bones.is_empty();
-            b.normalize(|id| ids.contains(&id));
-            if !had || !b.bones.is_empty() {
-                continue;
+    for i in 0..arm.skins.len() {
+        let Some(shape) = arm.skins.get(i).map(|k| k.shape) else { continue };
+        let segments = rest_segments(arm, shape);
+        let Some(skin) = arm.skins.get_mut(i) else { continue };
+        let pts = anchors(&skin.rest);
+        skin.points.resize(pts.len(), Binding::default());
+        for (b, &p) in skin.points.iter_mut().zip(&pts) {
+            if b.manual {
+                let had = !b.bones.is_empty();
+                b.normalize(|id| segments.iter().any(|s| s.0 == id));
+                if !had || !b.bones.is_empty() {
+                    continue;
+                }
             }
+            *b = auto_binding(&segments, p);
         }
-        *b = auto_binding(&segments, p);
     }
 }
 
-/// Every bone's skinning matrix under `pose`: how the pose moves the shape's space near it (the
-/// identity at rest, exactly).
-pub fn matrices(arm: &Armature, pose: &Pose) -> HashMap<BoneId, Affine> {
-    let Some(skin) = &arm.skin else { return HashMap::new() };
+/// The skinning matrix under `pose` of every bone inside `skin`'s shape: how the pose moves the
+/// shape's space near it (the identity at rest, exactly).
+pub fn matrices(arm: &Armature, skin: &Skin, pose: &Pose) -> HashMap<BoneId, Affine> {
     let mut node: HashMap<ElementId, Affine> = HashMap::new();
     node.insert(skin.shape, Affine::IDENTITY);
-    let mut out = HashMap::with_capacity(arm.bones.len());
-    for b in &arm.bones {
+    let mut out = HashMap::new();
+    for b in arm.bones_in(skin.shape) {
         let Some(wp) = node.get(&b.parent).copied() else { continue };
         let (a, s) = (b.allow(pose.angle(b.id)), b.allow_slide(pose.slide(b.id)));
         let wc = if a == 0.0 && s == anicraft_geom::Vec2::ZERO { wp.mul(&b.rest) } else { crate::armature::joint(b, &wp, a, s).1 };
@@ -237,15 +243,14 @@ fn mix(a: Option<Affine>, b: Option<Affine>) -> Option<Affine> {
     }
 }
 
-/// The outline `pose` bends the skin's shape into (the shape's space): linear blend skinning of
+/// The outline `pose` bends `skin`'s shape into (the shape's space): linear blend skinning of
 /// every anchor, each cubic handle moving with the anchor it leaves or enters and a quadratic's
 /// control with the mean of its two ends. At rest (or where no bound bone turned) points are
 /// exactly as drawn.
-pub fn deform(arm: &Armature, pose: &Pose) -> Option<Arc<Path>> {
-    let skin = arm.skin.as_ref()?;
-    let m = matrices(arm, pose);
+pub fn deform(arm: &Armature, skin: &Skin, pose: &Pose) -> Arc<Path> {
+    let m = matrices(arm, skin, pose);
     if m.values().all(|x| *x == Affine::IDENTITY) {
-        return Some(skin.rest.clone());
+        return skin.rest.clone();
     }
     let none = Binding::default();
     let mut idx = 0usize;
@@ -271,29 +276,31 @@ pub fn deform(arm: &Armature, pose: &Pose) -> Option<Arc<Path>> {
         });
         prev = next;
     }
-    Some(Arc::new(Path { cmds }))
+    Arc::new(Path { cmds })
 }
 
-/// Puts the skin's shape in `elements` in the outline `pose` bends it into (copy-on-write).
-/// Returns whether it changed.
+/// Puts every shape with bones in `elements` in the outline `pose` bends it into
+/// (copy-on-write). Returns whether any changed.
 pub fn apply(arm: &Armature, elements: &mut [Arc<Element>], pose: &Pose) -> bool {
-    let Some(skin) = &arm.skin else { return false };
-    let Some(e) = elements.iter_mut().find(|e| e.id == skin.shape) else { return false };
-    let ElementKind::Shape(s) = &e.kind else { return false };
-    let Some(path) = deform(arm, pose) else { return false };
-    if Arc::ptr_eq(&s.path, &path) || *s.path == *path {
-        return false;
+    let mut changed = false;
+    for skin in &arm.skins {
+        let Some(e) = elements.iter_mut().find(|e| e.id == skin.shape) else { continue };
+        let ElementKind::Shape(s) = &e.kind else { continue };
+        let path = deform(arm, skin, pose);
+        if Arc::ptr_eq(&s.path, &path) || *s.path == *path {
+            continue;
+        }
+        if let ElementKind::Shape(s) = &mut Arc::make_mut(e).kind {
+            s.path = path;
+            changed = true;
+        }
     }
-    if let ElementKind::Shape(s) = &mut Arc::make_mut(e).kind {
-        s.path = path;
-    }
-    true
+    changed
 }
 
-/// The points of a shape armature's shape in `elements` (evaluated: posed), in point order, in
-/// the layer's space: the anchors of its outline as it shows.
-pub fn points_shown(arm: &Armature, elements: &[Arc<Element>]) -> Vec<Vec2> {
-    let Some(skin) = &arm.skin else { return Vec::new() };
+/// The points of `skin`'s shape in `elements` (evaluated: posed), in point order, in the
+/// layer's space: the anchors of its outline as it shows.
+pub fn points_shown(skin: &Skin, elements: &[Arc<Element>]) -> Vec<Vec2> {
     elements
         .iter()
         .find(|e| e.id == skin.shape)
@@ -304,29 +311,24 @@ pub fn points_shown(arm: &Armature, elements: &[Arc<Element>]) -> Vec<Vec2> {
         .unwrap_or_default()
 }
 
-/// Repairs a loaded skin against its armature: the rest outline within [`MAX_SKIN_POINTS`]
-/// anchors (else the skin goes), one binding per anchor, weights of bones that exist, positive
-/// and summing to 1; unbound automatic anchors are bound. Returns whether anything changed.
-pub fn sanitize(arm: &mut Armature) -> bool {
-    let Some(skin) = &arm.skin else { return false };
-    let n = anchors(&skin.rest).len();
-    if n > MAX_SKIN_POINTS || arm.bones.iter().any(|b| b.child == skin.shape) {
-        arm.skin = None;
-        return true;
-    }
-    let before = arm.skin.clone();
-    let ids: Vec<BoneId> = arm.bones.iter().map(|b| b.id).collect();
-    let segments = rest_segments(arm);
-    let Some(skin) = arm.skin.as_mut() else { return false };
-    let pts = anchors(&skin.rest);
-    skin.points.resize(n, Binding::default());
-    for (b, &p) in skin.points.iter_mut().zip(&pts) {
-        b.normalize(|id| ids.contains(&id));
-        if b.bones.is_empty() && !b.manual {
-            *b = auto_binding(&segments, p);
+/// Repairs the loaded skins against their armature's bones: one binding per anchor, weights of
+/// bones inside the skin's own shape, positive and summing to 1; unbound automatic anchors are
+/// bound. ([`Armature::sanitize`] has already dropped skins that are too big or have no bones.)
+pub(crate) fn sanitize(arm: &mut Armature) {
+    for i in 0..arm.skins.len() {
+        let Some(shape) = arm.skins.get(i).map(|k| k.shape) else { continue };
+        let segments = rest_segments(arm, shape);
+        let ids: Vec<BoneId> = arm.bones_in(shape).map(|b| b.id).collect();
+        let Some(skin) = arm.skins.get_mut(i) else { continue };
+        let pts = anchors(&skin.rest);
+        skin.points.resize(pts.len(), Binding::default());
+        for (b, &p) in skin.points.iter_mut().zip(&pts) {
+            b.normalize(|id| ids.contains(&id));
+            if b.bones.is_empty() && !b.manual {
+                *b = auto_binding(&segments, p);
+            }
         }
     }
-    arm.skin != before
 }
 
 #[cfg(test)]

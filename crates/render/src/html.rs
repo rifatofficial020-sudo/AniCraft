@@ -102,6 +102,9 @@ pub struct HtmlExport {
 const PLUGIN_SCRIPTS: &str = "plug-in frame scripts (not exported; they need the plug-in host)";
 const KEPT_SCRIPTS: &str = "kept frame scripts outside the ActionScript subset (not run; kept in the document only)";
 const NINE_SLICE: &str = "9-slice scaling (scaled as a whole)";
+/// An input field is a real form element over the canvas (ADR 0066): what is typed is the
+/// browser's to draw, so the filters reach the field's box, border and authored text only.
+const INPUT_FILTERS: &str = "filters on input text (typed text is drawn by the browser, without them)";
 const OUTSIDE_CALLS: &str = "script calls that reach outside the movie (ignored)";
 const WARPED_BITMAPS: &str = "warped bitmaps (the image shows unbent inside its bent outline; warped shapes come across)";
 const FIELD_FONTS: &str = "text fields (their authored text keeps its outlines; text a script or the viewer changes is drawn with the browser's fonts)";
@@ -159,6 +162,16 @@ fn exact_color(c: Rgba) -> Value {
 /// `[r, g, b, a]`, ramps as `[offset, r, g, b, a]` stops, Adjust Color as its 4 × 5 matrix.
 /// The angle comes as the renderer's own `[cos, sin]` (`u`), so the page multiplies the same
 /// numbers and its whole-pixel offsets round as the renderer's do, at halves too.
+/// An item's filters, on a symbol instance or on text (ADR 0099): `fx` the list, `fm` how far
+/// they reach together (stage pixels); filters switched off are left out (ADR 0091).
+fn filters_json(filters: &[anicraft_doc::FilterEntry], item: &mut Map<String, Value>) {
+    let on = anicraft_doc::active_filters(filters);
+    if !on.is_empty() {
+        item.insert("fx".into(), Value::Array(on.iter().map(filter_json).collect()));
+        item.insert("fm".into(), exact(on.iter().map(anicraft_doc::Filter::margin).sum::<f32>()));
+    }
+}
+
 fn filter_json(f: &anicraft_doc::Filter) -> Value {
     use anicraft_doc::{Filter, FilterSide, GradientStop};
     let unit = |angle: f32| {
@@ -563,6 +576,11 @@ impl<'a> Bake<'a> {
         if f.max_chars > 0 {
             o["mx"] = json!(f.max_chars.min(MAX_FIELD_CHARS as u32));
         }
+        // Authored text in several colours: its pieces, each in its colour (ADR 0085).
+        if !t.fills.is_empty() {
+            let pieces: Vec<Value> = t.fill_paths().iter().map(|(c, _, p)| json!([self.path(p), self.paint(&Paint::Solid(*c))])).collect();
+            o["pp"] = json!(pieces);
+        }
         if f.background {
             o["bg"] = json!(self.paint(&Paint::Solid(f.background_color)));
         }
@@ -585,6 +603,10 @@ impl<'a> Bake<'a> {
         }
         if let Some(c) = effect(&el.color.transform()) {
             item.insert("c".into(), c);
+        }
+        filters_json(&t.filters, &mut item);
+        if f.kind == anicraft_doc::TextKind::Input && anicraft_doc::any_active_filter(&t.filters) {
+            self.notes.entry(INPUT_FILTERS).or_default().insert(el.id.0);
         }
         Value::Object(item)
     }
@@ -631,12 +653,29 @@ impl<'a> Bake<'a> {
                     let item = self.field(el, t, f);
                     out.push(item);
                 }
+                // One shape per colour piece (ADR 0085); with filters, one item of pieces, so
+                // they draw in one filtered group as `evaluate` draws them (ADR 0099).
+                None if anicraft_doc::any_active_filter(&t.filters) => {
+                    let pieces = t.fill_paths();
+                    let fill = Paint::Solid(pieces.first().map_or(t.color, |p| p.0));
+                    let mut item = self.shape(&t.outline, &el.transform, &el.color.transform(), Some(&fill), None, FillRule::NonZero);
+                    if let Some(o) = item.as_object_mut() {
+                        if pieces.len() > 1 {
+                            let pp: Vec<Value> = pieces.iter().map(|(c, _, p)| json!([self.path(p), self.paint(&Paint::Solid(*c))])).collect();
+                            o.insert("pp".into(), Value::Array(pp));
+                        }
+                        filters_json(&t.filters, o);
+                    }
+                    out.push(item);
+                }
                 None => {
-                    let fill = Paint::Solid(t.color);
-                    out.push(self.shape(&t.outline, &el.transform, &el.color.transform(), Some(&fill), None, FillRule::NonZero));
+                    for (color, _, path) in t.fill_paths() {
+                        let fill = Paint::Solid(color);
+                        out.push(self.shape(&path, &el.transform, &el.color.transform(), Some(&fill), None, FillRule::NonZero));
+                    }
                 }
             },
-            ElementKind::Symbol { symbol, loop_mode, first_frame, blend, filters, events } => {
+            ElementKind::Symbol { symbol, loop_mode, first_frame, blend, filters, events, .. } => {
                 let (Some(&y), Some(sym)) = (self.symbols.get(symbol), self.doc.symbol(*symbol)) else { return };
                 let len = sym.timeline.frame_count();
                 // The page's player places symbols itself and doesn't slice them yet (ADR 0055).
@@ -677,11 +716,7 @@ impl<'a> Bake<'a> {
                 // Filters run in the page as the renderer runs them (ADR 0072): `fx` the list,
                 // `fm` how far they reach together (stage pixels).
                 // Filters switched off are left out, as the renderer leaves them (ADR 0091).
-                let on = anicraft_doc::active_filters(filters);
-                if !on.is_empty() {
-                    o.insert("fx".into(), Value::Array(on.iter().map(filter_json).collect()));
-                    o.insert("fm".into(), exact(on.iter().map(anicraft_doc::Filter::margin).sum::<f32>()));
-                }
+                filters_json(filters, &mut o);
                 if !events.is_empty() {
                     o.insert("ev".into(), Value::Array(events.iter().map(|h| json!([h.event.key(), actions(&h.actions)])).collect()));
                 }
@@ -711,7 +746,8 @@ impl<'a> Bake<'a> {
     /// One timeline: its length `n`, frames as runs `f: [[content, count]…]`, mask layer count
     /// `nm`, labels `lb`, and per frame the scripts `a` and sounds `snd` of keyframes starting
     /// there (top layer first). A scene's frames seen through its camera (ADR 0027) carry the
-    /// camera's tint (`cc`) and each layer its view (`v`: the camera and the layer's depth).
+    /// camera's tint (`cc`) and each layer its view (`v`: the camera and the layer's depth). A
+    /// layer that follows a parent layer (ADR 0113) carries its space that frame (`r`).
     /// `decls`: the declarations its frame scripts share (ADR 0052), for timelines that
     /// run scripts; their functions go out as `fn` and their variables' types as `vt`.
     fn timeline(&mut self, tl: &Timeline, scene: bool, decls: Option<&Decls>) -> Value {
@@ -725,6 +761,8 @@ impl<'a> Bake<'a> {
         let mut sounds = Map::new();
         for f in 0..n {
             let camera = if scene { tl.camera_at(f, &stage) } else { None };
+            // Each layer's space this frame (ADR 0113): layers that follow a parent layer.
+            let rig = tl.has_rig().then(|| tl.rig_spaces(f, stage.fps));
             let mut layers = Vec::new();
             // Drawn deepest first, ties in timeline order, as the evaluator does (ADR 0082).
             let order = if scene { tl.draw_order(f) } else { (0..tl.layers.len()).rev().collect() };
@@ -739,9 +777,19 @@ impl<'a> Bake<'a> {
                         entry.insert("v".into(), v);
                     }
                 }
+                // Where its parent layer's object puts it this frame (`r`, ADR 0113).
+                if let Some(r) = rig.as_ref().and_then(|r| r.get(index)).and_then(matrix) {
+                    entry.insert("r".into(), r);
+                }
                 // The layer's volume, for the sounds inside the symbols on it.
                 if layer.sound_gain() != 1.0 {
                     entry.insert("sg".into(), num(layer.sound_gain(), 10_000.0));
+                }
+                // The layer's opacity (its own times its folders'; ADR 0111): the page fades
+                // the layer as one group. Mask artwork ignores it.
+                let fade = tl.layer_opacity(index);
+                if fade < 1.0 - 1e-4 && layer.kind != LayerKind::Mask {
+                    entry.insert("o".into(), num(fade, 10_000.0));
                 }
                 if layer.kind == LayerKind::Mask {
                     entry.insert("mk".into(), json!(slots.get(&layer.id.0).copied().unwrap_or(0)));
@@ -760,12 +808,16 @@ impl<'a> Bake<'a> {
                 }
                 let walk = layer.parent.and_then(|p| tl.layer(p)).filter(|g| g.kind == LayerKind::Guide).and_then(|g| guide_walk(g, f));
                 let mut items = Vec::new();
+                let mut any = false;
                 if let Some((start, els)) = evaluate_shown(layer, f, walk.as_ref(), self.doc.stage.fps) {
+                    any = !els.is_empty();
                     for el in els.iter() {
                         self.element(el, layer, f, start, &mut items);
                     }
                 }
-                if items.is_empty() && layer.kind != LayerKind::Mask {
+                // (A faded layer with elements stays, drawing or not: it is a group in the
+                // evaluator's list, and the page's groups are numbered the same.)
+                if items.is_empty() && layer.kind != LayerKind::Mask && !(any && entry.contains_key("o")) {
                     continue;
                 }
                 entry.insert("e".into(), Value::Array(items));
@@ -982,19 +1034,13 @@ pub fn movie(doc: &Document, opts: &HtmlOptions) -> Movie {
 
 /// Text for HTML content and attributes.
 fn escape_html(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            c if c.is_control() => {}
-            c => out.push(c),
-        }
+    // Exported page labels discard controls; this policy is distinct from guide text.
+    if s.chars().any(char::is_control) {
+        let clean: String = s.chars().filter(|c| !c.is_control()).collect();
+        craft_html::escape(&clean)
+    } else {
+        craft_html::escape(s)
     }
-    out
 }
 
 /// The movie as one web page: the data, the player and the page code inline, images and

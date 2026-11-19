@@ -4,7 +4,6 @@ use super::*;
 use crate::armature::{Armature, Bone, Pose};
 use crate::skin::{deform, rebind, rest_segments};
 use crate::ElementId;
-use anicraft_geom::Affine;
 
 const SHAPE: ElementId = ElementId(10);
 const B1: BoneId = BoneId(20);
@@ -23,16 +22,16 @@ fn rig() -> Armature {
     }
     p.close();
     let bones = vec![
-        Bone::new(B1, SHAPE, ElementId(30), Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0), Affine::IDENTITY),
-        Bone::new(B2, ElementId(30), ElementId(31), Vec2::new(100.0, 0.0), Vec2::new(200.0, 0.0), Affine::IDENTITY),
+        Bone::in_shape(B1, SHAPE, SHAPE, ElementId(30), Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0)),
+        Bone::in_shape(B2, SHAPE, ElementId(30), ElementId(31), Vec2::new(100.0, 0.0), Vec2::new(200.0, 0.0)),
     ];
-    let mut arm = Armature { bones, skin: Some(Skin::new(SHAPE, Arc::new(p))), ..Default::default() };
+    let mut arm = Armature { bones, skins: vec![Skin::new(SHAPE, Arc::new(p))], ..Default::default() };
     rebind(&mut arm);
     arm
 }
 
 fn skin(arm: &Armature) -> &Skin {
-    arm.skin.as_ref().expect("a skin")
+    arm.skins.first().expect("a skin")
 }
 
 fn sums_to_one(b: &Binding) -> bool {
@@ -40,9 +39,9 @@ fn sums_to_one(b: &Binding) -> bool {
 }
 
 fn paint_on(arm: &mut Armature, bone: BoneId, dabs: &[Vec2], radius: f32, strength: f32, brush: Brush) -> usize {
-    let segments = rest_segments(arm);
+    let segments = rest_segments(arm, SHAPE);
     let shown = anchors(&skin(arm).rest);
-    let k = arm.skin.as_mut().expect("a skin");
+    let k = arm.skins.first_mut().expect("a skin");
     paint(k, &segments, &shown, bone, dabs, Dab { brush, radius, strength })
 }
 
@@ -158,7 +157,7 @@ fn moving_points_keeps_every_binding() {
             q.y -= 15.0;
         }
     });
-    let out = reshape(skin(&arm), &p, &rest_segments(&arm));
+    let out = reshape(skin(&arm), &p, &rest_segments(&arm, SHAPE));
     assert_eq!(out, skin(&arm).points);
 }
 
@@ -166,7 +165,7 @@ fn moving_points_keeps_every_binding() {
 fn an_inserted_point_blends_its_neighbours() {
     let mut arm = rig();
     // Make the neighbours different by hand: anchor 3 (x = 75) follows B1, anchor 4 (x = 100) B2.
-    if let Some(k) = arm.skin.as_mut() {
+    if let Some(k) = arm.skins.first_mut() {
         k.points[3] = Binding { bones: vec![Influence(B1, 1.0)], manual: true };
         k.points[4] = Binding { bones: vec![Influence(B2, 1.0)], manual: true };
     }
@@ -174,7 +173,7 @@ fn an_inserted_point_blends_its_neighbours() {
     let p = edited(&arm, |p| {
         p.cmds.insert(4, PathCmd::LineTo(Vec2::new(81.25, -10.0)));
     });
-    let out = reshape(skin(&arm), &p, &rest_segments(&arm));
+    let out = reshape(skin(&arm), &p, &rest_segments(&arm, SHAPE));
     assert_eq!(out.len(), anchors(&p).len());
     let b = &out[4];
     assert!((b.weight(B1) - 0.75).abs() < 1e-5 && (b.weight(B2) - 0.25).abs() < 1e-5, "{b:?}");
@@ -187,13 +186,13 @@ fn an_inserted_point_blends_its_neighbours() {
 #[test]
 fn a_deleted_point_drops_its_binding() {
     let mut arm = rig();
-    if let Some(k) = arm.skin.as_mut() {
+    if let Some(k) = arm.skins.first_mut() {
         k.points[5] = Binding { bones: vec![Influence(B1, 0.6), Influence(B2, 0.4)], manual: true };
     }
     let p = edited(&arm, |p| {
         p.cmds.remove(4);
     });
-    let out = reshape(skin(&arm), &p, &rest_segments(&arm));
+    let out = reshape(skin(&arm), &p, &rest_segments(&arm, SHAPE));
     let mut want = skin(&arm).points.clone();
     want.remove(4);
     assert_eq!(out, want);
@@ -208,7 +207,7 @@ fn a_new_subpath_is_bound_automatically_and_closing_points_copy_the_start() {
         p.line_to(Vec2::new(160.0, 5.0));
         p.close();
     });
-    let segments = rest_segments(&arm);
+    let segments = rest_segments(&arm, SHAPE);
     let out = reshape(skin(&arm), &p, &segments);
     let n = skin(&arm).points.len();
     assert_eq!(out.len(), n + 3);
@@ -232,13 +231,13 @@ fn the_rest_pose_is_the_reshaped_outline_bit_for_bit() {
         }
     }));
     let mut arm2 = arm.clone();
-    arm2.skin = Some(reshaped(skin(&arm), p.clone(), &rest_segments(&arm)));
-    let rest = deform(&arm2, &Pose::default()).expect("an outline");
+    arm2.skins = vec![reshaped(skin(&arm), p.clone(), &rest_segments(&arm, SHAPE))];
+    let rest = deform(&arm2, &arm2.skins[0], &Pose::default());
     assert!(Arc::ptr_eq(&rest, &p));
     // Bent, the new point moves with the bones like its neighbours: between them.
     let mut pose = Pose::default();
     pose.set(B2, std::f32::consts::FRAC_PI_2);
-    let bent = anchors(&deform(&arm2, &pose).expect("an outline"));
+    let bent = anchors(&deform(&arm2, &arm2.skins[0], &pose));
     assert_eq!(bent.len(), anchors(&p).len());
     assert!(bent.iter().all(|q| q.x.is_finite() && q.y.is_finite()));
 }
@@ -251,8 +250,8 @@ fn painting_a_large_shape_is_fast() {
     for i in 1..20_000 {
         p.line_to(Vec2::new(i as f32 * 0.1, (i % 7) as f32));
     }
-    let bones = vec![Bone::new(B1, SHAPE, ElementId(30), Vec2::new(0.0, 0.0), Vec2::new(1000.0, 0.0), Affine::IDENTITY), Bone::new(B2, ElementId(30), ElementId(31), Vec2::new(1000.0, 0.0), Vec2::new(2000.0, 0.0), Affine::IDENTITY)];
-    let mut arm = Armature { bones, skin: Some(Skin::new(SHAPE, Arc::new(p))), ..Default::default() };
+    let bones = vec![Bone::in_shape(B1, SHAPE, SHAPE, ElementId(30), Vec2::new(0.0, 0.0), Vec2::new(1000.0, 0.0)), Bone::in_shape(B2, SHAPE, ElementId(30), ElementId(31), Vec2::new(1000.0, 0.0), Vec2::new(2000.0, 0.0))];
+    let mut arm = Armature { bones, skins: vec![Skin::new(SHAPE, Arc::new(p))], ..Default::default() };
     rebind(&mut arm);
     let dabs: Vec<Vec2> = (0..32).map(|i| Vec2::new(900.0 + 10.0 * i as f32, 3.0)).collect();
     let t = std::time::Instant::now();

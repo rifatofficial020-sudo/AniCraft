@@ -81,7 +81,7 @@ fn nested_symbols_compose_transforms_and_cycles_terminate() {
             name: String::new(),
             transform: Affine::translate(1.0, 0.0),
             color: ColorEffect::default(),
-            kind: ElementKind::Symbol { symbol: sid, loop_mode: Default::default(), first_frame: 0, blend: Default::default(), filters: Vec::new(), events: Vec::new() },
+            kind: ElementKind::Symbol { symbol: sid, loop_mode: Default::default(), first_frame: 0, blend: Default::default(), filters: Vec::new(), events: Vec::new(), pivot: None },
         },
     );
     tl.layers.push(Arc::new(layer));
@@ -94,7 +94,7 @@ fn nested_symbols_compose_transforms_and_cycles_terminate() {
             name: String::new(),
             transform: Affine::translate(100.0, 0.0),
             color: ColorEffect::Alpha(0.5),
-            kind: ElementKind::Symbol { symbol: sid, loop_mode: Default::default(), first_frame: 0, blend: Default::default(), filters: Vec::new(), events: Vec::new() },
+            kind: ElementKind::Symbol { symbol: sid, loop_mode: Default::default(), first_frame: 0, blend: Default::default(), filters: Vec::new(), events: Vec::new(), pivot: None },
         },
     );
     let dl = evaluate(&d, 0);
@@ -146,7 +146,7 @@ fn masks_inside_symbols_nest_in_the_instance_clip() {
         name: String::new(),
         transform: Affine::IDENTITY,
         color: ColorEffect::default(),
-        kind: ElementKind::Symbol { symbol: sid, loop_mode: Default::default(), first_frame: 0, blend: Default::default(), filters: Vec::new(), events: Vec::new() },
+        kind: ElementKind::Symbol { symbol: sid, loop_mode: Default::default(), first_frame: 0, blend: Default::default(), filters: Vec::new(), events: Vec::new(), pivot: None },
     };
     push(Arc::make_mut(&mut d.timeline_mut(0).layers[1]), 0, inst);
     let dl = evaluate(&d, 0);
@@ -323,7 +323,7 @@ fn movie_clips_play_their_own_timeline_graphics_keep_step_buttons_hold_up() {
         name: String::new(),
         transform: Affine::translate(x, 0.0),
         color: ColorEffect::default(),
-        kind: ElementKind::Symbol { symbol: sid, loop_mode: crate::LoopMode::Loop, first_frame: 0, blend: Default::default(), filters: Vec::new(), events: Vec::new() },
+        kind: ElementKind::Symbol { symbol: sid, loop_mode: crate::LoopMode::Loop, first_frame: 0, blend: Default::default(), filters: Vec::new(), events: Vec::new(), pivot: None },
     };
     let (mut k0, mut k1) = (Keyframe::new(0, 5), Keyframe::new(5, 7));
     k0.elements.push(Arc::new(inst(0.0)));
@@ -561,7 +561,7 @@ fn instance_filters_tween_when_they_pair_up() {
     let mut d = Document::default();
     let sid = SymbolId(90);
     d.library.push(Arc::new(Symbol { id: sid, name: "Clip".into(), kind: SymbolKind::MovieClip, linkage: None, scale_grid_kept: None, scale_grid: None, timeline: Timeline { layers: vec![Arc::new(Layer::new(LayerId(91), "x"))] } }));
-    let inst = |filters: Vec<Filter>| Element { id: ElementId(92), name: String::new(), transform: Affine::IDENTITY, color: ColorEffect::default(), kind: ElementKind::Symbol { symbol: sid, loop_mode: Default::default(), first_frame: 0, blend: Default::default(), filters: filters.into_iter().map(Into::into).collect(), events: Vec::new() } };
+    let inst = |filters: Vec<Filter>| Element { id: ElementId(92), name: String::new(), transform: Affine::IDENTITY, color: ColorEffect::default(), kind: ElementKind::Symbol { symbol: sid, loop_mode: Default::default(), first_frame: 0, blend: Default::default(), filters: filters.into_iter().map(Into::into).collect(), events: Vec::new(), pivot: None } };
     let blur = |b: f32| Filter::Blur { blur_x: b, blur_y: b, quality: 1 };
     let mut tw = Tween::new(Easing::Linear, TweenKind::Classic);
     tw.set_ease(crate::EaseGroup::Filters, Some(Easing::QuadIn));
@@ -576,12 +576,259 @@ fn instance_filters_tween_when_they_pair_up() {
         _ => Vec::new(),
     };
     assert_eq!(filters(5)[0], blur(40.0 * 0.25).into(), "eased by the filters group's ease");
-    // Lists that don't pair up hold the first keyframe's.
     let e = |f: Filter| crate::FilterEntry::from(f);
-    assert_eq!(crate::filter::lerp_filters(&[e(blur(1.0))], &[e(Filter::new("glow").unwrap())], 0.5), None);
-    assert_eq!(crate::filter::lerp_filters(&[e(blur(1.0))], &[e(blur(1.0)), e(blur(2.0))], 0.5), None);
     // A switched-off filter still pairs up (and stays off, as the first keyframe has it).
     let off = crate::FilterEntry { filter: blur(0.0), enabled: false };
     let got = crate::filter::lerp_filters(std::slice::from_ref(&off), &[e(blur(10.0))], 0.5).unwrap();
     assert_eq!(got, vec![crate::FilterEntry { filter: blur(5.0), enabled: false }]);
+    assert_eq!(crate::filter::lerp_filters(&[e(blur(1.0))], &[e(blur(1.0))], 0.5), None, "equal lists hold as they are");
+}
+
+/// ADR 0099: lists that differ pair as Animate pairs them. Filters of the same kind in the same
+/// order travel to each other; one without a partner travels to, or from, itself doing nothing,
+/// so it fades out or in. The first keyframe itself shows exactly its own list.
+#[test]
+fn mismatched_filter_lists_pair_and_the_rest_fade() {
+    use crate::Filter;
+    use crate::filter::{lerp_filters, pairing};
+    let e = |f: Filter| crate::FilterEntry::from(f);
+    let blur = |b: f32| Filter::Blur { blur_x: b, blur_y: b, quality: 1 };
+    let glow = |s: f32, knockout: bool| Filter::Glow { blur_x: 8.0, blur_y: 8.0, strength: s, quality: 2, color: Rgba::hex(0x00ff00), inner: false, knockout };
+    // A glow only the second keyframe has fades in from nothing, with its own colour and
+    // switches; the blur both have travels as before.
+    let (a, b) = (vec![e(blur(2.0))], vec![e(blur(6.0)), e(glow(2.0, true))]);
+    assert_eq!(pairing(&a, &b), Some(vec![(Some(0), Some(0)), (None, Some(1))]));
+    let mid = lerp_filters(&a, &b, 0.5).unwrap();
+    assert_eq!(mid[0], e(blur(4.0)));
+    assert_eq!(mid[1], e(Filter::Glow { blur_x: 4.0, blur_y: 4.0, strength: 1.0, quality: 2, color: Rgba::hex(0x00ff00), inner: false, knockout: true }));
+    assert_eq!(lerp_filters(&a, &b, 0.0), None, "on the first keyframe its own list shows, exactly");
+    assert_eq!(lerp_filters(&a, &b, 1.0).unwrap(), b);
+    // One only the first keyframe has fades out.
+    let out = lerp_filters(&b, &a, 0.75).unwrap();
+    assert_eq!(out.len(), 2);
+    assert!(matches!(out[1].filter, Filter::Glow { strength, blur_x, .. } if (strength - 0.5).abs() < 1e-6 && (blur_x - 2.0).abs() < 1e-6), "{out:?}");
+    // Another kind in the same place: the old one fades out as the new one fades in.
+    let swap = lerp_filters(&[e(blur(8.0))], &[e(glow(1.0, false))], 0.25).unwrap();
+    assert_eq!(swap.len(), 2);
+    assert_eq!(swap[0], e(blur(6.0)));
+    assert!(matches!(swap[1].filter, Filter::Glow { strength, .. } if (strength - 0.25).abs() < 1e-6));
+    // Reordered lists keep the longest run of kinds they share paired; the rest fade.
+    let (x, y) = (vec![e(blur(1.0)), e(glow(1.0, false)), e(Filter::new("bevel").unwrap())], vec![e(glow(3.0, false)), e(Filter::new("bevel").unwrap()), e(blur(9.0))]);
+    assert_eq!(pairing(&x, &y), Some(vec![(Some(0), None), (Some(1), Some(0)), (Some(2), Some(1)), (None, Some(2))]));
+    // A filter doing nothing keeps its look for when it fades in: colours, angle, switches.
+    let Filter::DropShadow { blur_x, strength, distance, angle, color, hide_object, .. } = (Filter::DropShadow { blur_x: 9.0, blur_y: 9.0, strength: 2.0, quality: 3, angle: 120.0, distance: 7.0, color: Rgba::hex(0x112233), inner: false, knockout: false, hide_object: true }).neutral() else { panic!() };
+    assert_eq!((blur_x, strength, distance, angle, color, hide_object), (0.0, 0.0, 0.0, 120.0, Rgba::hex(0x112233), true));
+    assert_eq!(Filter::AdjustColor { brightness: 40.0, contrast: -20.0, saturation: 10.0, hue: 90.0 }.neutral(), Filter::new("adjust_color").unwrap());
+    // Hostile lengths are refused, not walked.
+    let long: Vec<crate::FilterEntry> = (0..200).map(|_| e(blur(1.0))).collect();
+    assert_eq!(pairing(&long, &a), None);
+    assert_eq!(lerp_filters(&long, &a, 0.5), None);
+    assert_eq!(pairing(&[], &[]), Some(Vec::new()));
+}
+
+fn text_el(id: u64, filters: Vec<crate::FilterEntry>, field: Option<crate::TextField>) -> Element {
+    let block = crate::TextBlock {
+        text: "Hi".into(),
+        font: "Test".into(),
+        size: 20.0,
+        bold: false,
+        italic: false,
+        color: Rgba::BLACK,
+        align: Default::default(),
+        letter_spacing: 0.0,
+        line_spacing: 0.0,
+        width: None,
+        outline: Arc::new(Path::rect(2.0, 2.0, 30.0, 16.0)),
+        box_width: 40.0,
+        box_height: 24.0,
+        field,
+        on_path: None,
+        filters,
+        ..crate::TextBlock::default()
+    };
+    Element { id: ElementId(id), name: String::new(), transform: Affine::translate(50.0, 40.0), color: ColorEffect::Alpha(0.5), kind: ElementKind::Text(Arc::new(block)) }
+}
+
+/// ADR 0099: text with filters draws in a group of its own that the filters run on, as a movie
+/// clip does: static text and fields alike, their box and border included. Switched-off
+/// filters draw nothing, and files from before open without any.
+#[test]
+fn text_with_filters_draws_in_a_filtered_group() {
+    use crate::{Filter, FilterEntry, TextField, TextKind};
+    let shadow = FilterEntry::from(Filter::new("drop_shadow").unwrap());
+    let off = FilterEntry { filter: Filter::new("blur").unwrap(), enabled: false };
+    let field = TextField { border: true, background: true, ..TextField::new(TextKind::Dynamic) };
+    for field in [None, Some(field)] {
+        let mut d = Document::default();
+        push(layer0(&mut d), 0, text_el(1, vec![off.clone(), shadow.clone()], field.clone()));
+        let dl = evaluate(&d, 0);
+        assert_eq!(dl.groups.len(), 1, "one group for the text");
+        let g = &dl.groups[0];
+        assert_eq!(&*g.filters, std::slice::from_ref(&shadow.filter), "only the filter that is on");
+        assert_eq!(g.alpha, 0.5, "the text's alpha fades the group, after the filters");
+        assert!(!dl.items.is_empty() && dl.items.iter().all(|i| i.group == Some(0)), "every item of the text is in it");
+        assert!(dl.items.iter().all(|i| i.color.mul[3] == 1.0), "and none fades on its own");
+        // Without filters that draw, the text is as it was before: no group.
+        let mut plain = Document::default();
+        push(layer0(&mut plain), 0, text_el(1, vec![off.clone()], field));
+        let dl = evaluate(&plain, 0);
+        assert!(dl.groups.is_empty() && dl.items.iter().all(|i| i.group.is_none()));
+    }
+    // The file: filters ride with the block, left out when there are none, and old files open.
+    let with = text_el(1, vec![shadow.clone(), off], None);
+    let json = serde_json::to_value(&with).unwrap();
+    assert_eq!(json["kind"]["Text"]["filters"][0]["type"], "drop_shadow");
+    assert_eq!(json["kind"]["Text"]["filters"][1]["enabled"], false);
+    assert_eq!(serde_json::from_value::<Element>(json).unwrap(), with);
+    let mut old = serde_json::to_value(text_el(1, Vec::new(), None)).unwrap();
+    assert!(old["kind"]["Text"].get("filters").is_none(), "no key without filters: files stay as they were");
+    old["kind"]["Text"]["text"] = serde_json::json!("Old");
+    assert!(serde_json::from_value::<Element>(old).unwrap().kind.filters().is_some_and(<[FilterEntry]>::is_empty));
+    // One list for what takes filters; nothing else has one.
+    assert!(shape_el(9, 0.0).kind.filters().is_none() && ElementKind::Camera.filters().is_none());
+}
+
+/// ADR 0099: a classic tween between two keyframes of a text tweens its filters as it does a
+/// movie clip's.
+#[test]
+fn text_filters_tween_between_keyframes() {
+    use crate::{Filter, FilterEntry};
+    let glow = |blur: f32, color: u32| FilterEntry::from(Filter::Glow { blur_x: blur, blur_y: blur, strength: 1.0, quality: 1, color: Rgba::hex(color), inner: false, knockout: false });
+    let mut d = Document::default();
+    let mut k0 = Keyframe::new(0, 10);
+    k0.elements.push(Arc::new(text_el(1, vec![glow(0.0, 0xff0000)], None)));
+    k0.tween = Some(Tween::new(Easing::Linear, TweenKind::Classic));
+    let mut k1 = Keyframe::new(10, 1);
+    k1.elements.push(Arc::new(text_el(1, vec![glow(20.0, 0x0000ff)], None)));
+    layer0(&mut d).keyframes = vec![Arc::new(k0), Arc::new(k1)];
+    let at5 = crate::evaluate_layer_elements(&d.timeline(0).layers[0], 5).unwrap().1;
+    let Some([FilterEntry { filter: Filter::Glow { blur_x, color, .. }, .. }]) = at5[0].kind.filters() else { panic!("{:?}", at5[0].kind) };
+    assert_eq!(*blur_x, 10.0);
+    assert_eq!(*color, Rgba::new(0.5, 0.0, 0.5, 1.0), "colours travel channel by channel, as a tint does");
+    // And the renderers get the tweened filter.
+    assert_eq!(&*evaluate(&d, 5).groups[0].filters, &[Filter::Glow { blur_x: 10.0, blur_y: 10.0, strength: 1.0, quality: 1, color: Rgba::new(0.5, 0.0, 0.5, 1.0), inner: false, knockout: false }]);
+}
+
+/// Raw stroke runs with the same stroke but different colour effects are not joined, so the
+/// run that the tween shrinks away keeps its own colour effect.
+#[test]
+fn raw_stroke_runs_with_different_colour_effects_keep_them_in_a_shape_tween() {
+    let v = anicraft_geom::Vec2::new;
+    let run = |id, y: f32, color| {
+        let mut p = Path::new();
+        p.move_to(v(0.0, y)).line_to(v(50.0, y));
+        let mut s = Shape::filled(p, Paint::Solid(Rgba::BLACK)).with_stroke(Rgba::BLACK, 2.0);
+        s.fill = None;
+        s.merge = true;
+        Arc::new(Element { id: ElementId(id), name: String::new(), transform: Affine::IDENTITY, color, kind: ElementKind::Shape(s) })
+    };
+    let mut d = Document::default();
+    let mut k0 = Keyframe::new(0, 10);
+    k0.elements = vec![run(1, 0.0, ColorEffect::None), run(2, 100.0, ColorEffect::Alpha(0.5))];
+    k0.tween = Some(Tween { easing: Easing::Linear, kind: TweenKind::Shape, ..Default::default() });
+    let mut k1 = Keyframe::new(10, 1);
+    k1.elements = vec![run(1, 0.0, ColorEffect::None)];
+    layer0(&mut d).keyframes = vec![Arc::new(k0), Arc::new(k1)];
+    let list = evaluate(&d, 1);
+    let strokes: Vec<_> = list.items.iter().filter(|i| i.stroke.is_some()).collect();
+    assert_eq!(list.items.len(), 2);
+    assert_eq!(strokes.len(), 2);
+    // The run that the tween shrinks away (element 2) keeps its alpha; the first keeps none.
+    let by = |e: u64| strokes.iter().find(|i| i.element == ElementId(e)).unwrap();
+    assert_eq!(by(2).color, ColorEffect::Alpha(0.5).transform(), "the later run lost its alpha");
+    assert_eq!(by(1).color, ColorEffect::None.transform(), "the first run took the later run's colour");
+}
+
+/// A classic tween from scale `a` to scale `b` (with a turn and a skew at the end), eased.
+fn squash_doc(a: (f32, f32), b: (f32, f32), easing: Easing, keep_area: bool) -> Document {
+    let at = |s: (f32, f32), rot: f32, skew: f32, x: f32| {
+        let mut e = shape_el(10, 0.0);
+        e.transform = anicraft_geom::Decomposed { tx: x, ty: 5.0, sx: s.0, sy: s.1, rotation: rot, skew }.compose();
+        e
+    };
+    let mut d = Document::default();
+    let mut k0 = Keyframe::new(0, 12);
+    k0.elements.push(Arc::new(at(a, 0.0, 0.0, 0.0)));
+    k0.tween = Some(Tween { easing, keep_area, ..Default::default() });
+    let mut k1 = Keyframe::new(12, 1);
+    k1.elements.push(Arc::new(at(b, 0.6, 0.3, 80.0)));
+    layer0(&mut d).keyframes = vec![Arc::new(k0), Arc::new(k1)];
+    d
+}
+
+/// The area factor of a transform: its determinant.
+fn area(m: &Affine) -> f32 {
+    m.m[0] * m.m[3] - m.m[1] * m.m[2]
+}
+
+#[test]
+fn keep_area_holds_the_area_on_every_frame_of_a_classic_tween() {
+    // Issue #408: 100 x 100 % to 200 x 50 %. Straight lines bulge to 112.5 % halfway.
+    let plain = squash_doc((1.0, 1.0), (2.0, 0.5), Easing::Linear, false);
+    assert!((area(&evaluate(&plain, 6).items[0].transform) - 1.125).abs() < 1e-4);
+    for easing in [Easing::Linear, Easing::QuadIn, Easing::BackOut, Easing::ElasticOut, Easing::Classic(-60.0)] {
+        let d = squash_doc((1.0, 1.0), (2.0, 0.5), easing.clone(), true);
+        for f in 0..=12 {
+            let a = area(&evaluate(&d, f).items[0].transform);
+            assert!((a - 1.0).abs() < 2e-5, "{easing:?} frame {f}: area {a}");
+        }
+    }
+    // Halfway is about 141 x 71 %; the turn, the skew and the move tween as before.
+    let d = squash_doc((1.0, 1.0), (2.0, 0.5), Easing::Linear, true);
+    let (mid, was) = (evaluate(&d, 6).items[0].transform.decompose(), evaluate(&plain, 6).items[0].transform.decompose());
+    assert!((mid.sx - std::f32::consts::SQRT_2).abs() < 1e-4 && (mid.sy - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-4, "{mid:?}");
+    assert!((mid.rotation - was.rotation).abs() < 1e-5 && (mid.skew - was.skew).abs() < 1e-5 && (mid.tx - was.tx).abs() < 1e-4);
+    // The keys themselves show exactly as they are.
+    assert_eq!(evaluate(&d, 0).items[0].transform, evaluate(&plain, 0).items[0].transform);
+    assert_eq!(evaluate(&d, 12).items[0].transform, evaluate(&plain, 12).items[0].transform);
+}
+
+#[test]
+fn keep_area_between_keys_of_different_areas_changes_it_smoothly_and_flips_fall_back() {
+    // 1 to 4 times the area: each frame multiplies it by the same factor.
+    let d = squash_doc((1.0, 1.0), (4.0, 1.0), Easing::Linear, true);
+    let a = |f| area(&evaluate(&d, f).items[0].transform);
+    for f in 0..12 {
+        assert!((a(f + 1) / a(f) - 4f32.powf(1.0 / 12.0)).abs() < 1e-4, "frame {f}");
+    }
+    // An axis that flips between the keys can't go geometrically: it tweens as before.
+    let (flip, plain) = (squash_doc((1.0, 1.0), (-1.0, 2.0), Easing::Linear, true), squash_doc((1.0, 1.0), (-1.0, 2.0), Easing::Linear, false));
+    for f in 0..=12 {
+        let (m, p) = (evaluate(&flip, f).items[0].transform, evaluate(&plain, f).items[0].transform);
+        assert!(m.is_finite());
+        let (dm, dp) = (m.decompose(), p.decompose());
+        // Whichever axis the decomposition gives the flip to, the other one went geometrically
+        // or the same; nothing blows up and the ends agree.
+        if f == 0 || f == 12 {
+            assert_eq!(m, p, "frame {f}");
+        }
+        assert!(dm.sx.is_finite() && dm.sy.is_finite() && dp.sx.is_finite());
+    }
+}
+
+#[test]
+fn keep_area_off_is_bit_exact_with_a_tween_that_never_had_it_and_files_stay_small() {
+    // Off (the default) takes the same code path as before: every frame identical, bit by bit.
+    for easing in [Easing::Linear, Easing::QuadInOut, Easing::BounceOut] {
+        let off = squash_doc((1.0, 1.5), (2.5, 0.25), easing.clone(), false);
+        let mut old = off.clone();
+        // A file from before Keep area has no such key: it reads as off.
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("keep_area"), "off isn't written");
+        old = serde_json::from_str(&json).unwrap();
+        for f in 0..=12 {
+            let (x, y) = (evaluate(&off, f).items[0].transform, evaluate(&old, f).items[0].transform);
+            assert_eq!(x.m.map(f32::to_bits), y.m.map(f32::to_bits), "{easing:?} frame {f}");
+            if (1..12).contains(&f) {
+                let k = &off.scenes[0].timeline.layers[0].keyframes;
+                let d = (k[0].elements[0].transform.decompose(), k[1].elements[0].transform.decompose());
+                let t = easing.apply(f as f32 / 12.0);
+                assert_eq!(x.m.map(f32::to_bits), d.0.lerp(&d.1, t).compose().m.map(f32::to_bits), "the straight lerp of before, frame {f}");
+            }
+        }
+    }
+    // On round-trips.
+    let on = squash_doc((1.0, 1.0), (2.0, 0.5), Easing::Linear, true);
+    let back: Document = serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
+    assert!(back.scenes[0].timeline.layers[0].keyframes[0].tween.as_ref().unwrap().keep_area);
 }

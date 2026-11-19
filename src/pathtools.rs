@@ -45,11 +45,31 @@ const PICK: f32 = 6.0;
 
 // ----- Pen ---------------------------------------------------------------------------------
 
+/// What the press that started the current Pen drag took hold of (ADR 0115).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum PenGrip {
+    /// A new knot: dragging pulls its mirrored handles (Alt: only the one ahead).
+    #[default]
+    New,
+    /// The last knot: a click takes its handle ahead away (the next segment leaves it as a
+    /// corner) or, when it has none, finishes the path; a drag pulls a new handle ahead alone.
+    Last { moved: bool },
+    /// The end of the path being continued: a drag pulls its handle ahead, a click does nothing.
+    Out,
+    /// Alt on the last knot: its handles are drawn again. `was` is the knot as it was, drawn
+    /// as a ghost until the button is let go.
+    Adjust { was: [Vec2; 3] },
+}
+
 /// Pen path under construction: knots as `[anchor, in, out]` in stage space.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PenPath {
     pub knots: Vec<[Vec2; 3]>,
     pub dragging: bool,
+    pub grip: PenGrip,
+    /// The open drawing object this path continues, and whether from its start (ADR 0115):
+    /// the first knot is that end, and finishing extends the object instead of adding one.
+    pub extends: Option<(ElementId, bool)>,
 }
 
 impl PenPath {
@@ -80,68 +100,360 @@ impl PenPath {
     }
 }
 
-/// Pointer handling for the Pen. Runs on raw press/release (not egui's drag threshold), so a
-/// quick click places a point exactly where it was pressed.
-pub fn pen_input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, xf: Xf) {
-    let (pressed, down, alt) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.modifiers.alt));
-    let Some(pos) = resp.interact_pointer_pos().or_else(|| resp.hover_pos()) else { return };
-    let p = xf.to_stage(pos);
-    // Alt-click on a path, with no path being drawn, adds a point to it: the motion path first
-    // (ADR 0038), then a selected shape's outline.
-    if pressed && resp.hovered() && alt && app.pen.as_ref().is_none_or(|pen| pen.knots.is_empty()) {
+/// The modifier keys the Pen reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PenMods {
+    /// Break the handle pair; on the last knot, draw its handles again; on a path, add a point.
+    pub alt: bool,
+    /// Keep the new segment, or the handle, on a multiple of 45°.
+    pub shift: bool,
+    /// Ctrl (⌘ on macOS): select the path under the pointer, to show its points.
+    pub command: bool,
+}
+
+/// What a Pen click here would do: the mark drawn by the pointer, as Animate's Pen cursors
+/// tell it (issue #319).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PenHover {
+    /// Place a point.
+    Place,
+    /// Close the path on its first point.
+    Close,
+    /// Finish the open path (the last point, which has no handle ahead).
+    Finish,
+    /// Take the handles away: the last point's handle ahead, or a smooth point's pair.
+    Corner,
+    /// Draw the last point's handles again (Alt).
+    Adjust,
+    /// Add a point on the path.
+    Add,
+    /// Delete the point.
+    Delete,
+    /// Continue the open path from this end.
+    Continue,
+}
+
+/// `p` moved onto the nearest multiple of 45° around `from` (Shift), at the distance the
+/// pointer is along that direction.
+pub fn constrain_45(from: Vec2, p: Vec2) -> Vec2 {
+    let d = p - from;
+    if !d.is_finite() || d.length() < 1e-6 {
+        return p;
+    }
+    let step = std::f32::consts::FRAC_PI_4;
+    let a = (d.y.atan2(d.x) / step).round() * step;
+    let dir = Vec2::new(a.cos(), a.sin());
+    from + dir * (d.x * dir.x + d.y * dir.y)
+}
+
+/// A point of a path that shows its points, under the Pen.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PenTarget {
+    /// An anchor of a selected drawing object: smooth (it has a handle), and the end of an
+    /// open path it is, if any (`Some(true)`: the start).
+    Anchor { id: ElementId, cmd: usize, smooth: bool, end: Option<bool> },
+    /// A shared anchor of the selected raw shapes.
+    RawAnchor { at: Vec2, smooth: bool },
+    /// The outline of a selected shape, drawing object or raw, between its points.
+    Segment,
+}
+
+/// Whether `path` is one open run of segments, the kind the Pen can continue.
+fn is_open(path: &Path) -> bool {
+    path.cmds.len() >= 2 && matches!(path.cmds.first(), Some(PathCmd::MoveTo(_))) && !path.cmds.iter().skip(1).any(|c| matches!(c, PathCmd::MoveTo(_) | PathCmd::Close))
+}
+
+/// What of the paths showing their points (the selected shapes on the active layer) is at
+/// screen point `at`.
+fn pen_target(app: &App, at: Pos2, xf: Xf) -> Option<PenTarget> {
+    let near = |q: Vec2| xf.to_screen(q).distance(at) <= PICK;
+    let sp = xf.to_stage(at);
+    let slop = PICK * xf.unit();
+    let shapes = selected_shapes(app);
+    for (id, path, m) in &shapes {
+        if let Some((cmd, q)) = path.editable_anchors().into_iter().find(|(_, q)| near(m.apply(*q))) {
+            let smooth = shown_handles(path, [cmd].into_iter()).iter().any(|&(c, slot, _)| path.point(c, slot).is_some_and(|h| h.distance(q) > 1e-4));
+            let end = if !is_open(path) {
+                None
+            } else if cmd == 0 {
+                Some(true)
+            } else if cmd + 1 == path.cmds.len() {
+                Some(false)
+            } else {
+                None
+            };
+            return Some(PenTarget::Anchor { id: *id, cmd, smooth, end });
+        }
+    }
+    let raw = raw_selected(app);
+    if !raw.is_empty() {
+        let pts = app.s.raw_points(&raw);
+        if let Some(q) = pts.anchors.iter().copied().filter(|q| near(*q)).min_by(|a, b| xf.to_screen(*a).distance(at).total_cmp(&xf.to_screen(*b).distance(at))) {
+            let smooth = pts.handles.iter().any(|h| h.anchor.distance(q) <= SNAP && h.at.distance(h.anchor) > SNAP);
+            return Some(PenTarget::RawAnchor { at: q, smooth });
+        }
+    }
+    if shapes.iter().any(|(_, path, m)| path.nearest_segment(sp, m).is_some_and(|(_, _, d)| d <= slop)) {
+        return Some(PenTarget::Segment);
+    }
+    let on_raw = app.s.visible_elements().iter().filter(|e| raw.contains(&e.id)).take(512).any(|e| match &e.kind {
+        ElementKind::Shape(sh) => sh.path.nearest_segment(sp, &e.transform).is_some_and(|(_, _, d)| d <= slop),
+        _ => false,
+    });
+    on_raw.then_some(PenTarget::Segment)
+}
+
+/// Where the path being continued ends on its far side (stage space), if it still exists.
+fn far_end(app: &App, pen: &PenPath) -> Option<Vec2> {
+    let (id, at_start) = pen.extends?;
+    let els = app.s.visible_elements();
+    let e = els.iter().find(|e| e.id == id)?;
+    let ElementKind::Shape(sh) = &e.kind else { return None };
+    let q = if at_start { sh.path.point(sh.path.cmds.len().checked_sub(1)?, ANCHOR) } else { sh.path.point(0, ANCHOR) }?;
+    Some(e.transform.apply(q))
+}
+
+/// What a click at screen point `at` would do (no button down).
+pub fn pen_hover(app: &App, at: Pos2, xf: Xf, mods: PenMods) -> PenHover {
+    let p = xf.to_stage(at);
+    let tol = PICK * xf.unit();
+    if let Some(pen) = app.pen.as_ref().filter(|pen| !pen.knots.is_empty()) {
+        let n = pen.knots.len();
+        if n >= 2 && far_end(app, pen).is_some_and(|q| q.distance(p) <= tol) {
+            return PenHover::Close;
+        }
+        if n >= 2 && pen.extends.is_none() && pen.knots.first().is_some_and(|k| k[0].distance(p) <= tol) {
+            return PenHover::Close;
+        }
+        if let Some(k) = pen.knots.last().filter(|k| k[0].distance(p) <= tol) {
+            return match () {
+                _ if mods.alt => PenHover::Adjust,
+                _ if k[2] != k[0] => PenHover::Corner,
+                _ if n >= 2 => PenHover::Finish,
+                _ => PenHover::Place,
+            };
+        }
+        return PenHover::Place;
+    }
+    if mods.command {
+        return PenHover::Place;
+    }
+    match pen_target(app, at, xf) {
+        Some(PenTarget::Anchor { end: Some(_), .. }) => PenHover::Continue,
+        Some(PenTarget::Anchor { smooth: true, .. } | PenTarget::RawAnchor { smooth: true, .. }) => PenHover::Corner,
+        Some(PenTarget::Anchor { .. } | PenTarget::RawAnchor { .. }) => PenHover::Delete,
+        Some(PenTarget::Segment) => PenHover::Add,
+        None => PenHover::Place,
+    }
+}
+
+/// A Pen press on a path that shows its points, with no path being drawn (ADR 0115): an end
+/// of an open drawing object is picked up to draw on from, a smooth point becomes a corner, a
+/// corner is deleted, and the outline between points gets a point. False when the press was
+/// on none of them (it starts a new path).
+fn pen_press_on_path(app: &mut App, at: Pos2, xf: Xf) -> bool {
+    let undo = app.undo_key();
+    match pen_target(app, at, xf) {
+        Some(PenTarget::Anchor { id, cmd, end: Some(at_start), .. }) => {
+            let Some((_, path, m)) = selected_shapes(app).into_iter().find(|(e, _, _)| *e == id) else { return false };
+            // The end as a knot: its handle behind is the last segment's, so a handle pulled
+            // ahead can be seen against it.
+            let (Some(a), behind) = (path.point(cmd, ANCHOR), if at_start { path.point(1, C1) } else { path.point(cmd, C2) }) else { return false };
+            let a = m.apply(a);
+            let knot = [a, behind.map_or(a, |h| m.apply(h)), a];
+            app.pen = Some(PenPath { knots: vec![knot], dragging: true, grip: PenGrip::Out, extends: Some((id, at_start)) });
+            app.status_ok(tr!("Continuing the path: click to add points, Enter to finish."));
+            true
+        }
+        Some(PenTarget::Anchor { id, cmd, smooth: true, .. }) => {
+            if app.run("path.convert_point", json!({"id": id.0, "cmd": cmd, "smooth": false})).is_some() {
+                app.status_ok(tr!("Made a corner point. Click it again to delete it. {undo} to undo.", undo = undo));
+            }
+            true
+        }
+        Some(PenTarget::Anchor { id, cmd, .. }) => {
+            if app.run("path.delete_points", json!({"id": id.0, "cmds": [cmd]})).is_some() {
+                app.status_ok(trn!("Deleted {n} point. {undo} to undo.", "Deleted {n} points. {undo} to undo.", 1, undo = undo));
+            }
+            true
+        }
+        Some(PenTarget::RawAnchor { at: q, smooth }) => {
+            app.raw_anchors = vec![q];
+            if smooth {
+                raw_convert(app, false);
+                app.status_ok(tr!("Made a corner point. Click it again to delete it. {undo} to undo.", undo = undo));
+            } else {
+                raw_delete(app);
+            }
+            app.raw_anchors.clear();
+            true
+        }
+        Some(PenTarget::Segment) => add_point_on_selected(app, at, xf),
+        None => false,
+    }
+}
+
+/// Ctrl-click (⌘ on macOS) with the Pen: the path there is selected, so its points show and
+/// the Pen can edit them; over nothing, the selection is dropped.
+fn pen_select(app: &mut App, at: Pos2, xf: Xf) {
+    let sp = xf.to_stage(at);
+    if !raw_show_at(app, sp, false, xf) {
+        app.run("element.pick", json!({"x": sp.x, "y": sp.y}));
+    }
+}
+
+/// The Pen's button went down at screen point `at`.
+pub fn pen_press(app: &mut App, at: Pos2, xf: Xf, mods: PenMods) {
+    let p = xf.to_stage(at);
+    let idle = app.pen.as_ref().is_none_or(|pen| pen.knots.is_empty());
+    if idle {
         app.pen = None;
-        if crate::motion_path::pen_alt_click(app, pos, xf) || add_point_on_selected(app, pos, xf) {
+        // Alt-click on a path adds a point to it: the motion path first (ADR 0038), then a
+        // selected shape's outline.
+        if mods.alt && (crate::motion_path::pen_alt_click(app, at, xf) || add_point_on_selected(app, at, xf)) {
+            return;
+        }
+        if mods.command {
+            pen_select(app, at, xf);
+            return;
+        }
+        if !mods.alt && pen_press_on_path(app, at, xf) {
             return;
         }
     }
-    if pressed && resp.hovered() {
-        let tol = PICK * xf.unit();
-        let pen = app.pen.get_or_insert_with(PenPath::default);
-        let n = pen.knots.len();
-        if n >= 2 && pen.knots.first().is_some_and(|k| k[0].distance(p) <= tol) {
-            commit_pen(app, true);
-            return;
-        }
-        if n >= 2 && pen.knots.last().is_some_and(|k| k[0].distance(p) <= tol) {
-            commit_pen(app, false);
-            return;
-        }
-        // A new knot snaps to points, lines and fill edges (ADR 0045); handles never do.
-        let p = crate::stage::snap_draw(app, pos2(p.x, p.y), xf.zoom);
-        let p = Vec2::new(p.x, p.y);
-        let Some(pen) = app.pen.as_mut() else { return };
-        pen.knots.push([p; 3]);
+    let tol = PICK * xf.unit();
+    let far = app.pen.as_ref().and_then(|pen| far_end(app, pen));
+    let pen = app.pen.get_or_insert_with(PenPath::default);
+    let n = pen.knots.len();
+    // The other end of the path being continued: a point there, and the path is closed.
+    if let Some(q) = far.filter(|q| n >= 2 && q.distance(p) <= tol) {
+        pen.knots.push([q; 3]);
+        commit_pen(app, true);
+        return;
+    }
+    if n >= 2 && pen.extends.is_none() && pen.knots.first().is_some_and(|k| k[0].distance(p) <= tol) {
+        commit_pen(app, true);
+        return;
+    }
+    if let Some(k) = pen.knots.last().filter(|k| k[0].distance(p) <= tol) {
+        pen.grip = if mods.alt { PenGrip::Adjust { was: *k } } else { PenGrip::Last { moved: false } };
         pen.dragging = true;
         return;
     }
+    // A new knot snaps to points, lines and fill edges (ADR 0045); handles never do. Shift
+    // keeps the segment on a multiple of 45° from the knot before, and wins over snapping.
+    let prev = pen.knots.last().map(|k| k[0]);
+    let p = match prev.filter(|_| mods.shift) {
+        Some(from) => {
+            app.snap_ring = None;
+            constrain_45(from, p)
+        }
+        None => {
+            let q = crate::stage::snap_draw(app, pos2(p.x, p.y), xf.zoom);
+            Vec2::new(q.x, q.y)
+        }
+    };
     let Some(pen) = app.pen.as_mut() else { return };
-    if !down {
-        pen.dragging = false;
-        return;
-    }
-    if pen.dragging
-        && let Some(k) = pen.knots.last_mut()
-    {
-        let a = k[0];
-        if a.distance(p) * xf.zoom < 2.0 {
-            // A press that barely moved is a corner.
-            *k = [a; 3];
-        } else {
-            k[2] = p;
-            if !alt {
-                k[1] = a * 2.0 - p;
+    pen.knots.push([p; 3]);
+    pen.grip = PenGrip::New;
+    pen.dragging = true;
+}
+
+/// The pointer moved to screen point `at` with the Pen's button down.
+pub fn pen_drag(app: &mut App, at: Pos2, xf: Xf, mods: PenMods) {
+    let Some(pen) = app.pen.as_mut().filter(|pen| pen.dragging) else { return };
+    let grip = pen.grip;
+    let Some(k) = pen.knots.last_mut() else { return };
+    let a = k[0];
+    let p = xf.to_stage(at);
+    // A press that barely moved is a click.
+    let moved = a.distance(p) * xf.zoom >= 2.0;
+    let p = if mods.shift { constrain_45(a, p) } else { p };
+    match grip {
+        PenGrip::New => {
+            if !moved {
+                *k = [a; 3];
+            } else {
+                k[2] = p;
+                if !mods.alt {
+                    k[1] = a * 2.0 - p;
+                }
             }
+        }
+        PenGrip::Last { moved: was_moved } => {
+            if moved || was_moved {
+                k[2] = p;
+                pen.grip = PenGrip::Last { moved: true };
+            }
+        }
+        PenGrip::Out => {
+            if moved {
+                k[2] = p;
+            }
+        }
+        PenGrip::Adjust { was } => {
+            *k = if moved { [a, a * 2.0 - p, p] } else { was };
         }
     }
 }
 
-/// Finishes the Pen path as a shape (one undo step). Fewer than two knots are dropped.
+/// The Pen's button was let go.
+pub fn pen_release(app: &mut App) {
+    let Some(pen) = app.pen.as_mut() else { return };
+    if !pen.dragging {
+        return;
+    }
+    pen.dragging = false;
+    let grip = std::mem::take(&mut pen.grip);
+    if grip != (PenGrip::Last { moved: false }) {
+        return;
+    }
+    // A click on the last knot: its handle ahead goes (the next segment starts as a corner,
+    // issue #319); with none to take, the click finishes the path, as a double-click does.
+    let n = pen.knots.len();
+    match pen.knots.last_mut() {
+        Some(k) if k[2] != k[0] => {
+            k[2] = k[0];
+            app.status_ok(tr!("The next segment starts as a corner. Click the point again, or press Enter, to finish."));
+        }
+        Some(_) if n >= 2 => commit_pen(app, false),
+        _ => {}
+    }
+}
+
+/// Pointer handling for the Pen. Runs on raw press/release (not egui's drag threshold), so a
+/// quick click places a point exactly where it was pressed.
+pub fn pen_input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, xf: Xf) {
+    let (pressed, down, m) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.modifiers));
+    let mods = PenMods { alt: m.alt, shift: m.shift, command: m.command };
+    // Off the stage there is nothing to do: a button let go out there is seen when the
+    // pointer comes back.
+    let Some(pos) = resp.interact_pointer_pos().or_else(|| resp.hover_pos()) else { return };
+    if pressed && resp.hovered() {
+        pen_press(app, pos, xf, mods);
+    } else if down {
+        pen_drag(app, pos, xf, mods);
+    } else {
+        pen_release(app);
+    }
+}
+
+/// Finishes the Pen path as a shape (one undo step), or as more of the path it continues.
+/// Fewer than two knots are dropped.
 pub fn commit_pen(app: &mut App, closed: bool) {
     let Some(pen) = app.pen.take() else { return };
     if pen.knots.len() < 2 {
         return;
     }
-    app.draw("draw.path", json!({"d": pen.to_svg(closed)}));
+    match pen.extends {
+        // The object stays selected: its points go on showing under the Pen.
+        Some((id, at_start)) => {
+            app.run("path.extend", json!({"id": id.0, "d": pen.to_svg(false), "end": if at_start { "start" } else { "end" }, "close": closed}));
+        }
+        None => {
+            app.draw("draw.path", json!({"d": pen.to_svg(closed)}));
+        }
+    }
 }
 
 // ----- Pencil ------------------------------------------------------------------------------
@@ -767,11 +1079,47 @@ fn anchor_box(painter: &egui::Painter, c: Pos2, filled: bool) {
     painter.rect_stroke(r, 0.0, Stroke::new(1.0, T.selection), StrokeKind::Middle);
 }
 
+/// The mark by the Pen's pointer for what a click would do: a plus (add a point), a minus
+/// (delete it), a caret (make it a corner), a ring (close the path), a slash (continue the
+/// path), a square (finish). Drawn in the selection colour over white, so it reads on any
+/// artwork.
+fn pen_mark(painter: &egui::Painter, c: Pos2, what: PenHover) {
+    let r = 4.0;
+    let strokes = [Stroke::new(3.5, Color32::WHITE), Stroke::new(1.5, T.selection)];
+    let lines: &[[egui::Vec2; 2]] = match what {
+        PenHover::Place | PenHover::Adjust => return,
+        PenHover::Add => &[[vec2(-r, 0.0), vec2(r, 0.0)], [vec2(0.0, -r), vec2(0.0, r)]],
+        PenHover::Delete => &[[vec2(-r, 0.0), vec2(r, 0.0)]],
+        PenHover::Corner => &[[vec2(-r, r), vec2(0.0, -r)], [vec2(0.0, -r), vec2(r, r)]],
+        PenHover::Continue => &[[vec2(-r, r), vec2(r, -r)]],
+        PenHover::Close => {
+            for s in strokes {
+                painter.circle_stroke(c, r, s);
+            }
+            return;
+        }
+        PenHover::Finish => {
+            for s in strokes {
+                painter.rect_stroke(Rect::from_center_size(c, vec2(2.0 * r - 1.0, 2.0 * r - 1.0)), 0.0, s, StrokeKind::Middle);
+            }
+            return;
+        }
+    };
+    for s in strokes {
+        for [a, b] in lines {
+            painter.line_segment([c + *a, c + *b], s);
+        }
+    }
+}
+
 /// Path tool overlays: point editing on selected shapes, the Pen path being drawn and the
 /// Pencil stroke in progress.
 pub fn draw_overlay(app: &App, painter: &egui::Painter, xf: Xf, hover: Option<Pos2>) {
     let line = Stroke::new(1.0, T.selection);
-    if app.tool == Tool::Subselect {
+    // The Pen shows the points of the selected paths too, while it isn't drawing one: it adds,
+    // converts and deletes them, and continues an open path from its end (ADR 0115).
+    let pen_idle = app.tool == Tool::Pen && app.pen.as_ref().is_none_or(|pen| pen.knots.is_empty());
+    if app.tool == Tool::Subselect || pen_idle {
         draw_raw(app, painter, xf);
         for (id, path, m) in selected_shapes(app) {
             let to_px = Affine::translate(xf.origin.x, xf.origin.y).mul(&Affine::scale(xf.zoom, xf.zoom)).mul(&m);
@@ -802,14 +1150,27 @@ pub fn draw_overlay(app: &App, painter: &egui::Painter, xf: Xf, hover: Option<Po
             }
         }
         painter.add(egui::Shape::line(pts, stroke));
-        let first = pen.knots.first().map(|k| xf.to_screen(k[0]));
+        // Alt on the last knot draws its handles again: the segment as it was stays in view
+        // until the button is let go (issue #319).
+        if let (PenGrip::Adjust { was }, Some(prev)) = (pen.grip, pen.knots.len().checked_sub(2).and_then(|i| pen.knots.get(i))) {
+            let ghost: Vec<Pos2> = (0..=16).map(|k| xf.to_screen(bezier(prev[0], prev[2], was[1], was[0], k as f32 / 16.0))).collect();
+            painter.add(egui::Shape::line(ghost, Stroke::new(1.0, T.selection.gamma_multiply(0.45))));
+        }
         if let (Some(last), Some(h)) = (pen.knots.last(), hover)
             && !pen.dragging
         {
-            painter.add(egui::Shape::dashed_line(&[xf.to_screen(last[0]), h], line, 4.0, 3.0));
-            // Closing cue: a ring on the first point when a click would close the path.
+            // The segment a click here would add, as it would curve (Shift: on 45°).
+            let shift = painter.ctx().input(|i| i.modifiers.shift);
+            let to = if shift { constrain_45(last[0], xf.to_stage(h)) } else { xf.to_stage(h) };
+            let ahead: Vec<Pos2> = (0..=16).map(|k| xf.to_screen(bezier(last[0], last[2], to, to, k as f32 / 16.0))).collect();
+            painter.add(egui::Shape::dashed_line(&ahead, line, 4.0, 3.0));
+            // Closing cue: a ring on the point a click would close the path on.
+            let close_on = match pen.extends {
+                Some(_) => far_end(app, pen),
+                None => pen.knots.first().map(|k| k[0]),
+            };
             if pen.knots.len() >= 2
-                && let Some(f) = first
+                && let Some(f) = close_on.map(|q| xf.to_screen(q))
                 && f.distance(h) <= PICK
             {
                 painter.circle_stroke(f, 6.0, Stroke::new(1.5, T.selection));
@@ -828,6 +1189,16 @@ pub fn draw_overlay(app: &App, painter: &egui::Painter, xf: Xf, hover: Option<Po
             anchor_box(painter, c, last);
         }
     }
+    // What a click would do, by the pointer (Animate's Pen cursors, issue #319).
+    if app.tool == Tool::Pen
+        && app.drag == Drag::None
+        && let Some(h) = hover
+        && app.pen.as_ref().is_none_or(|pen| !pen.dragging)
+    {
+        let m = painter.ctx().input(|i| i.modifiers);
+        let what = pen_hover(app, h, xf, PenMods { alt: m.alt, shift: m.shift, command: m.command });
+        pen_mark(painter, h + vec2(13.0, 13.0), what);
+    }
     if app.drag == Drag::Pencil && app.pencil.len() > 1 {
         let w = (app.s.style.stroke_width * xf.zoom).max(1.0);
         let pts: Vec<Pos2> = app.pencil.iter().map(|p| xf.to_screen(*p)).collect();
@@ -845,7 +1216,7 @@ mod tests {
 
     #[test]
     fn pen_svg_is_straight_for_corners_and_curved_for_handles() {
-        let mut pen = PenPath { knots: vec![knot(0.0, 0.0), knot(100.0, 0.0), knot(100.0, 50.0)], dragging: false };
+        let mut pen = PenPath { knots: vec![knot(0.0, 0.0), knot(100.0, 0.0), knot(100.0, 50.0)], ..Default::default() };
         assert_eq!(pen.to_svg(false), "M0 0 L100 0 L100 50");
         assert_eq!(pen.to_svg(true), "M0 0 L100 0 L100 50 Z");
         pen.knots[1] = [Vec2::new(100.0, 0.0), Vec2::new(80.0, -10.0), Vec2::new(120.0, 10.0)];
@@ -854,6 +1225,293 @@ mod tests {
         // The engine takes it.
         let mut s = anicraft_engine::Session::default();
         assert!(s.execute("draw.path", &json!({"d": pen.to_svg(true)})).is_ok());
+    }
+
+    /// The Pen (ADR 0115, issue #319) on a headless app, stage and screen coordinates the same.
+    mod pen {
+        use super::*;
+
+        const XF: Xf = Xf { origin: Pos2::ZERO, zoom: 1.0 };
+        const NONE: PenMods = PenMods { alt: false, shift: false, command: false };
+        const ALT: PenMods = PenMods { alt: true, shift: false, command: false };
+        const SHIFT: PenMods = PenMods { alt: false, shift: true, command: false };
+        const CTRL: PenMods = PenMods { alt: false, shift: false, command: true };
+
+        fn app() -> App {
+            let ctx = egui::Context::default();
+            let session = anicraft_engine::Session::new(anicraft_engine::doc::Document::default());
+            let mut app = App::with_context(&ctx, session, Some(std::path::PathBuf::from("unused.png")));
+            app.tool = Tool::Pen;
+            app.view.zoom = 1.0;
+            // Drawing objects: one path is one element (merge drawing splits it at corners).
+            app.s.style.object_drawing = true;
+            app
+        }
+
+        fn v(x: f32, y: f32) -> Vec2 {
+            Vec2::new(x, y)
+        }
+
+        fn click(app: &mut App, x: f32, y: f32, mods: PenMods) {
+            pen_press(app, pos2(x, y), XF, mods);
+            pen_release(app);
+        }
+
+        fn drag(app: &mut App, from: (f32, f32), to: (f32, f32), mods: PenMods) {
+            pen_press(app, pos2(from.0, from.1), XF, mods);
+            pen_drag(app, pos2(to.0, to.1), XF, mods);
+            pen_release(app);
+        }
+
+        fn knots(app: &App) -> Vec<[Vec2; 3]> {
+            app.pen.as_ref().map(|p| p.knots.clone()).unwrap_or_default()
+        }
+
+        /// The one shape on the stage: its id and its path in stage space.
+        fn shape(app: &App) -> (ElementId, Path) {
+            let els = app.s.visible_elements();
+            assert_eq!(els.len(), 1, "one shape");
+            let ElementKind::Shape(sh) = &els[0].kind else { panic!("a shape") };
+            (els[0].id, sh.path.transformed(&els[0].transform))
+        }
+
+        fn anchors(p: &Path) -> Vec<(f32, f32)> {
+            p.editable_anchors().into_iter().map(|(_, q)| (q.x.round(), q.y.round())).collect()
+        }
+
+        /// An open drawing object, selected, so the Pen shows its points.
+        fn with_object(d: &str) -> App {
+            let mut app = app();
+            app.run("draw.path", json!({"d": d, "object": true}));
+            let (el, _) = shape(&app);
+            app.run("element.select", json!({"ids": [el.0]}));
+            assert!(app.s.selection.contains(app.s.layer, el));
+            app
+        }
+
+        #[test]
+        fn clicks_place_corners_drags_pull_mirrored_handles_and_alt_breaks_the_pair() {
+            let mut app = app();
+            click(&mut app, 10.0, 10.0, NONE);
+            drag(&mut app, (100.0, 10.0), (130.0, 40.0), NONE);
+            assert_eq!(knots(&app), vec![[v(10.0, 10.0); 3], [v(100.0, 10.0), v(70.0, -20.0), v(130.0, 40.0)]]);
+            // Alt while dragging a new knot moves only the handle ahead.
+            pen_press(&mut app, pos2(200.0, 10.0), XF, NONE);
+            pen_drag(&mut app, pos2(220.0, 10.0), XF, NONE);
+            pen_drag(&mut app, pos2(200.0, 50.0), XF, ALT);
+            pen_release(&mut app);
+            assert_eq!(knots(&app)[2], [v(200.0, 10.0), v(180.0, 10.0), v(200.0, 50.0)]);
+            // A press that barely moves stays a corner.
+            drag(&mut app, (300.0, 10.0), (301.0, 10.5), NONE);
+            assert_eq!(knots(&app)[3], [v(300.0, 10.0); 3]);
+        }
+
+        #[test]
+        fn shift_keeps_segments_and_handles_on_45_degree_steps() {
+            let mut app = app();
+            click(&mut app, 100.0, 100.0, NONE);
+            // Nearly horizontal: the point lands on the horizontal through the knot before.
+            click(&mut app, 200.0, 108.0, SHIFT);
+            assert_eq!(knots(&app)[1][0], v(200.0, 100.0));
+            // Nearly diagonal: on the 45° line, at the pointer's distance along it.
+            click(&mut app, 260.0, 150.0, SHIFT);
+            let k = knots(&app)[2][0];
+            assert!(((k.x - 200.0) - (k.y - 100.0)).abs() < 1e-3 && (k.x - 255.0).abs() < 1e-3, "{k:?}");
+            // A handle pulled with Shift is vertical here, and its twin mirrors it.
+            pen_press(&mut app, pos2(400.0, 100.0), XF, NONE);
+            pen_drag(&mut app, pos2(404.0, 160.0), XF, SHIFT);
+            pen_release(&mut app);
+            let k = knots(&app)[3];
+            assert!((k[2].x - 400.0).abs() < 1e-3 && (k[2].y - 160.0).abs() < 1e-3 && (k[1].y - 40.0).abs() < 1e-3, "{k:?}");
+            for (from, p) in [(v(0.0, 0.0), v(10.0, 1.0)), (v(5.0, 5.0), v(-20.0, 31.0)), (v(1.0, 2.0), v(1.0, 2.0)), (v(0.0, 0.0), v(f32::NAN, 1.0))] {
+                let q = constrain_45(from, p);
+                let d = q - from;
+                assert!(!d.is_finite() || d.length() < 1e-6 || (d.x.abs() < 1e-3 || d.y.abs() < 1e-3 || (d.x.abs() - d.y.abs()).abs() < 1e-3), "{from:?} {p:?} -> {q:?}");
+            }
+        }
+
+        #[test]
+        fn a_click_on_the_last_point_breaks_its_handle_then_finishes() {
+            // Issue #319, Break Handles: the next segment leaves the point as a sharp corner.
+            let mut app = app();
+            click(&mut app, 10.0, 100.0, NONE);
+            drag(&mut app, (100.0, 100.0), (140.0, 60.0), NONE);
+            assert_eq!(pen_hover(&app, pos2(101.0, 99.0), XF, NONE), PenHover::Corner);
+            click(&mut app, 101.0, 99.0, NONE);
+            assert_eq!(knots(&app)[1], [v(100.0, 100.0), v(60.0, 140.0), v(100.0, 100.0)], "the handle behind stays, the one ahead is gone");
+            assert_eq!(pen_hover(&app, pos2(100.0, 100.0), XF, NONE), PenHover::Finish);
+            click(&mut app, 200.0, 100.0, NONE);
+            // A click on the (corner) last point finishes the open path: one shape.
+            click(&mut app, 200.0, 100.0, NONE);
+            assert!(app.pen.is_none());
+            let (_, p) = shape(&app);
+            assert_eq!(anchors(&p), [(10.0, 100.0), (100.0, 100.0), (200.0, 100.0)]);
+            assert!(matches!(p.cmds[1], PathCmd::CubicTo(..)) && matches!(p.cmds[2], PathCmd::LineTo(_)), "curved in, straight out: {:?}", p.cmds);
+        }
+
+        #[test]
+        fn a_drag_from_the_last_point_pulls_a_new_handle_ahead_alone() {
+            let mut app = app();
+            click(&mut app, 10.0, 100.0, NONE);
+            drag(&mut app, (100.0, 100.0), (140.0, 60.0), NONE);
+            drag(&mut app, (100.0, 100.0), (100.0, 160.0), NONE);
+            assert_eq!(knots(&app)[1], [v(100.0, 100.0), v(60.0, 140.0), v(100.0, 160.0)]);
+            assert_eq!(knots(&app).len(), 2, "no point was added, and the path isn't finished");
+        }
+
+        #[test]
+        fn alt_drag_on_the_last_point_draws_its_segment_again() {
+            // Issue #319, Adjust Last Node: the segment as it was shows until the release.
+            let mut app = app();
+            click(&mut app, 10.0, 100.0, NONE);
+            drag(&mut app, (100.0, 100.0), (140.0, 60.0), NONE);
+            let was = knots(&app)[1];
+            assert_eq!(pen_hover(&app, pos2(100.0, 100.0), XF, ALT), PenHover::Adjust);
+            pen_press(&mut app, pos2(100.0, 100.0), XF, ALT);
+            assert_eq!(app.pen.as_ref().map(|p| p.grip), Some(PenGrip::Adjust { was }), "the ghost");
+            pen_drag(&mut app, pos2(100.0, 150.0), XF, ALT);
+            assert_eq!(knots(&app)[1], [v(100.0, 100.0), v(100.0, 50.0), v(100.0, 150.0)]);
+            // Back onto the point: nothing changes.
+            pen_drag(&mut app, pos2(100.5, 100.0), XF, ALT);
+            assert_eq!(knots(&app)[1], was);
+            pen_drag(&mut app, pos2(130.0, 100.0), XF, ALT);
+            pen_release(&mut app);
+            assert_eq!(knots(&app), vec![[v(10.0, 100.0); 3], [v(100.0, 100.0), v(70.0, 100.0), v(130.0, 100.0)]]);
+            assert_eq!(app.pen.as_ref().map(|p| (p.grip, p.dragging)), Some((PenGrip::New, false)));
+        }
+
+        #[test]
+        fn the_first_point_closes_with_a_hint_and_keys_finish_or_step_back() {
+            let mut app = app();
+            click(&mut app, 10.0, 10.0, NONE);
+            click(&mut app, 110.0, 10.0, NONE);
+            click(&mut app, 110.0, 90.0, NONE);
+            assert_eq!(pen_hover(&app, pos2(12.0, 11.0), XF, NONE), PenHover::Close);
+            assert_eq!(pen_hover(&app, pos2(60.0, 60.0), XF, NONE), PenHover::Place);
+            click(&mut app, 12.0, 11.0, NONE);
+            assert!(app.pen.is_none());
+            let (_, p) = shape(&app);
+            assert!(matches!(p.cmds.last(), Some(PathCmd::Close)));
+            assert_eq!(anchors(&p).len(), 3);
+            // Esc finishes an open path; Backspace takes the last point back.
+            let ctx = egui::Context::default();
+            let key = |app: &mut App, key: Key| {
+                let mut input = egui::RawInput::default();
+                input.events.push(egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
+                let mut out = ctx.run_ui(input, |ui| consume_keys(app, ui.ctx()));
+                out.textures_delta.clear();
+            };
+            click(&mut app, 300.0, 10.0, NONE);
+            click(&mut app, 400.0, 10.0, NONE);
+            click(&mut app, 400.0, 90.0, NONE);
+            key(&mut app, Key::Backspace);
+            assert_eq!(knots(&app).len(), 2);
+            key(&mut app, Key::Escape);
+            assert!(app.pen.is_none());
+            assert_eq!(app.s.visible_elements().len(), 2, "the open path is kept");
+        }
+
+        #[test]
+        fn on_a_selected_path_a_click_converts_then_deletes_a_point_and_adds_one_on_the_outline() {
+            // Issue #319, Add/Remove Nodes: caret, then minus, on a point; plus on a segment.
+            let mut app = with_object("M0 100 C30 40 70 40 100 100 C130 160 170 160 200 100 L300 100");
+            let at = pos2(100.0, 100.0);
+            assert_eq!(pen_hover(&app, at, XF, NONE), PenHover::Corner);
+            click(&mut app, at.x, at.y, NONE);
+            assert!(app.pen.is_none(), "no path was started");
+            let (_, p) = shape(&app);
+            assert_eq!(anchors(&p).len(), 4);
+            assert_eq!(pen_hover(&app, at, XF, NONE), PenHover::Delete, "a corner now: {:?}", p.cmds);
+            click(&mut app, at.x, at.y, NONE);
+            assert_eq!(anchors(&shape(&app).1), [(0.0, 100.0), (200.0, 100.0), (300.0, 100.0)]);
+            // The outline between points takes a point; away from it a click starts a path.
+            assert_eq!(pen_hover(&app, pos2(250.0, 101.0), XF, NONE), PenHover::Add);
+            click(&mut app, 250.0, 101.0, NONE);
+            assert_eq!(anchors(&shape(&app).1), [(0.0, 100.0), (200.0, 100.0), (250.0, 100.0), (300.0, 100.0)]);
+            assert!(app.pen.is_none());
+            assert_eq!(pen_hover(&app, pos2(250.0, 300.0), XF, NONE), PenHover::Place);
+            // Each was one undo step.
+            for n in [3, 4, 4] {
+                app.run("edit.undo", json!({}));
+                assert_eq!(anchors(&shape(&app).1).len(), n);
+            }
+        }
+
+        #[test]
+        fn an_unselected_path_is_drawn_over_and_ctrl_click_selects_it() {
+            let mut app = with_object("M0 100 L100 100 L200 100");
+            app.run("edit.deselect", json!({}));
+            // Its points aren't showing: the Pen starts a path there (a T-junction, say).
+            assert_eq!(pen_hover(&app, pos2(100.0, 100.0), XF, NONE), PenHover::Place);
+            click(&mut app, 100.0, 100.0, NONE);
+            assert_eq!(knots(&app).len(), 1);
+            app.pen = None;
+            // Ctrl-click selects it, and now the Pen edits it.
+            click(&mut app, 150.0, 100.0, CTRL);
+            assert!(app.pen.is_none() && app.s.selection.len() == 1);
+            assert_eq!(pen_hover(&app, pos2(100.0, 100.0), XF, NONE), PenHover::Delete);
+            assert_eq!(pen_hover(&app, pos2(150.0, 100.0), XF, NONE), PenHover::Add);
+            click(&mut app, 400.0, 400.0, CTRL);
+            assert!(app.s.selection.is_empty(), "Ctrl-click on nothing lets go");
+        }
+
+        #[test]
+        fn an_open_end_is_continued_and_the_other_end_closes_the_path() {
+            let mut app = with_object("M0 100 L100 100 C130 100 150 80 150 50");
+            let (id, _) = shape(&app);
+            assert_eq!(pen_hover(&app, pos2(150.0, 50.0), XF, NONE), PenHover::Continue);
+            assert_eq!(pen_hover(&app, pos2(0.0, 100.0), XF, NONE), PenHover::Continue);
+            // Press on the end and pull a handle ahead, then two more points, then finish.
+            drag(&mut app, (150.0, 50.0), (150.0, 20.0), NONE);
+            let pen = app.pen.clone().expect("continuing");
+            assert_eq!(pen.extends, Some((id, false)));
+            assert_eq!(pen.knots, vec![[v(150.0, 50.0), v(150.0, 80.0), v(150.0, 20.0)]]);
+            click(&mut app, 200.0, 0.0, NONE);
+            click(&mut app, 300.0, 0.0, NONE);
+            commit_pen(&mut app, false);
+            let (same, p) = shape(&app);
+            assert_eq!(same, id, "the same object, longer");
+            assert_eq!(anchors(&p), [(0.0, 100.0), (100.0, 100.0), (150.0, 50.0), (200.0, 0.0), (300.0, 0.0)]);
+            assert!(matches!(p.cmds[3], PathCmd::CubicTo(..)), "the handle pulled from the end curves the join");
+            // From the start, round to the other end: the ring shows there and the path closes.
+            click(&mut app, 0.0, 100.0, NONE);
+            assert_eq!(app.pen.as_ref().and_then(|p| p.extends), Some((id, true)));
+            click(&mut app, 0.0, 200.0, NONE);
+            assert_eq!(pen_hover(&app, pos2(300.0, 1.0), XF, NONE), PenHover::Close);
+            assert_eq!(pen_hover(&app, pos2(0.0, 100.0), XF, NONE), PenHover::Place, "its own first knot doesn't close it");
+            click(&mut app, 300.0, 1.0, NONE);
+            assert!(app.pen.is_none());
+            let (same, p) = shape(&app);
+            assert_eq!(same, id);
+            assert!(matches!(p.cmds.last(), Some(PathCmd::Close)), "{:?}", p.cmds);
+            assert_eq!(anchors(&p).len(), 6);
+            // Closed, it has no end to continue: its points convert and delete.
+            assert_eq!(pen_hover(&app, pos2(300.0, 0.0), XF, NONE), PenHover::Delete);
+            // Two undo steps take both continuations back.
+            app.run("edit.undo", json!({}));
+            app.run("edit.undo", json!({}));
+            assert_eq!(anchors(&shape(&app).1).len(), 3);
+        }
+
+        #[test]
+        fn the_pen_edits_the_points_of_selected_merged_drawings() {
+            let mut app = app();
+            app.run("draw.rect", json!({"x": 0, "y": 0, "w": 100, "h": 80, "fill": "#ff0000", "stroke": "#000000", "object": false}));
+            app.run("edit.deselect", json!({}));
+            assert_eq!(pen_hover(&app, pos2(100.0, 0.0), XF, NONE), PenHover::Place, "not selected: a path starts here");
+            click(&mut app, 50.0, 0.0, CTRL);
+            assert!(!app.s.selection.is_empty());
+            assert_eq!(raw_shown(&app).anchors.len(), 4);
+            assert_eq!(pen_hover(&app, pos2(50.0, 0.0), XF, NONE), PenHover::Add);
+            click(&mut app, 50.0, 0.0, NONE);
+            assert!(app.pen.is_none());
+            assert_eq!(raw_shown(&app).anchors.len(), 5);
+            // A corner point is deleted: the outline closes up across it.
+            assert_eq!(pen_hover(&app, pos2(100.0, 0.0), XF, NONE), PenHover::Delete);
+            click(&mut app, 100.0, 0.0, NONE);
+            assert_eq!(raw_shown(&app).anchors.len(), 4);
+            assert!(app.pen.is_none());
+        }
     }
 
     /// Subselection on a merged drawing (ADR 0042), on a headless app: a raw rectangle with

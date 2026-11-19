@@ -182,9 +182,11 @@ fn merge_results(results: Vec<(LayerId, Value)>) -> Value {
 }
 
 impl Session {
-    /// The elements on `layer` at the playhead (tweens applied).
+    /// The elements on `layer` at the playhead (tweens applied), in stage space: on a layer
+    /// that follows a parent layer (ADR 0113) they are placed as the stage shows them.
     pub fn elements_on(&self, layer: LayerId) -> Vec<Arc<Element>> {
-        self.timeline().layer(layer).and_then(|l| evaluate_layer_elements(l, self.frame)).map(|(_, e)| e.into_owned()).unwrap_or_default()
+        let els = self.timeline().layer(layer).and_then(|l| evaluate_layer_elements(l, self.frame)).map(|(_, e)| e.into_owned()).unwrap_or_default();
+        self.shown_on(layer, els)
     }
 
     /// Whether artwork on `layer` can be selected: it is in this scene, shown and unlocked
@@ -275,11 +277,17 @@ impl Session {
     /// where the edit does not apply (no movie clips for a filter, no text to restyle) is left
     /// as it was, and the command fails only when it applies nowhere.
     pub(crate) fn each_layer(&mut self, strict: bool, mut run: impl FnMut(&mut Session) -> Result<Value>) -> Result<Value> {
-        let layers = self.selected_layers();
+        let mut layers = self.selected_layers();
         match layers.as_slice() {
             [] => return run(self),
             [one] if *one == self.layer => return run(self),
             _ => {}
+        }
+        // Parent layers before the layers that follow them (ADR 0113): a follower's edit is
+        // stored for where its parent ends up.
+        if self.timeline().has_rig() {
+            let tl = self.timeline();
+            layers.sort_by_key(|l| tl.rig_ancestors(*l).len());
         }
         let active = self.layer;
         let full = self.selection.clone();
@@ -293,6 +301,7 @@ impl Session {
             // Each layer's run sees what the runs before it changed.
             self.dl_cache.replace(None);
             let r = run(self);
+            self.settle_rig();
             // A motion tween's target on this layer turns into property keys now (the session
             // does this once per command, for one layer).
             if let Some(edit) = self.motion_edit.take()
@@ -339,6 +348,7 @@ impl Session {
         self.layer = layer;
         self.dl_cache.replace(None);
         let r = f(self);
+        self.settle_rig();
         if let Some(edit) = self.motion_edit.take() {
             crate::cmds_motion::finish_edit(self, edit);
         }

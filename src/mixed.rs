@@ -122,10 +122,8 @@ pub fn of(doc: &Document, all: &[Arc<Element>]) -> Mixed {
             _ => None,
         })),
         kind: differ(instances().map(|e| kind_of(e))),
-        filters: differ(clips().filter_map(|e| match &e.kind {
-            ElementKind::Symbol { filters, .. } => Some(filters),
-            _ => None,
-        })),
+        // Filters: movie clips, buttons and text (ADR 0099).
+        filters: differ(all.iter().filter(|e| matches!(e.kind, ElementKind::Text(_)) || kind_of(e).is_some_and(|k| k != SymbolKind::Graphic)).filter_map(|e| e.kind.filters())),
         blend: differ(clips().filter_map(|e| match &e.kind {
             ElementKind::Symbol { blend, .. } => Some(*blend),
             _ => None,
@@ -275,6 +273,28 @@ mod tests {
         run(&mut s, "element.set_filters", json!({"filters": []}));
         let m = mixed(&s);
         assert!(!m.blend && !m.filters);
+    }
+
+    /// ADR 0099: text takes filters, so its Filters row compares with movie clips' and other
+    /// text's.
+    #[test]
+    fn the_filters_row_compares_text_too() {
+        if anicraft_engine::text::Fonts::get().families().is_empty() {
+            return; // No fonts on this computer: no text to make.
+        }
+        let (mut s, [a, _, _], _) = session();
+        let t1 = id(&run(&mut s, "text.create", json!({"text": "One", "x": 20, "y": 20})));
+        let t2 = id(&run(&mut s, "text.create", json!({"text": "Two", "x": 20, "y": 80})));
+        select(&mut s, &[t1, t2]);
+        assert!(!mixed(&s).filters);
+        select(&mut s, &[t1]);
+        run(&mut s, "element.set_filters", json!({"filters": [{"type": "drop_shadow"}]}));
+        select(&mut s, &[t1, t2]);
+        assert!(mixed(&s).filters, "one text has a shadow, the other none");
+        // A movie clip beside them is compared with them; setting the list makes all alike.
+        select(&mut s, &[t1, t2, a]);
+        run(&mut s, "element.set_filters", json!({"filters": [{"type": "glow"}]}));
+        assert!(!mixed(&s).filters);
     }
 
     #[test]

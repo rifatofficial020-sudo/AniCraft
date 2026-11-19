@@ -239,9 +239,14 @@ fn classic_tweens_carry_blur_and_glow_to_their_midpoint() {
     let dl = anicraft_doc::evaluate(&s.doc, 5);
     let g = dl.groups.iter().find(|g| !g.filters.is_empty()).expect("a filtered group");
     assert_eq!(g.filters.len(), 1, "only the blur draws");
-    // Reordered on one keyframe, the lists no longer pair up: the first keyframe's holds.
+    // Reordered on one keyframe, the lists no longer pair one to one (ADR 0099): the blur both
+    // keyframes have still travels, the first keyframe's glow (off) fades out where it stood
+    // and the second keyframe's fades in after the blur. The first keyframe shows its own.
     run(&mut s, "filter.move", json!({"from": 1, "to": 0}));
     let dl = anicraft_doc::evaluate(&s.doc, 5);
     let g = dl.groups.iter().find(|g| !g.filters.is_empty()).expect("a filtered group");
-    assert!(matches!(g.filters[0], Filter::Blur { blur_x, .. } if blur_x == 0.0), "{:?}", g.filters);
+    assert!(matches!(g.filters[..], [Filter::Blur { blur_x, .. }, Filter::Glow { strength, .. }] if blur_x == 10.0 && strength == 1.0), "{:?}", g.filters);
+    let dl = anicraft_doc::evaluate(&s.doc, 0);
+    let g = dl.groups.iter().find(|g| !g.filters.is_empty()).expect("a filtered group");
+    assert!(matches!(g.filters[..], [Filter::Blur { blur_x, .. }] if blur_x == 0.0), "{:?}", g.filters);
 }

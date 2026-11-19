@@ -75,6 +75,8 @@ const PROBES: &[(&str, u32, f32, f32, u32)] = &[
     ("video", 0, 10.0, 150.0, 0xFFFFFF),
     ("primitives", 0, 40.0, 50.0, 0xF2CC8F),
     ("primitives", 0, 210.0, 40.0, 0xE07A5F),
+    // The nested group's square at half size (#411).
+    ("primitives", 0, 270.0, 40.0, 0x81B29A),
     ("primitives", 0, 6.0, 170.0, 0xFFFFFF),
     // The checker's transparent corner, then a teal and a cream square, four times as large.
     ("bitmaps", 0, 14.0, 14.0, 0xFFFFFF),

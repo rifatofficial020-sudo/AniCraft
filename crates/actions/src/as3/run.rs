@@ -119,6 +119,10 @@ pub fn round(x: f64) -> f64 {
     if !x.is_finite() {
         return x;
     }
+    // Negative fractions rounded to zero keep their sign, so their reciprocal is -Infinity.
+    if (-0.5..0.0).contains(&x) {
+        return -0.0;
+    }
     let f = x.floor();
     if x - f >= 0.5 { f + 1.0 } else { f }
 }
@@ -130,7 +134,11 @@ fn min_max(vals: &[f64], max: bool) -> f64 {
         if v.is_nan() {
             return f64::NAN;
         }
-        if (max && v > out) || (!max && v < out) {
+        // Equal zeros prefer +0 for max and -0 for min, regardless of argument order.
+        if (max && v > out)
+            || (!max && v < out)
+            || (v == 0.0 && out == 0.0 && v.is_sign_positive() == max)
+        {
             out = v;
         }
     }
@@ -534,5 +542,34 @@ fn prop_name(p: Property) -> &'static str {
         Property::Rotation => "rotation",
         Property::ScaleX => "scaleX",
         Property::ScaleY => "scaleY",
+    }
+}
+
+#[cfg(test)]
+mod min_max_tests {
+    use super::{min_max, round};
+
+    #[test]
+    fn signed_zero_ties_are_independent_of_argument_order() {
+        for vals in [[-0.0, 0.0], [0.0, -0.0], [round(-0.4), 0.0], [0.0, round(-0.4)]] {
+            assert_eq!(min_max(&vals, true).to_bits(), 0.0_f64.to_bits());
+            assert_eq!(min_max(&vals, false).to_bits(), (-0.0_f64).to_bits());
+        }
+        for zero in [-0.0_f64, 0.0_f64] {
+            assert_eq!(min_max(&[zero, zero], true).to_bits(), zero.to_bits());
+            assert_eq!(min_max(&[zero, zero], false).to_bits(), zero.to_bits());
+        }
+    }
+
+    #[test]
+    fn zero_tie_handling_preserves_other_min_max_rules() {
+        assert_eq!(min_max(&[], true), f64::NEG_INFINITY);
+        assert_eq!(min_max(&[], false), f64::INFINITY);
+        for max in [false, true] {
+            assert!(min_max(&[0.0, f64::NAN], max).is_nan());
+            assert!(min_max(&[f64::NAN, -0.0], max).is_nan());
+        }
+        assert_eq!(min_max(&[-1.0, -0.0, 0.0, 1.0], true), 1.0);
+        assert_eq!(min_max(&[-1.0, -0.0, 0.0, 1.0], false), -1.0);
     }
 }

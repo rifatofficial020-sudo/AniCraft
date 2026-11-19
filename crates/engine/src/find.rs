@@ -891,7 +891,7 @@ fn apply_element(e: &mut anicraft_doc::Element, f: Field, q: &Query, with: &With
                     t.note("a text field can't be left empty (delete it instead)".into());
                 } else {
                     // Laid out again as it is: text on a path stays on it (ADR 0070).
-                    let (block, note, shift) = crate::cmds_text::relay_static(tb, &n, &crate::cmds_text::style_of(tb))?;
+                    let (block, note, shift) = crate::cmds_text::relay_static(tb, &n)?;
                     t.note_opt(note);
                     *tb = Arc::new(block);
                     e.transform = e.transform.mul(&anicraft_geom::Affine::translate(shift.x, shift.y));
@@ -900,16 +900,23 @@ fn apply_element(e: &mut anicraft_doc::Element, f: Field, q: &Query, with: &With
             }
         }
         (Field::Font, ElementKind::Text(tb), With::Font(family)) => {
-            let style = crate::cmds_text::TextStyle { font: family.clone(), ..crate::cmds_text::style_of(tb) };
-            let (block, note, shift) = crate::cmds_text::relay_static(tb, &tb.text, &style)?;
+            let (block, note, shift) = crate::cmds_text::refont_static(tb, family)?;
             t.note_opt(note);
             *tb = Arc::new(block);
             e.transform = e.transform.mul(&anicraft_geom::Affine::translate(shift.x, shift.y));
             t.replaced += 1;
         }
         (Field::TextColor, ElementKind::Text(tb), With::Color(c)) => {
+            // Every run and colour piece takes the colour, keeping its own opacity (ADR 0085).
             let tb = Arc::make_mut(tb);
-            tb.color = Rgba { a: tb.color.a, ..*c };
+            let n = tb.char_count();
+            let runs = anicraft_doc::rich_text::restyle_runs(&tb.styled_runs(), 0, n, |st| st.color = Rgba { a: st.color.a, ..*c });
+            let paras = tb.paragraph_styles();
+            tb.set_styles(runs, paras);
+            for f in &mut tb.fills {
+                f.color = Rgba { a: f.color.a, ..*c };
+            }
+            tb.fill_cache = Default::default();
             t.replaced += 1;
         }
         (Field::Fill | Field::Stroke, ElementKind::Shape(sh), With::Color(c)) => {

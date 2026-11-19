@@ -307,14 +307,16 @@ mod tests {
     }
 
     #[test]
-    fn over_unsaved_work_new_asks_first_and_esc_goes_back() {
+    fn over_unsaved_work_new_opens_a_tab_and_esc_goes_back() {
         let (mut app, ctx) = app();
         app.run("draw.rect", json!({"x": 0, "y": 0, "w": 10, "h": 10}));
         crate::start::open(&mut app);
         app.request("file.new", new_params(1920, 1080, 24.0));
-        assert!(app.confirm.is_some(), "unsaved work asks first");
-        assert!(app.start.is_some(), "and the start screen waits for the answer");
-        app.confirm = None;
+        assert!(app.confirm.is_none(), "nothing to ask: the work stays open in its tab (ADR 0112)");
+        assert_eq!(app.tabs.len(), 2);
+        assert!(app.start.is_none());
+        assert!(crate::tabs::activate(&mut app, 0));
+        crate::start::open(&mut app);
         // Esc returns to the work, untouched.
         let input = egui::RawInput { events: vec![egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }], ..Default::default() };
         let mut out = ctx.run_ui(input, |ui| app.frame(ui));

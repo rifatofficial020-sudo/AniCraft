@@ -37,6 +37,21 @@ fn three() -> (Session, [ElementId; 3]) {
 }
 
 #[test]
+fn a_groups_registration_is_the_centre_of_what_was_grouped() {
+    let (mut s, ids) = three();
+    let before = picture(&s);
+    run(&mut s, "element.select", json!({"ids": ids.map(|i| i.0)}));
+    let center = s.selection_bounds().center();
+    run(&mut s, "modify.group", json!({}));
+    let at = top(&s)[0].transform.translation();
+    assert!(at.distance(center) < 0.5, "registration {at:?}, centre of the artwork {center:?}");
+    assert!(at.x > 1.0 && at.y > 1.0, "not the corner of the stage: {at:?}");
+    assert_eq!(picture(&s), before, "grouping changes nothing drawn");
+    run(&mut s, "modify.ungroup", json!({}));
+    assert_eq!(picture(&s), before, "ungrouping changes nothing drawn");
+}
+
+#[test]
 fn group_and_ungroup_keep_every_members_place_exactly() {
     let (mut s, ids) = three();
     let before = picture(&s);
@@ -91,14 +106,17 @@ fn a_group_opens_in_place_and_edits_there_with_every_tool() {
     let (mut s, ids) = three();
     run(&mut s, "element.select", json!({"ids": ids.map(|i| i.0)}));
     let g = id_of(&run(&mut s, "modify.group", json!({})), "group");
+    let reg = top(&s)[0].transform.translation();
     run(&mut s, "modify.transform", json!({"a": 1, "b": 0, "c": 0, "d": 1, "e": 100, "f": 50}));
+    // The translation is applied on top of the registration, which is the artwork's centre.
+    let placed = reg + Vec2::new(100.0, 50.0);
     let steps = s.history_len();
     let v = run(&mut s, "symbol.edit", json!({"id": g.0}));
     assert_eq!(v["editing"][0]["group"], json!(g.0), "{v}");
     assert!(s.editing_group() && s.editing_symbol().is_none());
     assert_eq!(s.history_len(), steps, "opening is not an edit");
     let view = s.edit_view().unwrap_or_else(|| panic!("open"));
-    assert!(view.in_place && view.origin.distance(Vec2::new(100.0, 50.0)) < 1e-4, "{view:?}");
+    assert!(view.in_place && view.origin.distance(placed) < 1e-3, "{view:?} registration {reg:?}");
     // Inside: the members, in the group's space.
     assert_eq!(top(&s).len(), 3);
     run(&mut s, "draw.rect", json!({"x": 0, "y": 0, "w": 10, "h": 10, "fill": "#123456"}));
@@ -116,9 +134,10 @@ fn a_group_opens_in_place_and_edits_there_with_every_tool() {
     let members = top(&s)[0].kind.group_members();
     assert_eq!(members.len(), 4);
     let new = members.last().cloned().unwrap_or_else(|| panic!("member"));
-    // The new rectangle sits at (100, 50) + its place inside, on the stage.
-    let b = s.element_bounds(g);
-    assert!(b.min.x <= 100.5 && b.min.y <= 50.5, "{b:?}");
+    // The 10×10 rect was drawn at the group's local origin, so its own centre is 5 px from the registration.
+    let world = top(&s)[0].transform.mul(&new.transform).translation();
+    let want = placed + Vec2::new(5.0, 5.0);
+    assert!(world.distance(want) < 1e-3, "new rect at {world:?}, want {want:?}");
     assert!(matches!(new.kind, ElementKind::Shape(_)));
     // Undo goes back inside, where the change was made.
     run(&mut s, "edit.undo", json!({}));
@@ -144,9 +163,11 @@ fn raw_shapes_in_a_group_merge_only_with_each_other() {
     assert_eq!(m.len(), 1);
     let ElementKind::Shape(sh) = &m[0].kind else { panic!("shape") };
     assert!((even_odd_area(&sh.path, &m[0].transform) - 10_000.0).abs() < 1.0);
-    // The group sits above the raw drawing, as objects do... and inside, a raw square merges.
+    // The group sits above the raw drawing, as objects do. Inside, the square occupies local
+    // −50..50 (its registration is the centre). A raw square from local (0, −50) covers stage
+    // 50..150, 0..100 and joins it.
     run(&mut s, "symbol.edit", json!({"id": g.0}));
-    run(&mut s, "draw.rect", json!({"x": 50, "y": 0, "w": 100, "h": 100, "fill": "#ff0000", "stroke": null}));
+    run(&mut s, "draw.rect", json!({"x": 0, "y": -50, "w": 100, "h": 100, "fill": "#ff0000", "stroke": null}));
     let fills = top(&s);
     assert_eq!(fills.len(), 1, "one red fill: the two squares joined");
     run(&mut s, "symbol.exit", json!({}));
@@ -242,6 +263,9 @@ fn combine_objects_areas_are_exact() {
     assert_eq!(v["created"].as_array().map(Vec::len), Some(1));
     assert!(matches!(top(&s)[0].kind, ElementKind::Group { .. }));
     assert!(near(&areas(&s), &[17_500.0]), "{:?}", areas(&s));
+    // Two squares, 0..100 and 50..150: the group's registration is the centre of that union.
+    let at = top(&s)[0].transform.translation();
+    assert!(at.distance(Vec2::new(75.0, 75.0)) < 1.0, "combine group registration {at:?}");
     // Intersect: the overlap, in the top's colour.
     let mut s = Session::new(anicraft_doc::Document::default());
     squares(&mut s);

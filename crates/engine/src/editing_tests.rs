@@ -160,6 +160,21 @@ fn an_open_button_shows_its_hit_area_over_its_other_states() {
 }
 
 #[test]
+fn a_playhead_past_the_scene_end_shows_that_scene_not_the_next_one() {
+    let mut s = Session::default();
+    // Scene 2 holds a blue square; Scene 1 stays empty with a single frame.
+    run(&mut s, "scene.new", json!({"name": "Second"}));
+    run(&mut s, "draw.rect", json!({"x": 10, "y": 10, "w": 40, "h": 40, "fill": "#0000ff", "stroke": null, "object": true}));
+    run(&mut s, "scene.select", json!({"scene": 0}));
+    assert_eq!(s.doc.scenes.len(), 2);
+    // The playhead can be moved far past Scene 1's one frame (#305).
+    s.set_frame(8);
+    let pic = s.stage_picture();
+    assert_eq!(pic.doc.locate(pic.frame), (0, 0), "the picture is Scene 1's last frame, not Scene 2's");
+    assert!(anicraft_doc::evaluate(&pic.doc, pic.frame).items.is_empty(), "Scene 2's artwork is not drawn in Scene 1");
+}
+
+#[test]
 fn the_stage_shows_the_open_symbol_in_place_over_the_dimmed_stage() {
     let (mut s, _, _) = boxed();
     // Something else on the stage, beside the instance.

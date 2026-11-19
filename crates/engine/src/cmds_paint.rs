@@ -48,7 +48,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Fill",
             "",
             None,
-            "{type?: solid|linear|radial|bitmap (default: the swatch's), color? (solid), stops?: [{offset: 0..1, color: \"#rrggbb\" | \"#rrggbbaa\"}, ..] (2 to 15), spread?: extend|reflect|repeat, linear_rgb?: bool, focal?: -0.98..0.98 (radial), bitmap?: id, selection?: bool (default true)} sets the fill swatch (what new shapes, the Paint Bucket and the Brush pour) and, unless `selection` is false, the fills of the selected shapes. A shape keeping its kind of fill keeps where its gradient or bitmap lies; one changing kind gets it fitted to its bounds. A new gradient starts white to black → {fill: {type, ..}, changed}",
+            "{type?: solid|linear|radial|bitmap (default: the swatch's), color? (solid, \"#rrggbb\" or \"#rrggbbaa\"), stops?: [{offset: 0..1, color: \"#rrggbb\" | \"#rrggbbaa\"}, ..] (2 to 15; each stop has its own alpha), spread?: extend|reflect|repeat, linear_rgb?: bool, focal?: -0.98..0.98 (radial), bitmap?: id, selection?: bool (default true)} sets the fill swatch (what new shapes, the Paint Bucket and the Brush pour) and, unless `selection` is false, the fills of the selected shapes. A shape keeping its kind of fill keeps where its gradient or bitmap lies; one changing kind gets it fitted to its bounds. A new gradient starts white to black → {fill: {type, ..}, changed}",
             true,
             set_fill,
         ),
@@ -155,6 +155,23 @@ fn bucket(s: &mut Session, p: &Value) -> Result<Value> {
     // Under everything on the layer, so the lines that bound it stay on top.
     kf.elements.insert(0, Arc::new(el));
     Ok(json!({"element": id.0}))
+}
+
+/// Fills the empty area around `at` that the raw lines and fills of the active layer close off
+/// with `paint`, as the Paint Bucket does (behind the lines, joining fills of its colour).
+/// `false`: nothing closes it off.
+pub(crate) fn fill_enclosed(s: &mut Session, at: Vec2, paint: Paint) -> Result<bool> {
+    let Some(path) = crate::merge::enclosed_area(&s.visible_elements(), at) else { return Ok(false) };
+    let c = path.bounds().center();
+    let el = Element {
+        id: ElementId(s.doc.alloc_id()),
+        name: String::new(),
+        transform: Affine::translate(c.x, c.y),
+        color: ColorEffect::default(),
+        kind: ElementKind::Shape(Shape { fill: Some(paint), path: Arc::new(path.transformed(&Affine::translate(-c.x, -c.y))), stroke: None, fill_rule: FillRule::EvenOdd, merge: true, warp: None }),
+    };
+    crate::merge::merge_in_order(s, vec![el], crate::merge::Order::Behind)?;
+    Ok(true)
 }
 
 /// Grid over stage space: origin and cell size.

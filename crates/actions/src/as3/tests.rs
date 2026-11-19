@@ -173,6 +173,14 @@ fn expressions_follow_ecmascript() {
 }
 
 #[test]
+fn math_round_preserves_negative_zero() {
+    for value in [-0.5, -0.4, -0.0] {
+        assert_eq!(run::round(value).to_bits(), (-0.0f64).to_bits(), "{value}");
+    }
+    assert_eq!(lines("trace(1 / Math.round(-0.5), 1 / Math.round(-0.4));"), ["-Infinity -Infinity"]);
+}
+
+#[test]
 fn if_else_and_loops_run_with_break_and_continue() {
     let a = lines(
         "var total:int = 0;\n\
@@ -550,4 +558,11 @@ fn scripts_set_append_and_read_text_fields() {
     assert!(err("stage.text = 'x';").2.contains("text field") || err("stage.text = 'x';").2.contains("stage"));
     assert!(err("a_txt.appendText();").2.contains("one argument"));
     assert!(err("a_txt.length = 3;").2.contains("can only be read"));
+}
+
+#[test]
+fn surrogate_pair_escapes() {
+    assert_eq!(lines(r#"trace("\uD83D\uDE00");"#), vec!["😀".to_string()]);
+    assert_eq!(lines(r#"trace("é\uD83D\uDE00");"#), vec!["é😀".to_string()]);
+    assert_eq!(lines(r#"trace("\uD83Dx\uDE00");"#), vec!["\u{FFFD}x\u{FFFD}".to_string()]);
 }

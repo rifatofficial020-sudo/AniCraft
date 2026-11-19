@@ -531,6 +531,7 @@ fn filter_setup(dl: &DisplayList, run: &FilteredRun, view: &View, surface: IRect
         clip_parents: dl.clip_parents.iter().map(|p| p.filter(|c| inner.contains(c))).collect(),
         clip_modes: dl.clip_modes.clone(),
         groups,
+        links: Vec::new(),
     };
     let sub_view = View { transform: Affine::translate(-b.x0 as f32, -b.y0 as f32).mul(&view.transform), width: b.width() as u32, height: b.height() as u32, background: None };
     let filters = group.filters.iter().map(|f| filters::resolve(f, scale)).collect();
@@ -951,6 +952,9 @@ fn composite(cov: &Coverage, op: &Prepared, b: IRect, band_y0: i32, w: usize, ro
 mod nine_slice_tests;
 
 #[cfg(test)]
+mod layer_opacity_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use anicraft_doc::{ElementId, LayerId, sample};
@@ -979,7 +983,7 @@ mod tests {
     }
 
     fn list(items: Vec<DisplayItem>) -> DisplayList {
-        DisplayList { clip_modes: Vec::new(), items, clip_parents: Vec::new(), groups: Vec::new() }
+        DisplayList { links: Vec::new(), clip_modes: Vec::new(), items, clip_parents: Vec::new(), groups: Vec::new() }
     }
 
     /// A 40 × 40 opaque blue square masked by `art` in `mode`, on transparent.
@@ -1074,7 +1078,7 @@ mod tests {
         let mut mask = item(Path::ellipse(20.0, 20.0, 10.0, 10.0), Paint::Solid(Rgba::new(1.0, 0.0, 0.0, 0.2)));
         mask.masks = Some(0);
         mask.stroke = Some(anicraft_doc::Stroke::new(Rgba::BLACK, 8.0));
-        let dl = DisplayList { clip_modes: Vec::new(), items: vec![square, mask], clip_parents: vec![None], groups: Vec::new() };
+        let dl = DisplayList { links: Vec::new(), clip_modes: Vec::new(), items: vec![square, mask], clip_parents: vec![None], groups: Vec::new() };
         let (pm, _) = render(&dl, &view(40, 40)).unwrap();
         // Pixel for pixel, the same as the circle drawn in the square's colour.
         let circle = item(Path::ellipse(20.0, 20.0, 10.0, 10.0), Paint::Solid(Rgba::new(0.0, 0.0, 1.0, 1.0)));
@@ -1142,7 +1146,7 @@ mod tests {
         let mut blue = item(Path::rect(4.0, 0.0, 8.0, 4.0), Paint::Solid(Rgba::new(0.0, 0.0, 1.0, 1.0)));
         red.group = Some(0);
         blue.group = Some(0);
-        let grouped = DisplayList { clip_modes: Vec::new(), items: vec![red.clone(), blue.clone()], clip_parents: vec![], groups: vec![anicraft_doc::Group { parent: None, alpha: 0.5, blend: Default::default(), filters: Default::default(), clip: None }] };
+        let grouped = DisplayList { links: Vec::new(), clip_modes: Vec::new(), items: vec![red.clone(), blue.clone()], clip_parents: vec![], groups: vec![anicraft_doc::Group { parent: None, alpha: 0.5, blend: Default::default(), filters: Default::default(), clip: None }] };
         let (pm, _) = render(&grouped, &white).unwrap();
         let near = |p: Premul, q: [f32; 4]| p.iter().zip(q).all(|(a, b)| (a - b).abs() < 1e-4);
         // In the overlap only the top square shows through: half blue, half white, no red.
@@ -1158,7 +1162,7 @@ mod tests {
         // Nested groups multiply; a group with a bad parent link is a top-level group.
         let mut inner = item(Path::rect(0.0, 0.0, 12.0, 4.0), Paint::Solid(Rgba::BLACK));
         inner.group = Some(1);
-        let nested = DisplayList {
+        let nested = DisplayList { links: Vec::new(),
             clip_modes: Vec::new(),
             items: vec![inner],
             clip_parents: vec![],
@@ -1173,7 +1177,7 @@ mod tests {
         // Spanning several render bands changes nothing.
         let mut tall = item(Path::rect(0.0, 0.0, 4.0, 100.0), Paint::Solid(Rgba::BLACK));
         tall.group = Some(0);
-        let (t, _) = render(&DisplayList { clip_modes: Vec::new(), items: vec![tall], clip_parents: vec![], groups: vec![anicraft_doc::Group { parent: None, alpha: 0.25, blend: Default::default(), filters: Default::default(), clip: None }] }, &View { background: Some(Rgba::WHITE), ..view(4, 100) }).unwrap();
+        let (t, _) = render(&DisplayList { links: Vec::new(), clip_modes: Vec::new(), items: vec![tall], clip_parents: vec![], groups: vec![anicraft_doc::Group { parent: None, alpha: 0.25, blend: Default::default(), filters: Default::default(), clip: None }] }, &View { background: Some(Rgba::WHITE), ..view(4, 100) }).unwrap();
         assert!((0..100).all(|y| near(t.pixel(1, y).unwrap(), [0.75, 0.75, 0.75, 1.0])));
     }
 
@@ -1203,7 +1207,7 @@ mod tests {
         inner.masks = Some(1);
         let mut lost = clipped.clone();
         lost.clip = Some(2);
-        let dl = DisplayList { clip_modes: Vec::new(), items: vec![clipped, outer, inner, lost], clip_parents: vec![None, Some(0), Some(9)], groups: Vec::new() };
+        let dl = DisplayList { links: Vec::new(), clip_modes: Vec::new(), items: vec![clipped, outer, inner, lost], clip_parents: vec![None, Some(0), Some(9)], groups: Vec::new() };
         let (scene, st) = prepare_scene(&dl, &view(16, 16)).unwrap();
         let (_, rst) = render(&dl, &view(16, 16)).unwrap();
         assert_eq!((st.drawn, st.edges, st.pixels_touched), (rst.drawn, rst.edges, rst.pixels_touched));
@@ -1216,7 +1220,7 @@ mod tests {
         let mut grouped = sq.clone();
         grouped.group = Some(1);
         let g = |parent, alpha| anicraft_doc::Group { parent, alpha, blend: BlendMode::Multiply, filters: Default::default(), clip: None };
-        let dl = DisplayList { clip_modes: Vec::new(), items: vec![grouped], clip_parents: vec![], groups: vec![g(None, 2.0), g(Some(0), f32::NAN)] };
+        let dl = DisplayList { links: Vec::new(), clip_modes: Vec::new(), items: vec![grouped], clip_parents: vec![], groups: vec![g(None, 2.0), g(Some(0), f32::NAN)] };
         let (scene, _) = prepare_scene(&dl, &view(16, 16)).unwrap();
         assert!(scene.fills.iter().all(|f| f.group == Some(1)));
         assert_eq!((scene.groups[1].chain.clone(), scene.groups[0].alpha, scene.groups[1].alpha, scene.groups[1].blend), (vec![0, 1], 1.0, 1.0, BlendMode::Multiply));
@@ -1258,7 +1262,7 @@ mod tests {
         let mut clipped = item(Path::rect(0.0, 0.0, 8.0, 8.0), Paint::Solid(Rgba::BLACK));
         clipped.clip = Some(0);
         let free = item(Path::rect(0.0, 0.0, 2.0, 2.0), Paint::Solid(Rgba::BLACK));
-        let (pm, st) = render(&DisplayList { clip_modes: Vec::new(), items: vec![clipped, free.clone()], clip_parents: vec![None], groups: Vec::new() }, &view(8, 8)).unwrap();
+        let (pm, st) = render(&DisplayList { links: Vec::new(), clip_modes: Vec::new(), items: vec![clipped, free.clone()], clip_parents: vec![None], groups: Vec::new() }, &view(8, 8)).unwrap();
         assert_eq!(st.drawn, 1);
         assert_eq!(pm, render(&list(vec![free]), &view(8, 8)).unwrap().0);
     }
@@ -1273,11 +1277,11 @@ mod tests {
         inner.masks = Some(1);
         let items = vec![fill, outer, inner];
         // Clip 1 lies inside clip 0: a 32 × 32 square across two render bands survives.
-        let (pm, _) = render(&DisplayList { clip_modes: Vec::new(), items: items.clone(), clip_parents: vec![None, Some(0)], groups: Vec::new() }, &view(64, 64)).unwrap();
+        let (pm, _) = render(&DisplayList { links: Vec::new(), clip_modes: Vec::new(), items: items.clone(), clip_parents: vec![None, Some(0)], groups: Vec::new() }, &view(64, 64)).unwrap();
         assert!((alpha_sum(&pm) - 32.0 * 32.0).abs() < 1e-2, "{}", alpha_sum(&pm));
         // A parent link pointing forward (malformed) or out of range masks everything out.
         for parents in [vec![Some(1), Some(1)], vec![None, Some(9)]] {
-            let (pm, _) = render(&DisplayList { clip_modes: Vec::new(), items: items.clone(), clip_parents: parents, groups: Vec::new() }, &view(64, 64)).unwrap();
+            let (pm, _) = render(&DisplayList { links: Vec::new(), clip_modes: Vec::new(), items: items.clone(), clip_parents: parents, groups: Vec::new() }, &view(64, 64)).unwrap();
             assert_eq!(alpha_sum(&pm), 0.0);
         }
     }
@@ -1499,7 +1503,7 @@ mod tests {
         let bg = item(Path::rect(0.0, 0.0, 20.0, 10.0), Paint::Solid(Rgba::new(0.5, 0.5, 1.0, 1.0)));
         let mut top = item(Path::rect(0.0, 0.0, 10.0, 10.0), Paint::Solid(Rgba::new(1.0, 0.0, 0.0, 1.0)));
         top.group = Some(0);
-        let dl = DisplayList { clip_modes: Vec::new(), items: vec![bg, top], clip_parents: vec![], groups: vec![anicraft_doc::Group { parent: None, alpha: 1.0, blend: BlendMode::Multiply, filters: Default::default(), clip: None }] };
+        let dl = DisplayList { links: Vec::new(), clip_modes: Vec::new(), items: vec![bg, top], clip_parents: vec![], groups: vec![anicraft_doc::Group { parent: None, alpha: 1.0, blend: BlendMode::Multiply, filters: Default::default(), clip: None }] };
         let (pm, _) = render(&dl, &View { background: Some(Rgba::WHITE), ..view(20, 10) }).unwrap();
         let p = pm.pixel(5, 5).unwrap();
         assert!((p[0] - 0.5).abs() < 1e-3 && p[1].abs() < 1e-3 && p[2].abs() < 1e-3, "red × lavender: {p:?}");

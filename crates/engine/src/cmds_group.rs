@@ -12,7 +12,7 @@ use crate::params::*;
 use crate::{CommandSpec, EngineError, Result, Session};
 use anicraft_doc::{ColorEffect, Element, ElementId, ElementKind, LayerId, MAX_GROUP_DEPTH, Shape};
 use anicraft_geom::planar::{self, Item};
-use anicraft_geom::{Affine, FillRule, Path};
+use anicraft_geom::{Affine, FillRule, Path, Rect, Vec2};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -25,7 +25,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Group",
             "Modify",
             Some("Ctrl+G"),
-            "{} puts the selected elements on each layer into one group there (ADR 0073), where the topmost of them was, and selects it → {group, members} (one layer) or {layers: [..]}. Members keep their places exactly: the group's transform starts as the identity. Raw shapes inside merge only with each other; double-click the group (symbol.edit) to edit it in place",
+            "{} puts the selected elements on each layer into one group there (ADR 0073), where the topmost of them was, and selects it → {group, members} (one layer) or {layers: [..]}. Members keep their places exactly. The group's registration point is the centre of what was grouped, and members are stored relative to it. Raw shapes inside merge only with each other; double-click the group (symbol.edit) to edit it in place",
             true,
             (|s, p| s.each_layer(true, |s| group(s, p))) as crate::RunFn,
         ),
@@ -75,6 +75,31 @@ pub(crate) fn open_groups(s: &Session) -> usize {
     s.editing.iter().rev().take_while(|l| l.open.is_group()).count()
 }
 
+/// Centre of `members` in this timeline's space. Empty or non-finite bounds stay at the origin.
+fn members_center(doc: &anicraft_doc::Document, members: &[Arc<Element>]) -> Vec2 {
+    let mut r = Rect::EMPTY;
+    for e in members {
+        r = r.union(&e.bounds(doc));
+    }
+    let c = r.center();
+    if r.is_empty() || !c.is_finite() { Vec2::ZERO } else { c }
+}
+
+/// Group transform at `center`, with `members` stored relative to it. The group's transform
+/// times each member's is that member's old transform, so nothing moves.
+fn recenter(center: Vec2, members: Vec<Arc<Element>>) -> (Affine, Vec<Arc<Element>>) {
+    let to_local = Affine::translate(-center.x, -center.y);
+    let members = members
+        .into_iter()
+        .map(|e| {
+            let mut e = Arc::unwrap_or_clone(e);
+            e.transform = to_local.mul(&e.transform);
+            Arc::new(e)
+        })
+        .collect();
+    (Affine::translate(center.x, center.y), members)
+}
+
 fn group(s: &mut Session, _: &Value) -> Result<Value> {
     let sel = s.selection.on(s.layer);
     if sel.is_empty() {
@@ -83,8 +108,10 @@ fn group(s: &mut Session, _: &Value) -> Result<Value> {
     let layer_id = LayerId(s.doc.alloc_id());
     let id = ElementId(s.doc.alloc_id());
     let around = open_groups(s);
-    let kf = s.editable_keyframe()?;
-    let picked: Vec<Arc<Element>> = kf.elements.iter().filter(|e| sel.contains(&e.id)).cloned().collect();
+    let picked: Vec<Arc<Element>> = {
+        let kf = s.editable_keyframe()?;
+        kf.elements.iter().filter(|e| sel.contains(&e.id)).cloned().collect()
+    };
     if picked.is_empty() {
         return Err(EngineError::State("the selection is not on this keyframe".into()));
     }
@@ -95,12 +122,16 @@ fn group(s: &mut Session, _: &Value) -> Result<Value> {
     if around + deepest + 1 > MAX_GROUP_DEPTH {
         return Err(EngineError::State(format!("groups nest at most {MAX_GROUP_DEPTH} deep")));
     }
+    // Registration at the centre of this layer's members. Their transforms are relative to it.
+    let center = members_center(&s.doc, &picked);
+    let (transform, picked) = recenter(center, picked);
+    let n = picked.len();
+    let kf = s.editable_keyframe()?;
     // Where the topmost member was, among what stays.
     let top = kf.elements.iter().rposition(|e| sel.contains(&e.id)).unwrap_or(0);
     let below = kf.elements.iter().take(top).filter(|e| !sel.contains(&e.id)).count();
     kf.elements.retain(|e| !sel.contains(&e.id));
-    let n = picked.len();
-    let g = Element { id, name: String::new(), transform: Affine::IDENTITY, color: ColorEffect::None, kind: ElementKind::group(layer_id, picked) };
+    let g = Element { id, name: String::new(), transform, color: ColorEffect::None, kind: ElementKind::group(layer_id, picked) };
     let at = below.min(kf.elements.len());
     kf.elements.insert(at, Arc::new(g));
     s.select_only([id]);
@@ -259,7 +290,9 @@ fn result_of(s: &mut Session, pieces: Vec<Arc<Element>>) -> Option<Element> {
                 return Some(object(&mut s.doc, &joined(outline.iter()), Some(fill), None, color));
             }
             let layer = LayerId(s.doc.alloc_id());
-            Some(Element { id: ElementId(s.doc.alloc_id()), name: String::new(), transform: Affine::IDENTITY, color: ColorEffect::None, kind: ElementKind::group(layer, pieces) })
+            let center = members_center(&s.doc, &pieces);
+            let (transform, pieces) = recenter(center, pieces);
+            Some(Element { id: ElementId(s.doc.alloc_id()), name: String::new(), transform, color: ColorEffect::None, kind: ElementKind::group(layer, pieces) })
         }
     }
 }

@@ -132,10 +132,9 @@ pub fn sprung_pose(layer: &Layer, frame: u32, fps: f32) -> Option<Pose> {
 /// by `pose`, each sprung bone swung by its spring, which is advanced `dt` seconds with the
 /// frame's motion counting `weight` (0: the frame only records the motion).
 fn step(arm: &Armature, mut world: HashMap<ElementId, Affine>, pose: &Pose, swings: &mut [Swing], dt: f32, weight: f32) {
-    let nodes = arm.skin.is_some();
     for (b, sw) in arm.bones.iter().zip(swings.iter_mut()) {
         let Some(wp) = world.get(&b.parent).copied() else { continue };
-        if !nodes && !world.contains_key(&b.child) {
+        if b.shape.is_none() && !world.contains_key(&b.child) {
             continue;
         }
         let (key, slide) = (b.allow(pose.angle(b.id)), b.allow_slide(pose.slide(b.id)));

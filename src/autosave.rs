@@ -23,11 +23,12 @@ use anicraft_engine::StateId;
 use serde_json::json;
 use std::path::PathBuf;
 
-/// Autosave state of the running app.
+/// One open document's autosave (ADR 0112): each document is its own recovery session, with
+/// its own copy in the recovery folder, so a crash leaves one copy per document with unsaved
+/// changes. It goes with its document when another tab is shown.
 #[derive(Default)]
-pub struct Recovery {
+pub struct DocSaver {
     saver: Option<Autosaver>,
-    pub dir: Option<PathBuf>,
     /// Document state the newest copy holds (handed to the writer, or restored from disk).
     written: Option<StateId>,
     /// This session has a copy on disk (or one on its way).
@@ -41,6 +42,17 @@ pub struct Recovery {
     /// A restored copy of another session, removed once this session holds the work.
     adopt: Option<String>,
     failed: bool,
+}
+
+/// Autosave state of the running app.
+#[derive(Default)]
+pub struct Recovery {
+    /// The document being edited's autosave; the other open documents' are with them
+    /// (`tabs::Parked`).
+    pub doc: DocSaver,
+    pub dir: Option<PathBuf>,
+    /// Autosave runs (a recovery folder, and not a screenshot run): new documents get a saver.
+    on: bool,
     /// Copies left by sessions that didn't close cleanly, and whether the window shows them.
     pub found: Vec<Entry>,
     pub show: bool,
@@ -68,7 +80,8 @@ impl Recovery {
             let _ = shot_mode;
             match Autosaver::start() {
                 Ok(s) => {
-                    r.saver = Some(s);
+                    r.doc.saver = Some(s);
+                    r.on = true;
                     r.scanning = Some(false);
                     (r, None)
                 }
@@ -86,7 +99,8 @@ impl Recovery {
             r.show = !r.found.is_empty();
             let err = match SessionLock::acquire(&dir).and_then(Autosaver::start) {
                 Ok(s) => {
-                    r.saver = Some(s);
+                    r.doc.saver = Some(s);
+                    r.on = true;
                     None
                 }
                 Err(e) => Some(tr!("Autosave is off: {error}", error = e)),
@@ -97,14 +111,36 @@ impl Recovery {
     }
 
     pub fn active(&self) -> bool {
-        self.saver.is_some()
+        self.doc.saver.is_some()
+    }
+
+    /// The autosave of a document being opened in a new tab (ADR 0112): its own recovery
+    /// session. Without one (autosave is off here, or the folder can't be written) the document
+    /// opens all the same.
+    pub fn for_new_document(&self) -> DocSaver {
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let mut d = DocSaver::default();
+        if !self.on {
+            return d;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            d.saver = Autosaver::start().ok();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(dir) = &self.dir {
+            d.saver = SessionLock::acquire(dir).and_then(Autosaver::start).ok();
+        }
+        d
     }
 
     /// Rescans for left-behind copies (File › Recover Autosaved Documents…). `false` when the
     /// list comes later (a browser asks which tabs are open), and [`tick`] shows it then.
-    pub fn rescan(&mut self) -> bool {
+    /// `own`: the recovery sessions of the documents open here, which are not left behind.
+    pub fn rescan(&mut self, own: &[String]) -> bool {
         #[cfg(target_arch = "wasm32")]
         {
+            let _ = own;
             crate::web::refresh_live();
             self.scanning = Some(true);
             false
@@ -112,8 +148,8 @@ impl Recovery {
         #[cfg(not(target_arch = "wasm32"))]
         {
             if let Some(dir) = &self.dir {
-                let own = self.saver.as_ref().map(|s| s.id().to_string());
-                self.found = recovery::scan(dir, own.as_deref());
+                self.found = recovery::scan(dir, own.first().map(String::as_str));
+                self.found.retain(|e| !own.contains(&e.session));
             }
             true
         }
@@ -124,15 +160,22 @@ impl Recovery {
     pub fn restored(&mut self, session: &str) {
         self.found.retain(|e| e.session != session);
         self.show = self.show && !self.found.is_empty();
-        self.adopt = Some(session.to_string());
-        self.written = None;
-        self.dirty_since = Some(f64::NEG_INFINITY);
+        self.doc.adopt = Some(session.to_string());
+        self.doc.written = None;
+        self.doc.dirty_since = Some(f64::NEG_INFINITY);
     }
 
     pub fn discarded(&mut self, session: &str) {
         self.found.retain(|e| e.session != session);
         self.confirm_discard = None;
         self.show = self.show && !self.found.is_empty();
+    }
+}
+
+impl DocSaver {
+    /// This document's recovery session, while it has one.
+    pub fn id(&self) -> Option<String> {
+        self.saver.as_ref().map(|s| s.id().to_string())
     }
 
     /// Writes a copy of unsaved work now, without waiting for the interval (the graphics driver
@@ -151,8 +194,9 @@ impl Recovery {
         true
     }
 
-    /// Ends the session: a clean exit removes this session's copy; anything else (unsaved work
-    /// the user didn't decide about) is written one last time for the next start.
+    /// Ends the document's session: a clean end (saved, closed, or the user chose Don't Save)
+    /// removes its copy; anything else (unsaved work the user didn't decide about) is written
+    /// one last time for the next start.
     pub fn finish(&mut self, s: &anicraft_engine::Session, clean: bool) {
         if let Some(saver) = self.saver.take() {
             let keep = !clean && s.is_dirty();
@@ -179,8 +223,9 @@ fn drop_adopted(app: &mut App, old: &str) {
 #[cfg(target_arch = "wasm32")]
 fn poll_scan(app: &mut App) {
     let Some(asked) = app.recovery.scanning else { return };
-    let own = app.recovery.saver.as_ref().map(|s| s.id().to_string());
-    let Some(found) = crate::web::scan(own.as_deref()) else { return };
+    let own = crate::tabs::recovery_sessions(app);
+    let Some(mut found) = crate::web::scan(own.first().map(String::as_str)) else { return };
+    found.retain(|e| !own.contains(&e.session));
     let r = &mut app.recovery;
     r.scanning = None;
     r.found = found;
@@ -248,28 +293,28 @@ pub fn tick(app: &mut App, ctx: &egui::Context) {
     #[cfg(target_arch = "wasm32")]
     poll_scan(app);
     let now = ctx.input(|i| i.time);
-    let outcomes = app.recovery.saver.as_ref().map(Autosaver::poll).unwrap_or_default();
+    let outcomes = app.recovery.doc.saver.as_ref().map(Autosaver::poll).unwrap_or_default();
     for o in outcomes {
         match o {
             Outcome::Written { .. } => {
-                app.recovery.last_copy_at = Some(now);
-                app.recovery.failed = false;
-                if let Some(old) = app.recovery.adopt.take() {
+                app.recovery.doc.last_copy_at = Some(now);
+                app.recovery.doc.failed = false;
+                if let Some(old) = app.recovery.doc.adopt.take() {
                     drop_adopted(app, &old);
                 }
             }
             Outcome::Failed { error, .. } => {
-                if !app.recovery.failed {
+                if !app.recovery.doc.failed {
                     app.status_err(tr!("Autosave failed: {error}. Save your work to be safe; AniCraft will keep trying.", error = error));
                 }
-                app.recovery.failed = true;
-                app.recovery.written = None;
-                app.recovery.dirty_since = Some(now);
+                app.recovery.doc.failed = true;
+                app.recovery.doc.written = None;
+                app.recovery.doc.dirty_since = Some(now);
             }
             Outcome::Cleared { .. } => {}
         }
     }
-    let r = &mut app.recovery;
+    let r = &mut app.recovery.doc;
     let Some(saver) = &mut r.saver else { return };
     if !app.prefs.autosave || !app.s.is_dirty() {
         // Nothing to protect (saved, back at the saved state, a new document) or autosave off.
@@ -320,7 +365,7 @@ pub fn status(app: &App, now: f64) -> Option<String> {
     if !app.s.is_dirty() || !app.prefs.autosave {
         return None;
     }
-    let at = app.recovery.last_copy_at?;
+    let at = app.recovery.doc.last_copy_at?;
     Some(tr!("autosaved {when}", when = ago((now - at).max(0.0) as u64)))
 }
 
@@ -360,7 +405,7 @@ pub fn window(app: &mut App, ctx: &egui::Context) {
     let confirm = app.recovery.confirm_discard.clone();
     let btn = egui::vec2(96.0, crate::theme::TARGET + 4.0);
     let title = tr!("Recover unsaved work");
-    let shown = egui::Window::new(title)
+    let shown = crate::windows::new(ctx, title)
         .id(egui::Id::new("recover_window"))
         .open(&mut open)
         .collapsible(false)

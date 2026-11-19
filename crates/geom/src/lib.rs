@@ -10,7 +10,9 @@ pub mod clip;
 pub mod edit;
 pub mod envelope;
 pub mod morph;
+pub mod outline;
 pub mod planar;
+pub mod polygons;
 pub mod pressure;
 pub mod raw;
 pub mod slice;
@@ -169,9 +171,51 @@ pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
+/// Geometric interpolation of scalars: `a · (b / a)^t`, the straight line between them on a
+/// logarithmic scale, so equal steps of `t` multiply by equal factors. Two scale axes moved
+/// this way keep the product of their ends on the way (ADR 0115). It needs both ends on the
+/// same side of zero; ends that differ in sign, a zero end or anything not finite fall back
+/// to [`lerp`]. Exactly `a` at 0 and `b` at 1; outside 0..=1 it goes on in the same ratio and
+/// never crosses zero.
+pub fn lerp_geometric(a: f32, b: f32, t: f32) -> f32 {
+    if t == 0.0 {
+        return a;
+    }
+    if t == 1.0 {
+        return b;
+    }
+    if a.is_finite() && b.is_finite() && t.is_finite() && a * b > 0.0 {
+        let v = a * (b / a).powf(t);
+        if v.is_finite() {
+            return v;
+        }
+    }
+    lerp(a, b, t)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn geometric_lerp_keeps_the_product_of_two_axes() {
+        // 100 % x 100 % to 200 % x 50 %: the halfway frame is about 141 % x 71 %.
+        let (x, y) = (lerp_geometric(1.0, 2.0, 0.5), lerp_geometric(1.0, 0.5, 0.5));
+        assert!((x - std::f32::consts::SQRT_2).abs() < 1e-6 && (y - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6, "{x} {y}");
+        for i in -10..=20 {
+            let t = i as f32 / 10.0;
+            let p = lerp_geometric(3.0, 0.75, t) * lerp_geometric(0.5, 2.0, t);
+            assert!((p - 1.5).abs() < 1e-5, "t {t}: {p}");
+        }
+        // The ends exactly; a flipped axis keeps its sign.
+        assert_eq!((lerp_geometric(3.0, 7.0, 0.0), lerp_geometric(3.0, 7.0, 1.0)), (3.0, 7.0));
+        assert!((lerp_geometric(-1.0, -4.0, 0.5) + 2.0).abs() < 1e-6);
+        // Through zero, from zero, or not finite: the straight line.
+        assert_eq!(lerp_geometric(-1.0, 1.0, 0.25), lerp(-1.0, 1.0, 0.25));
+        assert_eq!(lerp_geometric(0.0, 2.0, 0.5), 1.0);
+        assert!(lerp_geometric(1.0, f32::INFINITY, 0.5).is_infinite());
+        assert!(lerp_geometric(1e-30, 1e30, 5.0).is_finite());
+    }
 
     #[test]
     fn flat_rects_transform_and_empty_ones_stay_empty() {

@@ -507,9 +507,14 @@ pub fn fresh_ids(tl: &Timeline, alloc: &mut dyn FnMut() -> u64) -> Timeline {
             l.id = layers.get(&l.id).copied().unwrap_or(l.id);
             l.parent = l.parent.map(|p| layers.get(&p).copied().unwrap_or(p));
             if let Some(a) = &mut l.armature {
-                for b in &mut Arc::make_mut(a).bones {
+                let a = Arc::make_mut(a);
+                for b in &mut a.bones {
                     b.parent = el(b.parent);
                     b.child = el(b.child);
+                    b.shape = b.shape.map(el);
+                }
+                for k in &mut a.skins {
+                    k.shape = el(k.shape);
                 }
             }
             for k in &mut l.keyframes {

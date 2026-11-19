@@ -14,7 +14,7 @@ fn inst(id: u64, symbol: u64, name: &str, x: f32, y: f32, events: Vec<EventHandl
         name: name.into(),
         transform: Affine::translate(x, y),
         color: ColorEffect::default(),
-        kind: ElementKind::Symbol { symbol: SymbolId(symbol), loop_mode: Default::default(), first_frame: 0, blend: Default::default(), filters: Vec::new(), events },
+        kind: ElementKind::Symbol { symbol: SymbolId(symbol), loop_mode: Default::default(), first_frame: 0, blend: Default::default(), filters: Vec::new(), events, pivot: None },
     })
 }
 
@@ -722,7 +722,7 @@ impl ScriptHost for Mono {
 }
 
 fn field(id: u64, name: &str, text: &str, kind: TextKind, x: f32, y: f32) -> Arc<Element> {
-    let block = TextBlock { text: text.into(), font: "Mono".into(), size: 10.0, bold: false, italic: false, color: Rgba::BLACK, align: crate::TextAlign::Left, letter_spacing: 0.0, line_spacing: 0.0, width: None, outline: Arc::new(Path::rect(2.0, 2.0, 8.0, 8.0)), box_width: 104.0, box_height: 14.0, field: Some(TextField { border: true, ..TextField::new(kind) }), on_path: None };
+    let block = TextBlock { text: text.into(), font: "Mono".into(), size: 10.0, bold: false, italic: false, color: Rgba::BLACK, align: crate::TextAlign::Left, letter_spacing: 0.0, line_spacing: 0.0, width: None, outline: Arc::new(Path::rect(2.0, 2.0, 8.0, 8.0)), box_width: 104.0, box_height: 14.0, field: Some(TextField { border: true, ..TextField::new(kind) }), on_path: None, ..Default::default() };
     Arc::new(Element { id: ElementId(id), name: name.into(), transform: Affine::translate(x, y), color: ColorEffect::default(), kind: ElementKind::Text(Arc::new(block)) })
 }
 

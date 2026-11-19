@@ -32,6 +32,15 @@ pub fn specs() -> Vec<CommandSpec> {
         c("layer.set_color", "Layer Colour", "", None, "{color: \"#rrggbb\", layer?} the layer's colour: its outlines in outline mode and its bar on the timeline", true, set_color),
         c("layer.set_height", "Layer Height", "", None, "{height: 100 | 200 | 300 (percent of a normal row), layer?} the layer's row height on the timeline", true, set_height),
         c(
+            "layer.set_opacity",
+            "Layer Opacity",
+            "",
+            None,
+            "{opacity: 0..100 (percent), layer?} how strongly the layer shows, in the movie and every export: its artwork is drawn together and then faded, so its overlapping parts don't show through each other. A folder's opacity fades the layers in it; mask and guide artwork ignore it (ADR 0111) → {layer, opacity}",
+            true,
+            set_opacity,
+        ),
+        c(
             "layer.set_mask",
             "Mask Type",
             "",
@@ -45,11 +54,11 @@ pub fn specs() -> Vec<CommandSpec> {
             "Layer Properties",
             "Modify/Timeline",
             None,
-            "{layer?, name?, type?: normal|mask|masked|guide|guided, mask?: coverage|alpha|luminance (a mask layer's mask type), color?, outline?: bool (view as outlines), height?: 100|200|300, visible?, locked?, onion?} sets several at once, as one undo step; answers with the layer's properties",
+            "{layer?, name?, type?: normal|mask|masked|guide|guided, mask?: coverage|alpha|luminance (a mask layer's mask type), color?, outline?: bool (view as outlines), height?: 100|200|300, opacity?: 0..100 (percent), visible?, locked?, onion?} sets several at once, as one undo step; answers with the layer's properties",
             true,
             set_properties,
         ),
-        c("layer.properties", "Get Layer Properties", "", None, "{layer?} the layer's name, type, mask type (mask layers), colour, outline, height (percent), visible, locked and onion", false, |s, p| properties(s, layer_id(s, p)?)),
+        c("layer.properties", "Get Layer Properties", "", None, "{layer?} the layer's name, type, mask type (mask layers), colour, outline, height (percent), opacity (percent), visible, locked and onion", false, |s, p| properties(s, layer_id(s, p)?)),
     ]
 }
 
@@ -112,6 +121,28 @@ fn set_height(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"height": u32::from(l.height()) * 100}))
 }
 
+/// `opacity` in percent (0 to 100) as a fraction.
+fn opacity_param(p: &Value) -> Result<Option<f32>> {
+    match opt_f32(p, "opacity")? {
+        None => Ok(None),
+        Some(o) if o.is_finite() && (0.0..=100.0).contains(&o) => Ok(Some(o / 100.0)),
+        Some(_) => Err(EngineError::Param("param 'opacity' must be between 0 and 100 (percent)".into())),
+    }
+}
+
+/// A layer's opacity in percent, as commands answer it (rounded to a hundredth of a percent).
+fn opacity_percent(l: &Layer) -> f64 {
+    (f64::from(l.shown_opacity()) * 10_000.0).round() / 100.0
+}
+
+fn set_opacity(s: &mut Session, p: &Value) -> Result<Value> {
+    let opacity = opacity_param(p)?.ok_or_else(|| EngineError::Param("param 'opacity' (0 to 100, percent) is required".into()))?;
+    let id = layer_id(s, p)?;
+    let l = s.layer_mut(Some(id))?;
+    l.opacity = opacity;
+    Ok(json!({"layer": id.0, "opacity": opacity_percent(l)}))
+}
+
 /// `mask`: a mask type's key.
 fn mask_param(p: &Value) -> Result<Option<MaskMode>> {
     opt_str(p, "mask")?.map(|k| MaskMode::from_key(k).ok_or_else(|| EngineError::Param(format!("'mask' is coverage, alpha or luminance, not '{k}'")))).transpose()
@@ -139,6 +170,7 @@ fn set_properties(s: &mut Session, p: &Value) -> Result<Value> {
     let color = opt_color(p, "color")?;
     let outline = opt_bool(p, "outline")?;
     let height = height_param(p)?;
+    let opacity = opacity_param(p)?;
     let mask = mask_param(p)?;
     let (visible, locked, onion) = (opt_bool(p, "visible")?, opt_bool(p, "locked")?, opt_bool(p, "onion")?);
     if let Some(ty) = ty {
@@ -166,6 +198,9 @@ fn set_properties(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(h) = height {
         l.height_rows = h;
     }
+    if let Some(o) = opacity {
+        l.opacity = o;
+    }
     if let Some(v) = visible {
         l.visible = v;
     }
@@ -189,6 +224,7 @@ fn properties(s: &Session, id: LayerId) -> Result<Value> {
         "color": l.color.to_hex(),
         "outline": l.outline,
         "height": u32::from(l.height()) * 100,
+        "opacity": opacity_percent(l),
         "visible": l.visible,
         "locked": l.locked,
         "onion": l.onion,

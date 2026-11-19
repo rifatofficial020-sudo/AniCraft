@@ -304,7 +304,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     let Some(ease) = ease_now(app, &ed) else { return };
     let mut open = true;
     let title = tr!("Custom Ease");
-    let shown = egui::Window::new(title)
+    let shown = crate::windows::new(ctx, title)
         .id(egui::Id::new("ease_editor"))
         .open(&mut open)
         .collapsible(false)

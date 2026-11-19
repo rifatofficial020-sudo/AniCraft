@@ -103,7 +103,7 @@ tool allowed to drag from a shape's bone end onto an instance. It is its own ADR
 
 ## Not yet
 
-* Instances and shapes in one armature (above); gravity, wind and per-armature spring presets;
+* ~~Instances and shapes in one armature (above)~~ (ADR 0098); gravity, wind and per-armature spring presets;
   springs on the root's own motion of a shape armature's outline points (only bones swing).
 * An IK drag that slides joints by preference rather than only to reach; translation limits
   drawn on the stage.

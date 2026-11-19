@@ -15,6 +15,10 @@ pub const C2: u8 = 2;
 /// Points closer than this (stage units) are the same anchor.
 const LINK_EPS: f32 = 1e-3;
 
+/// How close to an end (in the segment's parameter) a bend still carries the grabbed point
+/// exactly: nearer than this, both handles would have to move more than 4.5 times the drag.
+pub const BEND_END: f32 = 0.08;
+
 impl Path {
     /// The point at `(cmd, slot)`.
     pub fn point(&self, cmd: usize, slot: u8) -> Option<Vec2> {
@@ -324,20 +328,21 @@ impl Path {
     }
 
     /// Bends segment `cmd` so its point at `t` moves by `d` while its ends stay put: dragging a
-    /// curve, as the Selection tool does. The segment becomes a cubic and its two control
-    /// points take the smallest moves that carry that point exactly (the least-squares
-    /// solution of `b₁·o₁ + b₂·o₂ = d` with the Bernstein weights `b₁ = 3(1−t)²t`,
-    /// `b₂ = 3(1−t)t²`). `t` is kept off the very ends, where no handle move could reach.
+    /// curve, as the Selection tool does. The segment becomes a cubic and both control points
+    /// move by the same amount, `d / (3t(1−t))`, which carries that point exactly. So a straight
+    /// edge bends into one even arc between its ends wherever it is grabbed, as in Animate
+    /// (#186); giving each handle its own least move bulged the edge beside the grab instead.
+    /// Near an end no handle move could carry the point without flinging the middle away, so
+    /// there the bend is as for a grab [`BEND_END`] along and the point follows part of the way.
     pub fn bend_segment(&mut self, cmd: usize, t: f32, d: Vec2) -> bool {
         if !t.is_finite() || !d.is_finite() || self.segment_start(cmd).is_none() {
             return false;
         }
         self.to_cubic(cmd);
-        let t = t.clamp(0.02, 0.98);
-        let (b1, b2) = (3.0 * (1.0 - t) * (1.0 - t) * t, 3.0 * (1.0 - t) * t * t);
-        let norm = b1 * b1 + b2 * b2;
+        let t = t.clamp(BEND_END, 1.0 - BEND_END);
+        let o = d * (1.0 / (3.0 * t * (1.0 - t)));
         let (Some(c1), Some(c2)) = (self.point(cmd, C1), self.point(cmd, C2)) else { return false };
-        self.set_point(cmd, C1, c1 + d * (b1 / norm)) && self.set_point(cmd, C2, c2 + d * (b2 / norm))
+        self.set_point(cmd, C1, c1 + o) && self.set_point(cmd, C2, c2 + o)
     }
 
     /// The segment nearest to `p` (in the space `m` maps to): `(cmd, t, distance)`.
@@ -522,6 +527,20 @@ mod tests {
             assert_eq!(p.point(0, ANCHOR), Some(Vec2::new(0.0, 0.0)));
             assert_eq!(p.point(1, ANCHOR), Some(Vec2::new(40.0, 0.0)));
         }
+        // Grabbed off-centre, a straight edge still bends into an even arc: its two handles
+        // move alike, so the bulge is in the middle, not beside the grab (#186).
+        let mut p = Path::new();
+        p.move_to(Vec2::new(0.0, 0.0)).line_to(Vec2::new(90.0, 0.0));
+        assert!(p.bend_segment(1, 0.2, Vec2::new(0.0, 12.0)));
+        let (c1, c2) = (p.point(1, C1).unwrap(), p.point(1, C2).unwrap());
+        assert!((c1.y - c2.y).abs() < 1e-3 && c1.y > 12.0, "both handles moved alike: {c1:?} {c2:?}");
+        let (a, b) = (p.segment_point(1, 0.25).unwrap(), p.segment_point(1, 0.75).unwrap());
+        assert!((a.y - b.y).abs() < 1e-3 && (a.x + b.x - 90.0).abs() < 1e-3, "the arc is the same on both sides: {a:?} {b:?}");
+        // Right at an end the handles stay within reach.
+        let mut p = Path::new();
+        p.move_to(Vec2::new(0.0, 0.0)).line_to(Vec2::new(90.0, 0.0));
+        assert!(p.bend_segment(1, 0.001, Vec2::new(0.0, 10.0)));
+        assert!(p.point(1, C1).unwrap().y < 46.0);
         // A line bends into a curve.
         let mut p = cubic_path();
         assert!(p.bend_segment(2, 0.5, Vec2::new(10.0, 0.0)));

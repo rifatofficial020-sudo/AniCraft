@@ -49,7 +49,7 @@ fn rigged() -> (Session, u64, u64) {
 }
 
 fn skin(s: &Session) -> anicraft_doc::skin::Skin {
-    s.timeline().layers.iter().find_map(|l| l.armature.as_ref().and_then(|a| a.skin.clone())).unwrap()
+    s.timeline().layers.iter().find_map(|l| l.armature.as_ref().and_then(|a| a.skins.first().cloned())).unwrap()
 }
 
 fn weight(s: &Session, point: usize, bone: u64) -> f32 {
@@ -203,7 +203,7 @@ fn files_keep_painted_and_reshaped_bindings() {
     run(&mut s, "path.add_point", json!({"id": TAIL, "x": 181.25, "y": 140.0}));
     let text = crate::format::to_json(&s.doc).unwrap();
     let back = crate::format::from_json(&text).unwrap();
-    let k = back.timeline(0).layers.iter().find_map(|l| l.armature.as_ref().and_then(|a| a.skin.clone())).unwrap();
+    let k = back.timeline(0).layers.iter().find_map(|l| l.armature.as_ref().and_then(|a| a.skins.first().cloned())).unwrap();
     assert_eq!(k, skin(&s));
 }
 

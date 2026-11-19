@@ -129,7 +129,13 @@ fn merge_with(items: &[Item], cutter: Option<&Path>) -> Option<Merged> {
     }
     let splits = cut(&segs)?;
     let map = Map::build(&segs, &splits);
-    Some(map.output(items, &segs))
+    let faces = map.faces();
+    // Snapping moves the pieces a little. Where two leave a crossing almost along each other,
+    // that can make them cross again with no vertex there, and then the map's faces are not
+    // the drawing's regions: a fill's inside reads as outside and the fill is dropped (#308,
+    // a drawing vanishing under a new brush stroke). Such a map is refused, so the caller
+    // keeps the artwork whole instead.
+    faces.planar.then(|| map.output(items, &segs, faces))
 }
 
 // ----- points and curves ------------------------------------------------------------------------
@@ -569,7 +575,7 @@ impl Verts {
         let mut best: Option<(f64, usize)> = None;
         for dx in -1..=1 {
             for dy in -1..=1 {
-                for &i in self.grid.get(&(cx + dx, cy + dy)).map_or(&[][..], Vec::as_slice) {
+                for &i in self.grid.get(&(cx.saturating_add(dx), cy.saturating_add(dy))).map_or(&[][..], Vec::as_slice) {
                     let d = self.pts[i].dist(p);
                     if d < TOL && best.is_none_or(|b| d < b.0) {
                         best = Some((d, i));
@@ -750,7 +756,26 @@ impl Map {
         }
         let face_of_half = cycle_of.iter().map(|&c| face_of_cycle.get(c).copied().flatten()).collect();
         let samples = faces.iter().map(|f| interior_point(&f.iter().map(|&c| polys[c].as_slice()).collect::<Vec<_>>())).collect();
-        Faces { face_of_half, samples }
+        // Euler's formula, one connected part at a time: vertices − edges + cycles = 2 exactly
+        // when the halves round each vertex are in an order a drawing in the plane can have.
+        let mut euler: HashMap<usize, i64> = HashMap::new();
+        for (v, list) in self.around.iter().enumerate() {
+            if !list.is_empty()
+                && let Some(&r) = roots.get(v)
+            {
+                *euler.entry(r).or_default() += 1;
+            }
+        }
+        for e in &self.edges {
+            if let Some(&r) = roots.get(e.v[0]) {
+                *euler.entry(r).or_default() -= 1;
+            }
+        }
+        for &c in &comps {
+            *euler.entry(c).or_default() += 1;
+        }
+        let planar = euler.values().all(|&x| x == 2);
+        Faces { face_of_half, samples, planar }
     }
 
     fn polygon(&self, cycle: &[Half]) -> Vec<P> {
@@ -764,8 +789,8 @@ impl Map {
         pts
     }
 
-    fn output(&self, items: &[Item], segs: &[Seg]) -> Merged {
-        let Faces { face_of_half, samples } = self.faces();
+    fn output(&self, items: &[Item], segs: &[Seg], faces: Faces) -> Merged {
+        let Faces { face_of_half, samples, .. } = faces;
         let face = |h: Half| face_of_half.get(h).copied().flatten();
         // Which fill items cover each face, bottom to top.
         let regions: Vec<Region> = (0..items.len()).map(|i| Region::new(segs, i, items.get(i).is_some_and(|it| it.fill.is_some()))).collect();
@@ -981,6 +1006,8 @@ struct Faces {
     face_of_half: Vec<Option<usize>>,
     /// A point inside each face.
     samples: Vec<Option<P>>,
+    /// The map can be drawn in the plane as it is, so its faces are the drawing's regions.
+    planar: bool,
 }
 
 /// A run of output: a curve and the segment stretch it came from.

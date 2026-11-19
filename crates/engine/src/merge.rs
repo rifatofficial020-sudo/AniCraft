@@ -34,6 +34,55 @@ pub(crate) fn reach(s: &Shape, m: &Affine) -> Rect {
     s.path.bounds().transformed(m).inflate(pad + 2.0 * SNAP)
 }
 
+/// Splits raw pieces into the drawings they make: pieces whose bounds touch go in one group, so a
+/// fill and the strokes on its edges move, turn and align as one shape (#297, #301). `boxes` are
+/// the pieces' bounds in one space; each group lists indexes into it, in order.
+pub(crate) fn touching_groups(boxes: &[Rect]) -> Vec<Vec<usize>> {
+    // Every entry of `parent` is an index into it, so the lookups below stay in range.
+    fn root(parent: &mut [usize], i: usize) -> usize {
+        let mut r = i;
+        while parent[r] != r {
+            r = parent[r];
+        }
+        let mut j = i;
+        while parent[j] != r {
+            let next = parent[j];
+            parent[j] = r;
+            j = next;
+        }
+        r
+    }
+    let grown: Vec<Rect> = boxes.iter().map(|b| b.inflate(SNAP)).collect();
+    let mut parent: Vec<usize> = (0..boxes.len()).collect();
+    // Sweep along x: only pieces whose x spans overlap can touch.
+    let mut order: Vec<usize> = (0..boxes.len()).collect();
+    order.sort_by(|&a, &b| grown[a].min.x.total_cmp(&grown[b].min.x));
+    for (k, &i) in order.iter().enumerate() {
+        for &j in order.iter().skip(k + 1) {
+            if grown[j].min.x > grown[i].max.x {
+                break;
+            }
+            if !grown[i].intersect(&grown[j]).is_empty() {
+                let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+                parent[a.max(b)] = a.min(b);
+            }
+        }
+    }
+    let mut group_of: Vec<Option<usize>> = vec![None; boxes.len()];
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for i in 0..boxes.len() {
+        let r = root(&mut parent, i);
+        match group_of[r] {
+            Some(g) => groups[g].push(i),
+            None => {
+                group_of[r] = Some(groups.len());
+                groups.push(vec![i]);
+            }
+        }
+    }
+    groups
+}
+
 /// Where new raw shapes go in the drawing's stacking (the Brush tool's paint modes, ADR 0033).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Order {
@@ -314,6 +363,24 @@ pub(crate) fn drop_selected(s: &mut Session) -> Result<Value> {
     keep.extend(merge_in(s, moving)?);
     s.select_only(keep);
     Ok(json!({"dropped": n, "selected": s.selection.id_list()}))
+}
+
+/// The raw shapes `ids` of the active keyframe, left whole on top by a floating paste, go into
+/// the drawing where they lie.
+pub(crate) fn settle(s: &mut Session, ids: &[ElementId]) -> Result<()> {
+    let kf = s.editable_keyframe()?;
+    let mut floating = Vec::new();
+    kf.elements.retain(|e| {
+        let take = ids.contains(&e.id) && mergeable(e).is_some();
+        if take {
+            floating.push((**e).clone());
+        }
+        !take
+    });
+    if !floating.is_empty() {
+        merge_in(s, floating)?;
+    }
+    Ok(())
 }
 
 // ----- the Paint Bucket and imported drawings (ADR 0042) ---------------------------------------

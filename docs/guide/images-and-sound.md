@@ -187,6 +187,95 @@ speaker toggle in its timeline row. Volume applies to the layer's sounds and to 
 the symbols on it. A muted layer is silent while you work and in every export, which is handy
 while you time other tracks.
 
+## Convert Audio to Keyframes
+
+A sound can animate for you. **Convert Audio to Keyframes** measures how loud the sound is on
+each frame and writes that onto a property of an object: a speaker that pulses with the beat, a
+logo that brightens on every hit, a jaw that drops when a character talks.
+
+![Convert Audio to Keyframes: the star's scale follows a beat, previewed on the timeline](images/audio-to-keyframes.png)
+
+1. Put the sound on a layer and the object on another layer. **Stream** sync is best: the
+   sound then stays on its frames. With Event or Start sync the dialog still works, and a line
+   under **Frames** reminds you that the keys can drift from what is heard after a jump on the
+   timeline.
+2. Choose **Modify › Timeline › Convert Audio to Keyframes…**, or select the sound's keyframe
+   and press **To Keyframes…** in **Properties**.
+3. Pick the **Layer** that gets the keys (and the **Object**, when the layer holds several).
+4. Pick the **Property**, and its value **In silence** and **At the loudest**:
+
+   | Property | The values are |
+   |---|---|
+   | **Scale**, **Scale X**, **Scale Y** | percent of the object's own size (100 % is as it is) |
+   | **Alpha** | opacity in percent |
+   | **X offset**, **Y offset** | pixels from where the object is (negative Y is up) |
+   | **Rotation** | degrees from how the object is turned |
+   | **First frame** | a frame of a graphic symbol: louder shows a later frame, held as a single frame |
+
+5. Shape the movement:
+   * **Threshold** ignores everything quieter than this share of the loudest frame. Raise it
+     so background noise doesn't make the object tremble, or so only the loud beats count.
+   * **Smoothing** averages each frame with the frames either side. 0 follows every flick;
+     higher values are calmer. The beat stays on its frame.
+   * **Channel** (stereo sounds) measures the left side, the right side or both.
+   * **Key every** 2 frames animates on twos, and so on.
+6. Choose what to **Write**: **Keyframes** on the layer, as if you had set each by hand, or a
+   **Motion tween curve**, which keeps the span whole and shows in the Motion Editor (a motion
+   tween is made for an object alone on its layer).
+7. Press **OK**. It is one undo step.
+
+Everything is previewed while you change it. The graph shows the sound's loudness frame by
+frame, the threshold, the value the keys will follow (the white line) and a tick where each
+key lands; the stage and the timeline show the keys themselves. Click or drag in the graph to
+see another frame on the stage. Clear **Preview** to compare with the document as it was.
+
+Scale and rotation turn about the object's transformation point (the middle of a shape that
+has none). Keyframes that were already on the layer keep their place and take the value. After
+the sound ends, the layer carries on as it was. A layer shorter than the sound grows to its
+length.
+
+## Auto lip-sync
+
+**Auto Lip-Sync** listens to speech and picks a mouth for every frame, as Animate's Lip Syncing
+does. It is a first pass: expect to fix some mouths by hand afterwards.
+
+![A mouth lip-synced to speech: a keyframe on the Mouth layer wherever the mouth changes](images/lip-sync.png)
+
+1. Draw the mouths as the frames of a **graphic symbol**, one frame per mouth, and put an
+   instance on its own layer. **File › New from Template › Lip-sync mouth chart** gives you a
+   Mouth symbol with ten labelled frames to redraw.
+2. Put the dialogue on another layer, with **Stream** sync.
+3. Select the mouth and press **Lip Sync…** in **Properties** (beside Looping), or choose
+   **Modify › Timeline › Auto Lip-Sync…**.
+4. Check the **Mouths**. AniCraft tells five mouth shapes apart and needs a frame of your
+   symbol for each:
+
+   | Mouth | Sounds | Frame label it looks for |
+   |---|---|---|
+   | **Rest** | silence | Rest |
+   | **Open** | ah, as in *father* and *cat* | AI |
+   | **Wide** | ee and e, and the hiss of s and t | E |
+   | **Round** | oh, oo and w | O |
+   | **Closed** | m, b, p and the short stops between syllables | MBP |
+
+   Frames are found by their labels (other common names such as *open*, *wide*, *round* and
+   *closed* work too). Choose another frame for any mouth from its menu.
+5. **Silence below** sets how quiet counts as silence. **Hold each mouth** is the fewest frames
+   a mouth stays, so it doesn't flicker; closed lips are kept however short.
+6. Press **OK**. The Mouth layer gets a keyframe wherever the mouth changes, each showing one
+   frame of the symbol (**Single frame**). It is one undo step.
+
+The preview shows a row for each mouth with the frames it gets, under the sound's loudness.
+
+How it listens: no speech recognition and nothing sent anywhere. Each frame's sound is sorted
+by where its energy lies (low for *oo*, in the middle for *ah*, high for *ee* and *s*), which is
+what tells vowels apart. It cannot tell *f* from *s* or *l* from *d*, so the chart's other mouths
+(FV, L, WQ, U and the consonants) are yours to place. The same sound always gives the same
+keys.
+
+To fix a mouth afterwards, select its keyframe and change **First frame** in Properties, or
+move the keyframe on the timeline.
+
 ## Sounds inside symbols and buttons
 
 Sounds placed on a symbol's own timeline play too:
@@ -242,4 +331,8 @@ Lottie animations carry no sound. See [Exporting and Publish](exporting-and-publ
 
 * Picking a colour from a bitmap's pixels with the Eyedropper.
 * Panning beyond what the envelope does.
-* Sound playback in the web version.
+* Convert Audio to Keyframes on the camera or an armature layer, a filter's values, or with a
+  classic tween between the keys; the sound's own effect (a fade) isn't counted in its
+  loudness.
+* Lip-sync that tells more mouths apart (F and V, L, the chart's other consonants), or reads a
+  script; lip-syncing several sounds in one go.

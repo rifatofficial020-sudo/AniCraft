@@ -243,7 +243,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     }
     let mut open = app.find.open;
     let at = ctx.content_rect().right_top() + vec2(-720.0, 110.0);
-    let shown = egui::Window::new(tr!("Find and Replace")).id(egui::Id::new("find_replace")).open(&mut open).default_pos(at).default_width(400.0).resizable(true).collapsible(false).show(ctx, |ui| panel(app, ui));
+    let shown = crate::windows::new(ctx, tr!("Find and Replace")).id(egui::Id::new("find_replace")).open(&mut open).default_pos(at).default_width(400.0).resizable(true).collapsible(false).show(ctx, |ui| panel(app, ui));
     a11y::name_title_bar(&shown, tr!("Find and Replace"));
     app.find.open = open;
 }
@@ -477,7 +477,7 @@ fn results_list(app: &mut App, ui: &mut egui::Ui, list: &[Hit]) {
                 p.rect_filled(r, T.rc(), if on { T.accent_dim } else { T.hover });
             }
             if on {
-                p.rect_filled(Rect::from_min_size(r.left_top(), vec2(3.0, r.height())), 0.0, T.accent);
+                crate::theme::accent_bar(p, Rect::from_min_size(r.left_top(), vec2(3.0, r.height())));
             }
             // What was found (the text around a match), then where.
             let what = match kind {

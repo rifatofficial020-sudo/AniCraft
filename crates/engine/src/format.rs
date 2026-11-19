@@ -4,9 +4,45 @@ use crate::EngineError;
 use anicraft_doc::{Document, path_table};
 use anicraft_geom::Path;
 use craft_anicraft_format::PayloadDecoder;
-pub use craft_anicraft_format::{FORMAT_NAME, FORMAT_VERSION, MAX_FILE_BYTES};
-use serde::Deserialize;
+pub use craft_anicraft_format::{FORMAT_NAME, MAX_FILE_BYTES};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+/// The newest envelope version this build reads (v1 inline paths; v2 shared path table; v3
+/// named scene timelines; v4 mixed armatures, ADR 0098).
+pub const FORMAT_VERSION: u32 = 4;
+/// The version a document is written as unless it needs a later one: the shared envelope's.
+/// Builds from before ADR 0098 read up to this.
+pub const BASE_VERSION: u32 = craft_anicraft_format::FORMAT_VERSION;
+/// The first version that may hold mixed armatures.
+pub const MIXED_ARMATURES_VERSION: u32 = 4;
+
+/// The version `doc` is written as: the lowest that can say everything in it, so a document
+/// that uses nothing new still opens in earlier builds, and one that does is refused by them
+/// with a message naming the version instead of opening with parts missing.
+pub fn version_for(doc: &Document) -> u32 {
+    if doc.has_mixed_armatures() { MIXED_ARMATURES_VERSION } else { BASE_VERSION }
+}
+
+/// The envelope for versions past the shared crate's own: the same fields in the same order,
+/// and the same compact-or-pretty rule, with the version the document needs.
+#[derive(Serialize)]
+struct EnvelopeOut<'a> {
+    format: &'a str,
+    version: u32,
+    generator: &'a str,
+    paths: &'a [Arc<Path>],
+    document: &'a Document,
+}
+
+fn write_as(version: u32, generator: &str, paths: &[Arc<Path>], doc: &Document) -> Result<String, serde_json::Error> {
+    if version <= BASE_VERSION {
+        return craft_anicraft_format::write(generator, paths, doc);
+    }
+    let envelope = EnvelopeOut { format: FORMAT_NAME, version, generator, paths, document: doc };
+    let compact = serde_json::to_string(&envelope)?;
+    if compact.len() < craft_anicraft_format::PRETTY_LIMIT { serde_json::to_string_pretty(&envelope) } else { Ok(compact) }
+}
 
 /// AniCraft document deserialization uses its own path-table scope while the shared format crate
 /// controls when a payload is decoded in the envelope stream.
@@ -27,7 +63,8 @@ impl PayloadDecoder<Arc<Path>> for DocumentDecoder {
 pub fn to_json(doc: &Document) -> Result<String, EngineError> {
     let paths = path_table::build_table(doc);
     let generator = format!("AniCraft {}", env!("CARGO_PKG_VERSION"));
-    path_table::write_with_paths(&paths, || craft_anicraft_format::write(&generator, &paths, doc)).map_err(|e| EngineError::Format(e.to_string()))
+    let version = version_for(doc);
+    path_table::write_with_paths(&paths, || write_as(version, &generator, &paths, doc)).map_err(|e| EngineError::Format(e.to_string()))
 }
 
 pub fn from_json(text: &str) -> Result<Document, EngineError> {
@@ -37,7 +74,7 @@ pub fn from_json(text: &str) -> Result<Document, EngineError> {
         return Err(EngineError::Format(format!("unexpected format '{}'", env.format)));
     }
     if env.version > FORMAT_VERSION {
-        return Err(EngineError::Format(format!("file version {} is newer than this AniCraft (supports {FORMAT_VERSION})", env.version)));
+        return Err(EngineError::Format(format!("file version {} is newer than this AniCraft (supports {FORMAT_VERSION}): open it with the AniCraft that saved it, or a newer one", env.version)));
     }
     let mut doc = env.document.ok_or_else(|| EngineError::Format("the file has no document".into()))?;
     doc.sanitize();
@@ -55,9 +92,13 @@ pub fn load(path: &std::path::Path) -> Result<Document, EngineError> {
 pub fn save(doc: &Document, path: &std::path::Path) -> Result<(), EngineError> {
     let json = to_json(doc)?;
     // Write next to the target, then rename: a crash mid-write never corrupts the old file.
-    let tmp = path.with_extension("anicraft.tmp");
-    crate::vfs::write(&tmp, json)?;
-    crate::vfs::rename(&tmp, path)?;
+    // The temp name is unguessable and created exclusively, so a planted file or symlink can't redirect the write.
+    let tmp = path.with_extension(format!("anicraft.{}.tmp", crate::vfs::random_suffix()));
+    crate::vfs::write_new(&tmp, json)?;
+    if let Err(e) = crate::vfs::rename(&tmp, path) {
+        let _ = crate::vfs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }
 

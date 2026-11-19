@@ -29,3 +29,22 @@ jobs:
         libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev
         libgtk-3-dev libasound2-dev mesa-vulkan-drivers
       command: cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings
+
+  # The licence policy (deny.toml, docs/legal/compliance.md): the shared gate doesn't run
+  # cargo-deny, so AniCraft checks its own dependency licences, bans and sources here.
+  licenses:
+    timeout-minutes: 20
+    name: Licences, bans and sources (cargo deny)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --version 0.20.2
+      - name: Check licences, bans and sources
+        run: cargo deny --locked check licenses bans sources

@@ -227,8 +227,8 @@ Select a bone to see **Properties › Bone**:
 * **Springs: Enable** turns every spring of the armature on or off. Turn them off while you
   pose, to see exactly the poses you key; Test Movie and every export play them while they
   are on.
-* **Remove Bone** (or **Delete**): removes the bone and those below it. Their instances stay
-  where they are, on a layer of their own. If the armature has more than one pose, AniCraft asks
+* **Remove Bone** (or **Delete**): removes the bone and those below it. What they moved stays
+  where it is, on a layer of its own. If the armature has more than one pose, AniCraft asks
   first.
 
 Selecting a bone also selects the instance it moves. Properties then shows that instance's
@@ -299,8 +299,35 @@ to the rest pose first.
 
 Bones inside a shape take joint translation and springs too.
 
-Not there yet: symbols and shapes in one armature, reshaping at a posed frame, armatures
-that scripts pose while the movie plays, and armatures from Animate files.
+### Symbols and shapes in one armature
+
+One armature can hold both: a body drawn as a shape that bends, with a head, hands or props
+that are symbol instances, and more than one shape with bones. They pose, tween, spring and
+slide as one armature, on one armature layer.
+
+* **A symbol on a shape's bone.** With the **Bone** tool, drag from the end of a bone inside
+  the shape (the neck joint, say) and release over a symbol instance. The instance joins the
+  armature and follows that joint.
+* **A shape on a symbol's bone.** Drag from an instance and release over a shape. The bone
+  moves the shape as a whole. To make it bend as well, drag from that bone's end inside the
+  shape: this draws the shape's first bone, and its points are bound to it.
+* From the end of any bone you can go on either way, so a chain can run body, head, then a
+  feather on the head that bends.
+
+Drag any bone or part with the **Selection** tool, and the whole chain follows: pulling the
+head bends the body under it. The **Bind** tool shows the points of every shape with bones.
+Pick a bone, and you bind or paint the points of the shape that bone is inside.
+
+**Remove Bone** frees what the bone and the bones below it moved: instances and whole shapes
+go to a layer of their own, as they look at that moment. A shape that loses its last inside
+bone, but still hangs from a bone, stays in the armature and keeps the outline it showed.
+
+Files with such an armature need this version of AniCraft or a later one. An earlier version
+says the file is newer rather than opening it with parts missing. Documents without one are
+saved as before and open everywhere.
+
+Not there yet: joining two armatures into one, reshaping at a posed frame, armatures that
+scripts pose while the movie plays, and armatures from Animate files.
 
 ## Asset Warp
 

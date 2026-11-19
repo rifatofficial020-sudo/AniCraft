@@ -58,7 +58,8 @@ same order) and by observation. No Adobe code or asset was used.
    order, switched-off filters included, so switching one off never breaks a tween; numbers
    and colours travel, and on/off (like Inner, Knockout and Quality) holds from the first
    keyframe. Reordering one keyframe's list makes the lists no longer pair up, and the first
-   keyframe's filters hold, as in Animate.
+   keyframe's filters hold, as in Animate. (Superseded for lists that differ by ADR 0099 §3:
+   what matches is paired and the rest fade in or out.)
 7. **XFL.** `enabled="false"` filters now import switched off, in their place, instead of being
    dropped; the corpus already holds one and its golden render is unchanged.
 8. **Clipboard and plug-ins.** Copied filters live in `Session.filter_clipboard`, outside undo,

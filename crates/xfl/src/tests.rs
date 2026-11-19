@@ -598,6 +598,28 @@ fn loose_shapes_come_in_raw_and_drawing_objects_and_groups_as_groups() {
 }
 
 #[test]
+fn group_members_keep_their_own_placement() {
+    // A 50% instance in a 50% group stays 50% (#411).
+    let document = r##"<DOMDocument>
+      <symbols><Include href="Target.xml"/></symbols>
+      <timelines><DOMTimeline name="Scene 1"><layers><DOMLayer name="Layer 1"><frames><DOMFrame index="0"><elements>
+        <DOMGroup><matrix><Matrix a="0.5" d="0.5" tx="50" ty="50"/></matrix><members>
+          <DOMSymbolInstance libraryItemName="Target"><matrix><Matrix a="0.5" d="0.5" tx="50" ty="50"/></matrix></DOMSymbolInstance>
+        </members></DOMGroup>
+        <DOMGroup><matrix><Matrix a="0" d="0"/></matrix><members>
+          <DOMSymbolInstance libraryItemName="Target"><matrix><Matrix tx="7" ty="8"/></matrix></DOMSymbolInstance>
+        </members></DOMGroup>
+      </elements></DOMFrame></frames></DOMLayer></layers></DOMTimeline></timelines>
+    </DOMDocument>"##;
+    let symbol = r#"<DOMSymbolItem name="Target"><timeline><DOMTimeline name="Target"/></timeline></DOMSymbolItem>"#;
+    let (doc, _) = import(&HashMap::from([("DOMDocument.xml", document), ("LIBRARY/Target.xml", symbol)])).unwrap();
+    let placed: Vec<[f32; 6]> =
+        doc.timeline(0).layers[0].keyframes[0].elements.iter().map(|g| g.transform.mul(&g.kind.group_members()[0].transform).m).collect();
+    // The second group's matrix can't be inverted: it frames nothing and its member stays put.
+    assert_eq!(placed, [[0.5, 0.0, 0.0, 0.5, 50.0, 50.0], [1.0, 0.0, 0.0, 1.0, 7.0, 8.0]]);
+}
+
+#[test]
 fn stroke_caps_joints_dashes_and_dots_come_across() {
     use anicraft_doc::{Cap, Dash, Join, StrokeStyle};
     let read = |xml: &str| {
@@ -770,4 +792,45 @@ fn a_package_in_one_top_folder_opens_and_several_are_named() {
     // Deeper than one folder isn't looked for.
     let e = crate::import_fla(&fla(&[("a/b/DOMDocument.xml", doc)])).err().unwrap().to_string();
     assert!(e.contains("no DOMDocument.xml"), "{e}");
+}
+
+#[test]
+fn grouped_instance_is_not_scaled_twice() {
+    // Issue #411: a group's members are written in the group's parent space; the group's own
+    // matrix only describes its frame. A 200×200 box at 50% inside a group lands where the same
+    // box at 50% outside one would, not at 25%.
+    let document = r##"<DOMDocument width="400" height="200">
+      <symbols><Include href="Box.xml"/></symbols>
+      <timelines><DOMTimeline name="Scene 1"><layers><DOMLayer name="Layer 1"><frames><DOMFrame index="0"><elements>
+        <DOMGroup><matrix><Matrix a="0.5" d="0.5" tx="50" ty="50"/></matrix><members>
+          <DOMSymbolInstance libraryItemName="Box"><matrix><Matrix a="0.5" d="0.5" tx="50" ty="50"/></matrix></DOMSymbolInstance>
+        </members></DOMGroup>
+        <DOMSymbolInstance libraryItemName="Box"><matrix><Matrix a="0.5" d="0.5" tx="250" ty="50"/></matrix></DOMSymbolInstance>
+        <DOMGroup><matrix><Matrix tx="10" ty="20"/></matrix><members>
+          <DOMGroup><matrix><Matrix a="2" d="2" tx="30" ty="40"/></matrix><members>
+            <DOMSymbolInstance libraryItemName="Box"><matrix><Matrix a="0.25" d="0.25" tx="300" ty="100"/></matrix></DOMSymbolInstance>
+          </members></DOMGroup>
+        </members></DOMGroup>
+      </elements></DOMFrame></frames></DOMLayer></layers></DOMTimeline></timelines>
+    </DOMDocument>"##;
+    let symbol = r##"<DOMSymbolItem name="Box" symbolType="graphic"><timeline><DOMTimeline name="Box"><layers><DOMLayer name="Layer 1"><frames><DOMFrame index="0"><elements>
+        <DOMRectangleObject x="0" y="0" objectWidth="200" objectHeight="200"><fill><SolidColor color="#FF0000"/></fill></DOMRectangleObject>
+      </elements></DOMFrame></frames></DOMLayer></layers></DOMTimeline></timeline></DOMSymbolItem>"##;
+    let files = HashMap::from([("DOMDocument.xml", document), ("LIBRARY/Box.xml", symbol)]);
+    let (doc, _) = import(&files).unwrap();
+    let els = &doc.timeline(0).layers[0].keyframes[0].elements;
+    let corners = |m: anicraft_geom::Affine| {
+        let (a, b) = (m.apply(anicraft_geom::Vec2::new(0.0, 0.0)), m.apply(anicraft_geom::Vec2::new(200.0, 200.0)));
+        [a.x, a.y, b.x, b.y].map(|v| (v * 1000.0).round() / 1000.0)
+    };
+    let grouped = els[0].transform.mul(&els[0].kind.group_members()[0].transform);
+    assert_eq!(corners(grouped), [50.0, 50.0, 150.0, 150.0], "grouped instance");
+    assert_eq!(corners(els[1].transform), [250.0, 50.0, 350.0, 150.0], "loose instance");
+    let outer = &els[2];
+    let inner = &outer.kind.group_members()[0];
+    let nested = outer.transform.mul(&inner.transform).mul(&inner.kind.group_members()[0].transform);
+    assert_eq!(corners(nested), [300.0, 100.0, 350.0, 150.0], "instance in nested groups");
+    // The groups keep their own matrices for editing.
+    assert_eq!(els[0].transform.m, [0.5, 0.0, 0.0, 0.5, 50.0, 50.0]);
+    assert_eq!(outer.transform.m, [1.0, 0.0, 0.0, 1.0, 10.0, 20.0]);
 }

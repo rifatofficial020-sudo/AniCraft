@@ -22,6 +22,8 @@ pub struct PendingConfirm {
 pub struct Palette {
     pub query: String,
     pub selected: usize,
+    /// What F1 opens the guide at: the chosen entry (ADR 0096), as of the last frame.
+    pub help: Option<crate::context_help::Subject>,
 }
 
 pub fn show_all(app: &mut App, ctx: &egui::Context) {
@@ -91,7 +93,6 @@ fn confirm_modal(app: &mut App, ctx: &egui::Context) {
         }
         Some(false) => {
             app.confirm = None;
-            app.close_after_save = false;
             app.status_ok(tr!("Cancelled"));
         }
         None => {}
@@ -99,20 +100,31 @@ fn confirm_modal(app: &mut App, ctx: &egui::Context) {
 }
 
 fn close_modal(app: &mut App, ctx: &egui::Context) {
-    if !app.close_dialog || app.prompt.is_some() || app.confirm.is_some() {
+    if !app.tabs.asking() || app.prompt.is_some() || app.confirm.is_some() {
         return;
     }
-    #[derive(PartialEq)]
-    enum Choice {
-        Save,
-        Discard,
-        Cancel,
-    }
+    use crate::tabs::Answer as Choice;
+    // The document a closing tab asks about, or every unsaved one when the window closes: one
+    // question for all of them (ADR 0112).
+    let names = crate::tabs::asked_about(app);
+    let Some(name) = names.first().cloned() else { return };
+    let several = names.len() > 1;
     let mut choice = None;
-    let name = app.s.path.as_ref().and_then(|p| p.file_name()).map_or_else(|| tr!("Untitled").to_string(), |n| n.to_string_lossy().into_owned());
     egui::Modal::new(egui::Id::new("close_guard")).show(ctx, |ui| {
         ui.set_width(440.0);
-        ui.label(text(Type::Title, tr!("Save changes to “{name}” before closing?", name = name)));
+        if several {
+            ui.label(text(Type::Title, trn!("Save changes to {n} document before closing?", "Save changes to {n} documents before closing?", names.len())));
+            ui.add_space(6.0);
+            // Their own names, as on their tabs (the first few of a long list).
+            for n in names.iter().take(8) {
+                ui.label(text(Type::Body, format!("• {n}")));
+            }
+            if names.len() > 8 {
+                ui.label(text(Type::Body, trn!("and {n} more", "and {n} more", names.len() - 8)).color(T.text_dim));
+            }
+        } else {
+            ui.label(text(Type::Title, tr!("Save changes to “{name}” before closing?", name = name)));
+        }
         ui.add_space(6.0);
         ui.label(text(Type::Body, tr!("If you don't save, your changes since the last save will be lost.")).color(T.text_dim));
         ui.add_space(12.0);
@@ -121,7 +133,7 @@ fn close_modal(app: &mut App, ctx: &egui::Context) {
                 choice = Some(Choice::Discard);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(egui::Button::new(text(Type::Body, tr!("Save")).strong().color(T.on_fill)).fill(T.accent).min_size(egui::vec2(96.0, crate::theme::TARGET + 4.0))).clicked() {
+                if ui.add(egui::Button::new(text(Type::Body, if several { tr!("Save All") } else { tr!("Save") }).strong().color(T.on_fill)).fill(T.accent).min_size(egui::vec2(96.0, crate::theme::TARGET + 4.0))).clicked() {
                     choice = Some(Choice::Save);
                 }
                 if ui.add(egui::Button::new(tr!("Cancel")).min_size(egui::vec2(96.0, crate::theme::TARGET + 4.0))).clicked() {
@@ -137,23 +149,10 @@ fn close_modal(app: &mut App, ctx: &egui::Context) {
     } else if enter {
         choice = Some(Choice::Save);
     }
-    match choice {
-        Some(Choice::Save) => {
-            app.close_dialog = false;
-            app.close_after_save = true;
-            if app.s.path.is_some() {
-                app.perform("file.save", json!({}));
-            } else {
-                app.invoke("file.save_as");
-            }
-        }
-        Some(Choice::Discard) => {
-            app.allow_close = true;
-        }
-        Some(Choice::Cancel) => {
-            app.close_dialog = false;
-        }
-        None => {}
+    // Save saves each (a document without a file asks for a name); Don't Save gives the changes
+    // up; Cancel leaves everything open (`tabs::tick` does the rest).
+    if let Some(choice) = choice {
+        crate::tabs::answer(app, choice);
     }
 }
 
@@ -169,6 +168,17 @@ enum Entry {
 }
 
 impl Entry {
+    /// What F1 on it opens in the guide (ADR 0096); view entries have no section of their own.
+    fn help(&self) -> Option<crate::context_help::Subject> {
+        use crate::context_help::Subject;
+        match self {
+            Entry::Command(c) => Some(Subject::Command(c.id.to_string())),
+            Entry::Tool(t) => Some(Subject::Tool(*t)),
+            Entry::View(..) => None,
+            Entry::Plugin(..) => Some(Subject::Topic("plugins.md#running-a-plug-in")),
+        }
+    }
+
     /// The menu path to the entry, in the interface language (`local`) or in English, so
     /// either finds it.
     fn title(&self, local: bool) -> String {
@@ -216,8 +226,9 @@ fn entries() -> Vec<Entry> {
     v.push(Entry::View(tr_noop!("Onion Skin"), "", crate::onion::toggle_ghosts));
     v.push(Entry::View(tr_noop!("Preview Through Camera"), "", App::toggle_camera_preview));
     v.push(Entry::View(tr_noop!("Fit Stage in Window"), "Ctrl+0", |a| a.view.fit = true));
-    v.push(Entry::View(tr_noop!("Keyboard Shortcuts"), "F1", |a| a.show_shortcuts = true));
+    v.push(Entry::View(tr_noop!("Keyboard Shortcuts"), "Ctrl+Alt+Shift+K", |a| a.show_shortcuts = true));
     v.push(Entry::View(tr_noop!("User Guide"), "", App::open_user_guide));
+    v.push(Entry::View(tr_noop!("Search the User Guide"), "", App::open_guide_search));
     v.push(Entry::View(tr_noop!("Project Files & Docs"), "", |a| a.show_files = true));
     v.push(Entry::View(tr_noop!("Licenses & Notices"), "", |a| a.show_licenses = true));
     v.push(Entry::View(tr_noop!("Preferences"), "Ctrl+U", App::open_prefs));
@@ -274,6 +285,7 @@ fn palette(app: &mut App, ctx: &egui::Context) {
     let mut run: Option<Entry> = None;
     let mut close = esc;
     let selected = p.selected;
+    p.help = matches.get(selected).and_then(|(_, e, _)| e.help());
     egui::Area::new(egui::Id::new("palette")).order(egui::Order::Foreground).anchor(egui::Align2::CENTER_TOP, [0.0, 70.0]).show(ctx, |ui| {
         egui::Frame::popup(ui.style()).fill(T.panel_alt).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
             ui.set_width(560.0);
@@ -373,9 +385,10 @@ fn preferences(app: &mut App, ctx: &egui::Context) {
     let (bundled_ui, bundled_mono) = crate::theme::bundled_names();
     let mut reset_confirms = false;
     let mut about_act: Option<crate::desktop_ui::Act> = None;
+    let mut theme_act: Option<ThemeAct> = None;
     let to_about = std::mem::take(&mut app.prefs_to_about);
     let title = if crate::platform::OS == crate::platform::Os::Mac { tr!("Settings") } else { tr!("Preferences") };
-    let shown = egui::Window::new(title)
+    let shown = crate::windows::new(ctx, title)
         // An id of its own: the window keeps its place when the language changes.
         .id(egui::Id::new("prefs_window"))
         .open(&mut open)
@@ -420,10 +433,18 @@ fn preferences(app: &mut App, ctx: &egui::Context) {
                     ui.add_space(4.0);
                     form_row(ui, LW, tr!("Theme"), |ui| {
                         ui.vertical(|ui| {
-                            // Follow system (ADR 0064), then each palette by hand.
-                            let was = if p.follows_system() { None } else { Some(p.theme) };
-                            let mut choice = was;
-                            crate::theme::radio_value(ui, &mut choice, None, text(Type::Body, tr!("Follow system")));
+                            // Follow system (ADR 0064), then each palette by hand, then your own
+                            // themes (ADR 0117).
+                            let was = if p.follows_system() {
+                                ThemeChoice::System
+                            } else {
+                                match p.user_theme() {
+                                    Some(id) => ThemeChoice::Mine(id.to_string()),
+                                    None => ThemeChoice::BuiltIn(p.theme),
+                                }
+                            };
+                            let mut choice = was.clone();
+                            crate::theme::radio_value(ui, &mut choice, ThemeChoice::System, text(Type::Body, tr!("Follow system")));
                             // What following would show now, and why (ADR 0064, ADR 0077).
                             let look = app.system_look;
                             let says = match (look.high_contrast, look.dark) {
@@ -435,15 +456,70 @@ fn preferences(app: &mut App, ctx: &egui::Context) {
                             form_note(ui, toggle_indent, text(Type::Caption, says));
                             ui.add_space(2.0);
                             for (palette, name, tip) in crate::theme::Palette::ALL {
-                                crate::theme::radio_value(ui, &mut choice, Some(palette), text(Type::Body, crate::i18n::t(name)));
+                                crate::theme::radio_value(ui, &mut choice, ThemeChoice::BuiltIn(palette), text(Type::Body, crate::i18n::t(name)));
                                 form_note(ui, toggle_indent, text(Type::Caption, crate::i18n::t(tip)));
                                 ui.add_space(2.0);
                             }
-                            if choice != was {
-                                p.theme_follows_system = Some(choice.is_none());
-                                if let Some(t) = choice {
-                                    p.theme = t;
+                            // Yours, from the themes folder: the ones that pass their checks can
+                            // be chosen; a refused one says why, naming what is at fault.
+                            for entry in &app.themes.entries {
+                                let file = entry.path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+                                match &entry.theme {
+                                    Ok(t) => {
+                                        crate::theme::radio_value(ui, &mut choice, ThemeChoice::Mine(entry.id.clone()), text(Type::Body, entry.name()));
+                                        let from = match &t.author {
+                                            Some(author) => tr!("Your theme, by {author}, from {file}.", author = author, file = file),
+                                            None => tr!("Your theme, from {file}.", file = file),
+                                        };
+                                        form_note(ui, toggle_indent, text(Type::Caption, from));
+                                        if let Some(first) = t.notes.first() {
+                                            let low = trn!("Low contrast in {n} place: {pair} is {ratio}:1.", "Low contrast in {n} places, such as {pair}, which is {ratio}:1.", t.notes.len(), pair = first.pair, ratio = format!("{:.1}", first.ratio));
+                                            form_note(ui, toggle_indent, text(Type::Caption, low));
+                                        }
+                                    }
+                                    Err(why) => {
+                                        ui.add_enabled_ui(false, |ui| {
+                                            let mut off = false;
+                                            crate::theme::radio_value(ui, &mut off, true, text(Type::Body, entry.name())).set_name(&tr!("{name} (refused)", name = entry.name()));
+                                        });
+                                        form_note(ui, toggle_indent, text(Type::Caption, tr!("{file} is not used. {why}", file = file, why = why.message())).color(T.error));
+                                    }
                                 }
+                                ui.add_space(2.0);
+                            }
+                            if app.themes.left_out > 0 {
+                                form_note(ui, toggle_indent, text(Type::Caption, trn!("{n} more theme file in the folder is not listed.", "{n} more theme files in the folder are not listed.", app.themes.left_out)));
+                            }
+                            if choice != was {
+                                p.theme_follows_system = Some(choice == ThemeChoice::System);
+                                match choice {
+                                    ThemeChoice::System => {}
+                                    ThemeChoice::BuiltIn(palette) => {
+                                        p.theme = palette;
+                                        p.theme_file = None;
+                                    }
+                                    ThemeChoice::Mine(id) => {
+                                        // The palette it is based on: what shows if its file goes.
+                                        p.theme = app.themes.get(&id).and_then(|e| e.theme.as_ref().ok()).map_or(p.theme, |t| t.base);
+                                        p.theme_file = Some(id);
+                                    }
+                                }
+                            }
+                            // Your themes folder: small files that name colours for the roles.
+                            if app.themes_dir.is_some() {
+                                ui.add_space(2.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button(text(Type::Body, tr!("Open Themes Folder"))).on_hover_text(tr!("Shows the folder your own themes are kept in.")).clicked() {
+                                        theme_act = Some(ThemeAct::OpenFolder);
+                                    }
+                                    if ui.button(text(Type::Body, tr!("Reload"))).on_hover_text(tr!("Reads the themes folder again, so a file you changed shows at once.")).clicked() {
+                                        theme_act = Some(ThemeAct::Reload);
+                                    }
+                                    if ui.button(text(Type::Body, tr!("Export Current Theme"))).on_hover_text(tr!("Writes the look in use to the themes folder as a file to start your own from.")).clicked() {
+                                        theme_act = Some(ThemeAct::Export);
+                                    }
+                                });
+                                ui.add(egui::Label::new(text(Type::Caption, tr!("A theme is a small file that names colours for the interface's roles. A theme whose text would be hard to read is not used, and says which colours to change."))).wrap());
                             }
                         });
                     });
@@ -654,10 +730,33 @@ fn preferences(app: &mut App, ctx: &egui::Context) {
     if p != app.prefs {
         app.set_prefs(ctx, p);
     }
+    match theme_act {
+        Some(ThemeAct::OpenFolder) => app.open_themes_folder(),
+        Some(ThemeAct::Reload) => app.reload_themes(ctx),
+        Some(ThemeAct::Export) => app.export_theme(ctx),
+        None => {}
+    }
     if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
         open = false;
     }
     app.show_prefs = open;
+}
+
+/// What Preferences › Theme has picked: following the system, a built-in palette, or a theme
+/// of the user's own by its file's name (ADR 0117).
+#[derive(Clone, Debug, PartialEq)]
+enum ThemeChoice {
+    System,
+    BuiltIn(crate::theme::Palette),
+    Mine(String),
+}
+
+/// The buttons under the themes (ADR 0117), run once the window is drawn.
+#[derive(Clone, Copy)]
+enum ThemeAct {
+    OpenFolder,
+    Reload,
+    Export,
 }
 
 // ----- licences ---------------------------------------------------------------------------------
@@ -682,7 +781,7 @@ fn licenses(app: &mut App, ctx: &egui::Context) {
     }
     let mut open = true;
     let title = tr!("Licenses & Notices");
-    let shown = egui::Window::new(title)
+    let shown = crate::windows::new(ctx, title)
         .id(egui::Id::new("licenses_window"))
         .open(&mut open)
         .collapsible(false)
@@ -749,7 +848,8 @@ pub(crate) fn fixed_rows() -> Vec<(&'static str, &'static str, Vec<&'static str>
     // Keys in registry notation; the words among them are translated by `fixed_key`.
     vec![
         (essentials, tr_noop!("Command palette"), vec!["Ctrl+K"]),
-        (essentials, tr_noop!("Keyboard shortcuts (this editor)"), vec!["F1", "Ctrl+Alt+Shift+K"]),
+        (essentials, tr_noop!("Help for what you are pointing at"), vec!["F1"]),
+        (essentials, tr_noop!("Keyboard shortcuts (this editor)"), vec!["Ctrl+Alt+Shift+K"]),
         (essentials, tr_noop!("Play / Stop"), vec!["Enter"]),
         (essentials, tr_noop!("Preferences"), vec!["Ctrl+U", "Ctrl+,"]),
         (essentials, quit, vec!["Ctrl+Q"]),
@@ -834,6 +934,20 @@ fn take_key_press(ctx: &egui::Context) -> Option<(egui::Modifiers, Key)> {
     })
 }
 
+/// Opens the shortcut editor filtered to `filter` and waiting for a new key for `id` (Manage
+/// Saved Commands' Shortcut…, ADR 0097).
+pub(crate) fn shortcuts_for(app: &mut App, ctx: &egui::Context, filter: &str, id: &'static str) {
+    let state_id = egui::Id::new("shortcut_editor");
+    let mut st: SheetState = ctx.data_mut(|d| d.get_temp(state_id).unwrap_or_default());
+    st.filter = filter.to_string();
+    st.notice = None;
+    st.steal = None;
+    ctx.data_mut(|d| d.insert_temp(state_id, st));
+    app.show_shortcuts = true;
+    let replace = (!app.keymap.keys(id).is_empty()).then_some(0);
+    app.key_capture = Some(KeyCapture { id, replace });
+}
+
 fn shortcut_sheet(app: &mut App, ctx: &egui::Context) {
     if !app.show_shortcuts {
         app.key_capture = None;
@@ -874,7 +988,7 @@ fn shortcut_sheet(app: &mut App, ctx: &egui::Context) {
     let capture = app.key_capture;
     let changed = app.prefs.shortcuts.len();
     let title = tr!("Keyboard Shortcuts");
-    let shown = egui::Window::new(title)
+    let shown = crate::windows::new(ctx, title)
         .id(egui::Id::new("shortcuts_window"))
         .open(&mut open)
         .collapsible(false)

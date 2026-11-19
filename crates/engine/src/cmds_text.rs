@@ -8,16 +8,24 @@
 //! Text on a path (ADR 0070): `text.attach_path` sets static text along a shape's outline (a
 //! copy of it, in the text's own space), `text.path` moves it along, flips it or releases it.
 //! The glyphs are set by arc length and stored as outlines, as all text is.
+//!
+//! Styled text (ADR 0085): a block's characters come in runs with their own font, size, style,
+//! colour, letter spacing, baseline shift, underline and link, and its paragraphs have their own
+//! alignment, indent, margins and line spacing. `text.style` styles a range of characters,
+//! `text.paragraph` the paragraphs a range touches, `text.styles` reads them back (mixed values
+//! as `null`); `text.edit` keeps the runs through a change of text (typing continues the style
+//! before it) or takes new ones. Every layout here goes through [`lay_out_block`].
 
 use crate::params::*;
 use crate::{CommandSpec, EngineError, Result, Session};
-use anicraft_doc::{ColorEffect, Element, ElementId, ElementKind, FIELD_GUTTER, LineType, MAX_FIELD_CHARS, MAX_FIELD_NAME, MAX_PATH_OFFSET, Rgba, TextAlign, TextBlock, TextField, TextKind, TextPath};
+use anicraft_doc::rich_text::{self as rt, StyleSummary};
+use anicraft_doc::{BaselineShift, CharStyle, ColorEffect, Element, ElementId, ElementKind, FIELD_GUTTER, LineType, MAX_FIELD_CHARS, MAX_FIELD_NAME, MAX_PATH_OFFSET, MAX_TEXT_RUNS, MAX_URL, ParagraphStyle, Rgba, TextAlign, TextBlock, TextField, TextKind, TextPath, TextRun};
 use anicraft_geom::{Affine, Path, Vec2};
 use anicraft_text::{Align, Fonts};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-/// The text style new text gets: the last one used.
+/// The text style new text gets: the last one used, as in Animate.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextStyle {
     pub font: String,
@@ -36,12 +44,18 @@ impl Default for TextStyle {
     }
 }
 
+const CHAR_KEYS: &str = "font?, size? (px), bold?, italic?, color?, letter_spacing?, shift?: normal|superscript|subscript, underline?, url? (\"\": none)";
+const PARA_KEYS: &str = "align?: left|center|right, indent? (px, first line), left_margin?, right_margin? (px), line_spacing? (px)";
 
 pub fn specs() -> Vec<CommandSpec> {
     let c = |id, label, menu, shortcut, params, mutates, run| CommandSpec { id, label, menu, shortcut, params, mutates, run };
+    let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
     vec![
-        c("text.create", "New Text", "", None, "{text (may be empty for an input field), type?: static|dynamic|input, x?, y? (top-left; default: centred), font?, size?, bold?, italic?, color?, align?, letter_spacing?, line_spacing?, width?}", true, create as crate::RunFn),
-        c("text.edit", "Edit Text", "", None, "{text?, font?, size? (px), bold?, italic?, color?, align?: left|center|right, letter_spacing?, line_spacing?, width? (px, wraps; null: one line per paragraph)} on the selected text", true, |s, p| s.each_layer(false, |s| edit(s, p))),
+        c("text.create", "New Text", "", None, leak(format!("{{text (may be empty for an input field), type?: static|dynamic|input, x?, y? (top-left; default: centred), width?, {CHAR_KEYS}, {PARA_KEYS}, runs?: [{{chars, …character keys}}] (styles of the text's characters in order; unset keys take the style above), paragraphs?: [{{…paragraph keys}}] (one per line of the text)}} (ADR 0085)")), true, create as crate::RunFn),
+        c("text.edit", "Edit Text", "", None, leak(format!("{{text? (the runs follow the change: typed characters continue the style before them), runs?, paragraphs? (as text.create: replace the styles), width? (px, wraps; null: one line per paragraph), {CHAR_KEYS} (every character), {PARA_KEYS} (every paragraph)}} on the selected text")), true, |s, p| s.each_layer(false, |s| edit(s, p))),
+        c("text.style", "Text Character Style", "", None, leak(format!("{{start?, end? (characters; default: all), {CHAR_KEYS}}} styles those characters of the selected text, splitting and joining its runs (ADR 0085)")), true, |s, p| s.each_layer(false, |s| style_range(s, p))),
+        c("text.paragraph", "Text Paragraph Style", "", None, leak(format!("{{start?, end? (characters; default: all), {PARA_KEYS}}} sets the layout of the paragraphs those characters touch in the selected text (ADR 0085)")), true, |s, p| s.each_layer(false, |s| paragraph_range(s, p))),
+        c("text.styles", "Text Styles", "", None, "{start?, end? (characters; default: all)} of the first selected text: its runs, paragraphs, and what those characters share (a mixed value is null) (ADR 0085)", false, styles_of),
         c("text.fonts", "Fonts", "", None, "{}", false, fonts),
         c(
             "text.attach_path",
@@ -58,13 +72,13 @@ pub fn specs() -> Vec<CommandSpec> {
     ]
 }
 
-fn align_param(p: &Value) -> Result<Option<TextAlign>> {
-    Ok(match opt_str(p, "align")? {
+fn align_of(p: &Value, key: &str) -> Result<Option<TextAlign>> {
+    Ok(match opt_str(p, key)? {
         None => None,
         Some("left") => Some(TextAlign::Left),
         Some("center" | "centre") => Some(TextAlign::Center),
         Some("right") => Some(TextAlign::Right),
-        Some(other) => return Err(EngineError::Param(format!("'align' is left, center or right, not '{other}'"))),
+        Some(other) => return Err(EngineError::Param(format!("'{key}' is left, center or right, not '{other}'"))),
     })
 }
 
@@ -80,102 +94,284 @@ fn width_param(p: &Value, current: Option<f32>) -> Result<Option<f32>> {
     }
 }
 
-/// The style in `p` over `base`.
-fn style_param(p: &Value, base: &TextStyle) -> Result<TextStyle> {
-    let size = opt_f32(p, "size")?.unwrap_or(base.size);
-    if !(1.0..=2000.0).contains(&size) {
-        return Err(EngineError::Param("'size' must be between 1 and 2000 px".into()));
+fn ranged(p: &Value, key: &str, lo: f32, hi: f32) -> Result<Option<f32>> {
+    match opt_f32(p, key)? {
+        Some(v) if !(lo..=hi).contains(&v) => Err(EngineError::Param(format!("'{key}' must be between {lo} and {hi} px"))),
+        v => Ok(v),
     }
-    let spacing = |key: &str, d: f32| -> Result<f32> {
-        let v = opt_f32(p, key)?.unwrap_or(d);
-        if (-1000.0..=1000.0).contains(&v) { Ok(v) } else { Err(EngineError::Param(format!("'{key}' must be between -1000 and 1000 px"))) }
-    };
-    Ok(TextStyle {
-        font: opt_str(p, "font")?.map_or_else(|| base.font.clone(), |f| f.chars().take(256).collect()),
-        size,
-        bold: opt_bool(p, "bold")?.unwrap_or(base.bold),
-        italic: opt_bool(p, "italic")?.unwrap_or(base.italic),
-        color: opt_color(p, "color")?.unwrap_or(base.color),
-        align: align_param(p)?.unwrap_or(base.align),
-        letter_spacing: spacing("letter_spacing", base.letter_spacing)?,
-        line_spacing: spacing("line_spacing", base.line_spacing)?,
-    })
 }
 
-/// Lays a block out with this computer's fonts. Also says when the family asked for isn't
-/// installed and another was used.
-pub(crate) fn lay_out(text: &str, style: &TextStyle, width: Option<f32>) -> Result<(TextBlock, Option<String>)> {
+/// Character style keys in a command's params: each one given changes that attribute only.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CharPatch {
+    pub font: Option<String>,
+    pub size: Option<f32>,
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+    pub color: Option<Rgba>,
+    pub letter_spacing: Option<f32>,
+    pub shift: Option<BaselineShift>,
+    pub underline: Option<bool>,
+    pub url: Option<String>,
+}
+
+impl CharPatch {
+    pub fn parse(p: &Value) -> Result<CharPatch> {
+        let shift = opt_str(p, "shift")?.map(|k| BaselineShift::from_key(k).ok_or_else(|| EngineError::Param(format!("'shift' is normal, superscript or subscript, not '{k}'")))).transpose()?;
+        let url = match opt_str(p, "url")? {
+            None => None,
+            Some(u) if u.chars().count() > MAX_URL => return Err(EngineError::Param(format!("'url' is at most {MAX_URL} characters"))),
+            Some(u) => Some(rt::safe_url(u).ok_or_else(|| EngineError::Param("'url' can't run script (javascript:, vbscript: and data: links aren't allowed)".into()))?),
+        };
+        Ok(CharPatch {
+            font: opt_str(p, "font")?.map(|f| f.chars().take(256).collect()),
+            size: ranged(p, "size", 1.0, 2000.0)?,
+            bold: opt_bool(p, "bold")?,
+            italic: opt_bool(p, "italic")?,
+            color: opt_color(p, "color")?,
+            letter_spacing: ranged(p, "letter_spacing", -1000.0, 1000.0)?,
+            shift,
+            underline: opt_bool(p, "underline")?,
+            url,
+        })
+    }
+    pub fn is_empty(&self) -> bool {
+        *self == CharPatch::default()
+    }
+    pub fn apply(&self, s: &mut CharStyle) {
+        if let Some(v) = &self.font {
+            s.font.clone_from(v);
+        }
+        if let Some(v) = self.size {
+            s.size = v;
+        }
+        if let Some(v) = self.bold {
+            s.bold = v;
+        }
+        if let Some(v) = self.italic {
+            s.italic = v;
+        }
+        if let Some(v) = self.color {
+            s.color = v;
+        }
+        if let Some(v) = self.letter_spacing {
+            s.letter_spacing = v;
+        }
+        if let Some(v) = self.shift {
+            s.shift = v;
+        }
+        if let Some(v) = self.underline {
+            s.underline = v;
+        }
+        if let Some(v) = &self.url {
+            s.url.clone_from(v);
+        }
+    }
+}
+
+/// Paragraph style keys in a command's params.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ParaPatch {
+    pub align: Option<TextAlign>,
+    pub indent: Option<f32>,
+    pub left_margin: Option<f32>,
+    pub right_margin: Option<f32>,
+    pub line_spacing: Option<f32>,
+}
+
+impl ParaPatch {
+    pub fn parse(p: &Value) -> Result<ParaPatch> {
+        Ok(ParaPatch {
+            align: align_of(p, "align")?,
+            indent: ranged(p, "indent", -1000.0, 1000.0)?,
+            left_margin: ranged(p, "left_margin", 0.0, 1000.0)?,
+            right_margin: ranged(p, "right_margin", 0.0, 1000.0)?,
+            line_spacing: ranged(p, "line_spacing", -1000.0, 1000.0)?,
+        })
+    }
+    pub fn is_empty(&self) -> bool {
+        *self == ParaPatch::default()
+    }
+    pub fn apply(&self, s: &mut ParagraphStyle) {
+        s.align = self.align.unwrap_or(s.align);
+        s.indent = self.indent.unwrap_or(s.indent);
+        s.left_margin = self.left_margin.unwrap_or(s.left_margin);
+        s.right_margin = self.right_margin.unwrap_or(s.right_margin);
+        s.line_spacing = self.line_spacing.unwrap_or(s.line_spacing);
+    }
+}
+
+/// `runs: [{chars, …character keys}]` over `base` (unset keys take it), at most
+/// [`MAX_TEXT_RUNS`] of them.
+fn runs_param(p: &Value, base: &CharStyle) -> Result<Option<Vec<TextRun>>> {
+    let Some(v) = p.get("runs").filter(|v| !v.is_null()) else { return Ok(None) };
+    let list = v.as_array().ok_or_else(|| EngineError::Param("'runs' must be a list of {chars, …style}".into()))?;
+    if list.len() > MAX_TEXT_RUNS {
+        return Err(EngineError::Param(format!("'runs' has at most {MAX_TEXT_RUNS} runs")));
+    }
+    let mut out = Vec::with_capacity(list.len());
+    for r in list {
+        let chars = opt_u32(r, "chars")?.ok_or_else(|| EngineError::Param("each run needs 'chars' (how many characters it styles)".into()))?;
+        let mut style = base.clone();
+        CharPatch::parse(r)?.apply(&mut style);
+        out.push(TextRun { chars, style });
+    }
+    Ok(Some(out))
+}
+
+/// `paragraphs: [{…paragraph keys}]` over `base`.
+fn paragraphs_param(p: &Value, base: &ParagraphStyle) -> Result<Option<Vec<ParagraphStyle>>> {
+    let Some(v) = p.get("paragraphs").filter(|v| !v.is_null()) else { return Ok(None) };
+    let list = v.as_array().ok_or_else(|| EngineError::Param("'paragraphs' must be a list of {align?, indent?, …}".into()))?;
+    if list.len() > anicraft_text::MAX_CHARS + 1 {
+        return Err(EngineError::Param("'paragraphs' has more entries than a block has lines".into()));
+    }
+    list.iter()
+        .map(|q| {
+            let mut s = *base;
+            ParaPatch::parse(q)?.apply(&mut s);
+            Ok(s)
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+/// `start`, `end` (characters, default the whole text), clamped to `n`.
+fn range_param(p: &Value, n: u32) -> Result<(u32, u32)> {
+    let start = opt_u32(p, "start")?.unwrap_or(0).min(n);
+    let end = opt_u32(p, "end")?.unwrap_or(n).min(n);
+    if end < start {
+        return Err(EngineError::Param("'end' comes before 'start'".into()));
+    }
+    Ok((start, end))
+}
+
+fn align_text(a: TextAlign) -> Align {
+    match a {
+        TextAlign::Left => Align::Left,
+        TextAlign::Center => Align::Center,
+        TextAlign::Right => Align::Right,
+    }
+}
+
+/// `d`'s runs and paragraphs as the text engine takes them, and the paints (colour, link) the
+/// runs' `paint` numbers stand for.
+fn rich_parts(d: &TextBlock) -> (Vec<anicraft_text::Run>, Vec<anicraft_text::ParaStyle>, Vec<(Rgba, String)>) {
+    let mut paints: Vec<(Rgba, String)> = Vec::new();
+    let runs = d
+        .styled_runs()
+        .into_iter()
+        .map(|r| {
+            let key = (r.style.color, r.style.url.clone());
+            let paint = match paints.iter().position(|k| *k == key) {
+                Some(i) => i,
+                None => {
+                    paints.push(key);
+                    paints.len() - 1
+                }
+            } as u32;
+            let shift = match r.style.shift {
+                BaselineShift::Normal => anicraft_text::Shift::Normal,
+                BaselineShift::Superscript => anicraft_text::Shift::Superscript,
+                BaselineShift::Subscript => anicraft_text::Shift::Subscript,
+            };
+            anicraft_text::Run {
+                chars: r.chars as usize,
+                style: anicraft_text::RunStyle { family: r.style.font, size: r.style.size, bold: r.style.bold, italic: r.style.italic, letter_spacing: r.style.letter_spacing, shift, underline: r.style.underline, paint },
+            }
+        })
+        .collect();
+    let paras = d
+        .paragraph_styles()
+        .into_iter()
+        .map(|p| anicraft_text::ParaStyle { align: align_text(p.align), indent: p.indent, left_margin: p.left_margin, right_margin: p.right_margin, line_spacing: p.line_spacing })
+        .collect();
+    (runs, paras, paints)
+}
+
+/// The block with its outline from laid-out pieces and its runs' fonts the families actually
+/// used; with a note when a family asked for isn't installed.
+fn finish(mut d: TextBlock, pieces: Vec<(u32, Path)>, families: &[String], paints: &[(Rgba, String)]) -> (TextBlock, Option<String>) {
+    let mut note = None;
+    let mut runs = d.styled_runs();
+    for (r, used) in runs.iter_mut().zip(families) {
+        let asked = r.style.font.trim();
+        if note.is_none() && !asked.is_empty() && !used.eq_ignore_ascii_case(asked) {
+            note = Some(format!("“{asked}” isn't installed on this computer; used {used}"));
+        }
+        r.style.font.clone_from(used);
+    }
+    let paras = d.paragraph_styles();
+    d.set_styles(runs, paras);
+    let pieces = pieces.into_iter().map(|(k, p)| paints.get(k as usize).map_or((d.color, String::new(), p.clone()), |(c, u)| (*c, u.clone(), p))).collect();
+    d.set_outline(pieces);
+    (d, note)
+}
+
+fn layout_err(e: anicraft_text::TextError) -> EngineError {
+    EngineError::State(format!("can't lay out text: {e}"))
+}
+
+/// Lays out a block from its text, runs, paragraphs and width, as static text, a field (in its
+/// box) or text on a path, with the fonts on this computer. Returns the laid-out block, a note
+/// when a family wasn't installed, and (text on a path) where the block's origin moved to,
+/// which the element's transform must move by for nothing to move (`transform ×
+/// translate(shift)`; zero otherwise).
+pub(crate) fn lay_out_block(d: &TextBlock) -> Result<(TextBlock, Option<String>, Vec2)> {
     let fonts = Fonts::get();
-    let layout = fonts
-        .layout(
-            text,
-            &anicraft_text::Style {
-                family: style.font.clone(),
-                size: style.size,
-                bold: style.bold,
-                italic: style.italic,
-                align: match style.align {
-                    TextAlign::Left => Align::Left,
-                    TextAlign::Center => Align::Center,
-                    TextAlign::Right => Align::Right,
-                },
-                letter_spacing: style.letter_spacing,
-                line_spacing: style.line_spacing,
-                width,
-            },
-        )
-        .map_err(|e| EngineError::State(format!("can't lay out text: {e}")))?;
-    let note = (!style.font.trim().is_empty() && !layout.family.eq_ignore_ascii_case(style.font.trim())).then(|| format!("“{}” isn't installed on this computer; used {}", style.font.trim(), layout.family));
-    let block = TextBlock {
-        text: text.to_string(),
-        font: layout.family,
-        size: style.size,
-        bold: style.bold,
-        italic: style.italic,
-        color: style.color,
-        align: style.align,
-        letter_spacing: style.letter_spacing,
-        line_spacing: style.line_spacing,
-        width,
-        outline: Arc::new(layout.outline),
-        box_width: layout.width,
-        box_height: layout.height,
-        field: None,
-        on_path: None,
-    };
-    Ok((block, note))
+    let mut d = d.clone();
+    let (runs, paras, paints) = rich_parts(&d);
+    match (d.field.clone(), d.on_path.clone()) {
+        (_, Some(on)) => {
+            // One line along the path (line breaks become spaces), anchored by the alignment.
+            let line: String = d.text.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
+            let l = fonts.layout_rich(&anicraft_text::RichText { text: &line, runs: &runs, paragraphs: &[anicraft_text::ParaStyle::default()], width: None }, true).map_err(layout_err)?;
+            let offset = if on.offset.is_finite() { on.offset.clamp(-MAX_PATH_OFFSET, MAX_PATH_OFFSET) } else { 0.0 };
+            let set = anicraft_text::on_path_boxed(&l.glyphs, &on.path, anicraft_text::PathPlacement { offset, flip: on.flip, align: align_text(d.align) }).ok_or_else(|| EngineError::State("the path has no length to set text along".into()))?;
+            d.width = None;
+            d.field = None;
+            d.box_width = set.width;
+            d.box_height = set.height;
+            d.on_path = Some(TextPath { path: set.path, offset, flip: on.flip });
+            let shift = set.shift;
+            let (b, n) = finish(d, set.pieces, &l.families, &paints);
+            Ok((b, n, shift))
+        }
+        (Some(f), None) => {
+            d.text = d.text.chars().take(MAX_FIELD_CHARS).collect();
+            let (runs, paras, paints) = rich_parts(&d);
+            let shown = f.shown(&d.text);
+            let l = field_lay(fonts, &anicraft_text::RichText { text: &shown, runs: &runs, paragraphs: &paras, width: f.wrap_width(d.box_width) }, d.align, &f, d.box_width).map_err(layout_err)?;
+            d.width = f.wrap_width(d.box_width);
+            let (b, n) = finish(d, l.pieces, &l.families, &paints);
+            Ok((b, n, Vec2::ZERO))
+        }
+        (None, None) => {
+            let l = fonts.layout_rich(&anicraft_text::RichText { text: &d.text, runs: &runs, paragraphs: &paras, width: d.width }, false).map_err(layout_err)?;
+            d.box_width = l.width;
+            d.box_height = l.height;
+            let (b, n) = finish(d, l.pieces, &l.families, &paints);
+            Ok((b, n, Vec2::ZERO))
+        }
+    }
 }
 
-/// A field's text laid out (ADR 0066): `shown` in the block's style, wrapped at the box less its
-/// gutters when it is multiline, aligned in the box, with the outline moved into the gutter.
-/// The carets are from the text's left edge (the alignment applied, not the gutter).
-pub fn field_layout(fonts: &Fonts, style: &TextStyle, field: &TextField, box_width: f32, shown: &str) -> std::result::Result<anicraft_text::Layout, anicraft_text::TextError> {
-    let wrap = field.wrap_width(box_width);
-    let mut l = fonts.layout(
-        shown,
-        &anicraft_text::Style {
-            family: style.font.clone(),
-            size: style.size,
-            bold: style.bold,
-            italic: style.italic,
-            align: match style.align {
-                TextAlign::Left => Align::Left,
-                TextAlign::Center => Align::Center,
-                TextAlign::Right => Align::Right,
-            },
-            letter_spacing: style.letter_spacing,
-            line_spacing: style.line_spacing,
-            width: wrap,
-        },
-    )?;
-    // Lines that don't wrap align against the widest; the widest aligns in the box.
+/// A field's rich text laid out in its box (ADR 0066): wrapped at the box less its gutters
+/// when multiline, the widest line aligned in the box when it doesn't wrap, and the outline
+/// (and its pieces) moved into the gutter. The carets are from the text's left edge.
+fn field_lay(fonts: &Fonts, rich: &anicraft_text::RichText, align: TextAlign, field: &TextField, box_width: f32) -> std::result::Result<anicraft_text::Layout, anicraft_text::TextError> {
+    let mut l = fonts.layout_rich(rich, false)?;
     let inner = (box_width - 2.0 * FIELD_GUTTER).max(0.0);
-    let shift = match (wrap, style.align) {
+    let shift = match (field.wrap_width(box_width), align) {
         (Some(_), _) | (None, TextAlign::Left) => 0.0,
         (None, TextAlign::Center) => ((inner - l.width) * 0.5).max(0.0),
         (None, TextAlign::Right) => (inner - l.width).max(0.0),
     };
-    l.outline = l.outline.transformed(&Affine::translate(FIELD_GUTTER + shift, FIELD_GUTTER));
+    let to = Affine::translate(FIELD_GUTTER + shift, FIELD_GUTTER);
+    l.outline = l.outline.transformed(&to);
+    for (_, p) in &mut l.pieces {
+        *p = p.transformed(&to);
+    }
     if shift != 0.0 {
         for line in &mut l.carets {
             for s in &mut line.stops {
@@ -187,89 +383,46 @@ pub fn field_layout(fonts: &Fonts, style: &TextStyle, field: &TextField, box_wid
     Ok(l)
 }
 
-/// A field block for `text`: laid out in its box (`box_width` × `box_height`).
-pub(crate) fn lay_out_field(text: &str, style: &TextStyle, field: &TextField, box_width: f32, box_height: f32) -> Result<(TextBlock, Option<String>)> {
-    let fonts = Fonts::get();
-    let text: String = text.chars().take(MAX_FIELD_CHARS).collect();
-    let l = field_layout(fonts, style, field, box_width, &field.shown(&text)).map_err(|e| EngineError::State(format!("can't lay out text: {e}")))?;
-    let note = (!style.font.trim().is_empty() && !l.family.eq_ignore_ascii_case(style.font.trim())).then(|| format!("“{}” isn't installed on this computer; used {}", style.font.trim(), l.family));
-    let block = TextBlock {
-        text,
-        font: l.family,
-        size: style.size,
-        bold: style.bold,
-        italic: style.italic,
-        color: style.color,
-        align: style.align,
-        letter_spacing: style.letter_spacing,
-        line_spacing: style.line_spacing,
-        width: field.wrap_width(box_width),
-        outline: Arc::new(l.outline),
-        box_width,
-        box_height,
-        field: Some(field.clone()),
-        on_path: None,
-    };
-    Ok((block, note))
+/// A field's text laid out in one style, as the player lays out text a script set or a viewer
+/// typed (ADR 0066).
+pub fn field_layout(fonts: &Fonts, style: &TextStyle, field: &TextField, box_width: f32, shown: &str) -> std::result::Result<anicraft_text::Layout, anicraft_text::TextError> {
+    let run = anicraft_text::Run { chars: usize::MAX, style: anicraft_text::RunStyle { family: style.font.clone(), size: style.size, bold: style.bold, italic: style.italic, letter_spacing: style.letter_spacing, ..anicraft_text::RunStyle::default() } };
+    let para = anicraft_text::ParaStyle { align: align_text(style.align), line_spacing: style.line_spacing, ..anicraft_text::ParaStyle::default() };
+    field_lay(fonts, &anicraft_text::RichText { text: shown, runs: &[run], paragraphs: &[para], width: field.wrap_width(box_width) }, style.align, field, box_width)
 }
 
-/// Text on a path (ADR 0070): `text` on one line (line breaks become spaces) set along `on`'s
-/// path. The block's space is moved so its box (the path and the glyphs together) starts at
-/// the origin, as every text box does: the second value is where that origin was, which the
-/// element's transform must move by (`transform × translate(shift)`) for nothing to move.
-pub(crate) fn lay_out_on_path(text: &str, style: &TextStyle, on: &TextPath) -> Result<(TextBlock, Option<String>, Vec2)> {
-    let fonts = Fonts::get();
-    let line: String = text.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
-    let layout = fonts
-        .layout_glyphs(&line, &anicraft_text::Style { family: style.font.clone(), size: style.size, bold: style.bold, italic: style.italic, align: Align::Left, letter_spacing: style.letter_spacing, line_spacing: 0.0, width: None })
-        .map_err(|e| EngineError::State(format!("can't lay out text: {e}")))?;
-    let note = (!style.font.trim().is_empty() && !layout.family.eq_ignore_ascii_case(style.font.trim())).then(|| format!("“{}” isn't installed on this computer; used {}", style.font.trim(), layout.family));
-    let align = match style.align {
-        TextAlign::Left => Align::Left,
-        TextAlign::Center => Align::Center,
-        TextAlign::Right => Align::Right,
-    };
-    let offset = if on.offset.is_finite() { on.offset.clamp(-MAX_PATH_OFFSET, MAX_PATH_OFFSET) } else { 0.0 };
-    let set = anicraft_text::on_path_boxed(&layout.glyphs, &on.path, anicraft_text::PathPlacement { offset, flip: on.flip, align }).ok_or_else(|| EngineError::State("the path has no length to set text along".into()))?;
-    let shift = set.shift;
-    let block = TextBlock {
-        text: text.to_string(),
-        font: layout.family,
-        size: style.size,
-        bold: style.bold,
-        italic: style.italic,
-        color: style.color,
-        align: style.align,
-        letter_spacing: style.letter_spacing,
-        line_spacing: style.line_spacing,
-        width: None,
-        outline: Arc::new(set.outline),
-        box_width: set.width,
-        box_height: set.height,
-        field: None,
-        on_path: Some(TextPath { path: set.path, offset, flip: on.flip }),
-    };
-    Ok((block, note, shift))
-}
-
-/// The block `t` with new text or style: a field keeps its box (or takes `width` as its new
-/// width); static text wraps at `width`; text on a path stays on it. With where the block's
-/// origin moved to ([`lay_out_on_path`]; zero for the others).
-pub(crate) fn relay(t: &TextBlock, text: &str, style: &TextStyle, width: Option<f32>) -> Result<(TextBlock, Option<String>, Vec2)> {
-    match (&t.field, &t.on_path) {
-        (_, Some(on)) => lay_out_on_path(text, style, on),
-        (Some(f), None) => lay_out_field(text, style, f, width.unwrap_or(t.box_width), t.box_height).map(|(b, n)| (b, n, Vec2::ZERO)),
-        (None, None) => lay_out(text, style, width).map(|(b, n)| (b, n, Vec2::ZERO)),
+/// `t` with its text changed to `text`, its runs and paragraphs following the change (one
+/// edit: what was typed continues the style before it).
+pub(crate) fn retext(t: &TextBlock, text: &str) -> TextBlock {
+    let mut d = t.clone();
+    if d.text == text {
+        return d;
     }
+    let (start, old_end, new_end) = rt::diff_chars(&t.text, text);
+    let runs = rt::type_into_runs(&t.styled_runs(), start, old_end, new_end - start);
+    let inserted: String = text.chars().skip(start as usize).take((new_end - start) as usize).collect();
+    let paras = rt::edit_paragraphs(&t.paragraph_styles(), &t.text, start, old_end, &inserted);
+    d.text = text.to_string();
+    d.set_styles(runs, paras);
+    d
 }
 
-/// What Find and Replace lays text out with: as before (static text, its fields' boxes
-/// dropped), except that text on a path stays on its path.
-pub(crate) fn relay_static(t: &TextBlock, text: &str, style: &TextStyle) -> Result<(TextBlock, Option<String>, Vec2)> {
-    match &t.on_path {
-        Some(on) => lay_out_on_path(text, style, on),
-        None => lay_out(text, style, t.width).map(|(b, n)| (b, n, Vec2::ZERO)),
-    }
+/// What Find and Replace lays text out with: the runs following the change, as static text
+/// (its fields' boxes dropped), except that text on a path stays on its path.
+pub(crate) fn relay_static(t: &TextBlock, text: &str) -> Result<(TextBlock, Option<String>, Vec2)> {
+    let mut d = retext(t, text);
+    d.field = None;
+    lay_out_block(&d)
+}
+
+/// `t` with every run's font set to `family`, laid out as [`relay_static`] does.
+pub(crate) fn refont_static(t: &TextBlock, family: &str) -> Result<(TextBlock, Option<String>, Vec2)> {
+    let mut d = t.clone();
+    let runs = rt::restyle_runs(&t.styled_runs(), 0, t.char_count(), |s| s.font = family.to_string());
+    let paras = d.paragraph_styles();
+    d.set_styles(runs, paras);
+    d.field = None;
+    lay_out_block(&d)
 }
 
 /// The selected static text, along a copy of a shape's outline (ADR 0070).
@@ -326,13 +479,12 @@ fn attach_path(s: &mut Session, p: &Value) -> Result<Value> {
             continue;
         }
         let ElementKind::Text(t) = &e.kind else { continue };
-        let style = style_of(t);
         let offset = offset.unwrap_or(match t.align {
             TextAlign::Left => 0.0,
             TextAlign::Center => length * 0.5,
             TextAlign::Right => length,
         });
-        let (block, note, shift) = lay_out_on_path(&t.text, &style, &TextPath { path: first.clone(), offset, flip })?;
+        let (block, note, shift) = lay_out_block(&TextBlock { field: None, width: None, on_path: Some(TextPath { path: first.clone(), offset, flip }), ..(**t).clone() })?;
         // The path is in stage space; the text's new space is the path's, moved to its box.
         e.transform = Affine::translate(shift.x, shift.y);
         out = json!({"element": e.id.0, "length": length, "offset": offset, "flip": flip, "note": note});
@@ -354,17 +506,16 @@ fn set_path(s: &mut Session, p: &Value) -> Result<Value> {
     for e in s.selected_elements_mut()? {
         let ElementKind::Text(t) = &e.kind else { continue };
         let Some(on) = &t.on_path else { continue };
-        let style = style_of(t);
         if release {
             // Back to a line of text, its box where the text started along the path.
             let start = t.outline.bounds();
-            let (block, _) = lay_out(&t.text, &style, None)?;
+            let (block, _, _) = lay_out_block(&TextBlock { on_path: None, width: None, ..(**t).clone() })?;
             let at = if start.min.x.is_finite() { start.min } else { Vec2::ZERO };
             e.transform = e.transform.mul(&Affine::translate(at.x, at.y));
             e.kind = ElementKind::Text(Arc::new(block));
         } else {
             let on = TextPath { offset: offset.unwrap_or(on.offset), flip: flip.unwrap_or(on.flip), ..on.clone() };
-            let (block, _, shift) = lay_out_on_path(&t.text, &style, &on)?;
+            let (block, _, shift) = lay_out_block(&TextBlock { on_path: Some(on), ..(**t).clone() })?;
             e.transform = e.transform.mul(&Affine::translate(shift.x, shift.y));
             e.kind = ElementKind::Text(Arc::new(block));
         }
@@ -411,7 +562,6 @@ fn set_field(s: &mut Session, p: &Value) -> Result<Value> {
             return Err(EngineError::State("text on a path is static text (release it from the path first)".into()));
         }
         let to = kind.unwrap_or(t.kind());
-        let style = style_of(t);
         let (block, note) = if to == TextKind::Static {
             if t.field.is_none() {
                 continue;
@@ -419,7 +569,8 @@ fn set_field(s: &mut Session, p: &Value) -> Result<Value> {
             // Back to static text: laid out as before fields, the words where they were.
             e.transform = e.transform.mul(&Affine::translate(FIELD_GUTTER, FIELD_GUTTER));
             e.name.clear();
-            lay_out(&t.text, &style, t.field.as_ref().and_then(|f| f.wrap_width(t.box_width)))?
+            let (b, n, _) = lay_out_block(&TextBlock { field: None, width: t.field.as_ref().and_then(|f| f.wrap_width(t.box_width)), ..(**t).clone() })?;
+            (b, n)
         } else {
             let (bw, bh) = if t.field.is_some() { (t.box_width, t.box_height) } else { field_box(t) };
             // Wrapped text becomes a multiline field, text with line breaks a multiline one
@@ -455,7 +606,8 @@ fn set_field(s: &mut Session, p: &Value) -> Result<Value> {
             if let Some(v) = &variable {
                 f.variable.clone_from(v);
             }
-            lay_out_field(&t.text, &style, &f.sanitized(), width.unwrap_or(bw), height.unwrap_or(bh))?
+            let (b, n, _) = lay_out_block(&TextBlock { field: Some(f.sanitized()), box_width: width.unwrap_or(bw), box_height: height.unwrap_or(bh), ..(**t).clone() })?;
+            (b, n)
         };
         notes.extend(note);
         e.kind = ElementKind::Text(Arc::new(block));
@@ -468,8 +620,19 @@ fn set_field(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"changed": changed, "note": notes.first()}))
 }
 
-pub(crate) fn style_of(t: &TextBlock) -> TextStyle {
-    TextStyle { font: t.font.clone(), size: t.size, bold: t.bold, italic: t.italic, color: t.color, align: t.align, letter_spacing: t.letter_spacing, line_spacing: t.line_spacing }
+
+/// The style a block starts with: `base`, with the params' character and paragraph keys.
+fn new_style(p: &Value, base: &TextStyle) -> Result<(CharStyle, ParagraphStyle)> {
+    let mut c = CharStyle { font: base.font.clone(), size: base.size, bold: base.bold, italic: base.italic, color: base.color, letter_spacing: base.letter_spacing, ..CharStyle::default() };
+    CharPatch::parse(p)?.apply(&mut c);
+    let mut q = ParagraphStyle { align: base.align, line_spacing: base.line_spacing, ..ParagraphStyle::default() };
+    ParaPatch::parse(p)?.apply(&mut q);
+    Ok((c, q))
+}
+
+/// The last style used, from a block (what new text gets next).
+fn remember(s: &mut Session, b: &TextBlock) {
+    s.text_style = TextStyle { font: b.font.clone(), size: b.size, bold: b.bold, italic: b.italic, color: b.color, align: b.align, letter_spacing: b.letter_spacing, line_spacing: b.line_spacing };
 }
 
 fn create(s: &mut Session, p: &Value) -> Result<Value> {
@@ -479,56 +642,225 @@ fn create(s: &mut Session, p: &Value) -> Result<Value> {
     if text.trim().is_empty() && kind == TextKind::Static {
         return Err(EngineError::Param("'text' is empty".into()));
     }
-    let style = style_param(p, &s.text_style)?;
+    if text.chars().count() > anicraft_text::MAX_CHARS {
+        return Err(EngineError::Param(format!("text is limited to {} characters per block", anicraft_text::MAX_CHARS)));
+    }
+    let (cs, ps) = new_style(p, &s.text_style)?;
     let width = width_param(p, None)?;
-    let (block, note) = lay_out(&text, &style, width)?;
+    let mut d = TextBlock { text: text.clone(), width, ..TextBlock::default() };
+    let runs = runs_param(p, &cs)?.unwrap_or_else(|| vec![TextRun { chars: u32::MAX, style: cs.clone() }]);
+    let paras = paragraphs_param(p, &ps)?.unwrap_or_else(|| vec![ps]);
+    d.set_styles(runs, paras);
+    let (block, note, _) = lay_out_block(&d)?;
     let (block, note) = if kind == TextKind::Static {
         (block, note)
     } else {
         let (bw, bh) = field_box(&block);
-        let f = TextField { lines: if width.is_some() { LineType::Multiline } else if text.contains('\n') { LineType::MultilineNoWrap } else { LineType::Single }, ..TextField::new(kind) };
-        lay_out_field(&text, &style, &f, bw, bh)?
+        let lines = if width.is_some() {
+            LineType::Multiline
+        } else if text.contains('\n') {
+            LineType::MultilineNoWrap
+        } else {
+            LineType::Single
+        };
+        let f = TextField { lines, ..TextField::new(kind) };
+        let (b, n, _) = lay_out_block(&TextBlock { field: Some(f), box_width: bw, box_height: bh, ..block })?;
+        (b, n)
     };
     let x = opt_f32(p, "x")?.unwrap_or((s.doc.stage.width as f32 - block.box_width) * 0.5);
     let y = opt_f32(p, "y")?.unwrap_or((s.doc.stage.height as f32 - block.box_height) * 0.5);
     let id = ElementId(s.doc.alloc_id());
-    let out = json!({"element": id.0, "font": block.font, "width": block.box_width, "height": block.box_height, "note": note});
-    s.text_style = TextStyle { font: block.font.clone(), ..style };
+    let out = json!({"element": id.0, "font": block.font, "width": block.box_width, "height": block.box_height, "runs": block.runs.len().max(1), "note": note});
+    remember(s, &block);
     let el = Element { id, name: String::new(), transform: Affine::translate(x, y), color: ColorEffect::default(), kind: ElementKind::Text(Arc::new(block)) };
     s.editable_keyframe()?.elements.push(Arc::new(el));
     s.select_only([id]);
     Ok(out)
 }
 
+/// Lays `d` out where `e` stands (text on a path keeps its place) and puts it in.
+fn put(e: &mut Element, d: &TextBlock) -> Result<(TextBlock, Option<String>)> {
+    let (block, note, shift) = lay_out_block(d)?;
+    e.transform = e.transform.mul(&Affine::translate(shift.x, shift.y));
+    e.kind = ElementKind::Text(Arc::new(block.clone()));
+    Ok((block, note))
+}
+
 fn edit(s: &mut Session, p: &Value) -> Result<Value> {
     let new_text = opt_str(p, "text")?.map(str::to_string);
+    if new_text.as_ref().is_some_and(|t| t.chars().count() > anicraft_text::MAX_CHARS) {
+        return Err(EngineError::Param(format!("text is limited to {} characters per block", anicraft_text::MAX_CHARS)));
+    }
+    let (cp, pp) = (CharPatch::parse(p)?, ParaPatch::parse(p)?);
     let mut notes = Vec::new();
     let mut edited = 0;
-    let mut last_style = None;
+    let mut last = None;
     for e in s.selected_elements_mut()? {
         let ElementKind::Text(t) = &e.kind else { continue };
-        let style = style_param(p, &style_of(t))?;
         let text = new_text.clone().unwrap_or_else(|| t.text.clone());
         // Fields may be empty (a script or the viewer fills them); static text may not.
         if text.trim().is_empty() && t.field.is_none() {
             return Err(EngineError::Param("'text' is empty (delete the text instead)".into()));
         }
-        let width = if t.field.is_some() { width_param(p, Some(t.box_width))?.or(Some(t.box_width)).map(|w| w.max(1.0)) } else { width_param(p, t.width)? };
-        let (block, note, shift) = relay(t, &text, &style, width)?;
+        // The text changed: the runs follow; then new runs and paragraphs, if given.
+        let mut d = retext(t, &text);
+        let runs = runs_param(p, &d.char_style())?.unwrap_or_else(|| d.styled_runs());
+        let paras = paragraphs_param(p, &d.para_style())?.unwrap_or_else(|| d.paragraph_styles());
+        // Style keys apply to every character and paragraph.
+        let n = d.char_count();
+        let runs = if cp.is_empty() { runs } else { rt::restyle_runs(&runs, 0, n, |st| cp.apply(st)) };
+        let paras: Vec<ParagraphStyle> = paras
+            .into_iter()
+            .map(|mut q| {
+                pp.apply(&mut q);
+                q
+            })
+            .collect();
+        d.set_styles(runs, paras);
+        if t.field.is_some() {
+            d.box_width = width_param(p, Some(t.box_width))?.unwrap_or(t.box_width).max(1.0);
+        } else {
+            d.width = width_param(p, t.width)?;
+        }
+        let (block, note) = put(e, &d)?;
         notes.extend(note);
-        last_style = Some(TextStyle { font: block.font.clone(), ..style });
-        e.transform = e.transform.mul(&Affine::translate(shift.x, shift.y));
-        e.kind = ElementKind::Text(Arc::new(block));
+        last = Some(block);
         edited += 1;
     }
     if edited == 0 {
         return Err(EngineError::State("the selection has no text".into()));
     }
-    if let Some(st) = last_style {
-        s.text_style = st;
+    if let Some(b) = last {
+        remember(s, &b);
     }
     notes.dedup();
     Ok(json!({"edited": edited, "note": notes.first()}))
+}
+
+/// `text.style`: characters `start..end` of the selected text restyled.
+fn style_range(s: &mut Session, p: &Value) -> Result<Value> {
+    let cp = CharPatch::parse(p)?;
+    if cp.is_empty() {
+        return Err(EngineError::Param(format!("give a style to set: {CHAR_KEYS}")));
+    }
+    let mut changed = 0;
+    let mut notes = Vec::new();
+    for e in s.selected_elements_mut()? {
+        let ElementKind::Text(t) = &e.kind else { continue };
+        let (start, end) = range_param(p, t.char_count())?;
+        let mut d = (**t).clone();
+        let runs = rt::restyle_runs(&t.styled_runs(), start, end, |st| cp.apply(st));
+        d.set_styles(runs, t.paragraph_styles());
+        let (_, note) = put(e, &d)?;
+        notes.extend(note);
+        changed += 1;
+    }
+    if changed == 0 {
+        return Err(EngineError::State("the selection has no text".into()));
+    }
+    Ok(json!({"changed": changed, "note": notes.first()}))
+}
+
+/// `text.paragraph`: the paragraphs characters `start..end` touch, laid out anew.
+fn paragraph_range(s: &mut Session, p: &Value) -> Result<Value> {
+    let pp = ParaPatch::parse(p)?;
+    if pp.is_empty() {
+        return Err(EngineError::Param(format!("give a paragraph setting: {PARA_KEYS}")));
+    }
+    let mut changed = 0;
+    for e in s.selected_elements_mut()? {
+        let ElementKind::Text(t) = &e.kind else { continue };
+        let (start, end) = range_param(p, t.char_count())?;
+        let range = rt::paragraphs_in(&t.text, start, end);
+        let mut paras = t.paragraph_styles();
+        for (i, q) in paras.iter_mut().enumerate() {
+            if range.contains(&i) {
+                pp.apply(q);
+            }
+        }
+        let mut d = (**t).clone();
+        d.set_styles(t.styled_runs(), paras);
+        put(e, &d)?;
+        changed += 1;
+    }
+    if changed == 0 {
+        return Err(EngineError::State("the selection has no text".into()));
+    }
+    Ok(json!({"changed": changed}))
+}
+
+fn hex_of(c: Rgba) -> String {
+    let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!("#{:02x}{:02x}{:02x}", b(c.r), b(c.g), b(c.b))
+}
+
+fn style_json(c: &CharStyle) -> Value {
+    json!({"font": c.font, "size": c.size, "bold": c.bold, "italic": c.italic, "color": hex_of(c.color), "letter_spacing": c.letter_spacing, "shift": c.shift.key(), "underline": c.underline, "url": c.url})
+}
+
+fn align_key(a: TextAlign) -> &'static str {
+    match a {
+        TextAlign::Left => "left",
+        TextAlign::Center => "center",
+        TextAlign::Right => "right",
+    }
+}
+
+fn para_json(q: &ParagraphStyle) -> Value {
+    json!({"align": align_key(q.align), "indent": q.indent, "left_margin": q.left_margin, "right_margin": q.right_margin, "line_spacing": q.line_spacing})
+}
+
+/// What a summary shares (a mixed attribute is `null`).
+pub fn summary_json(m: &StyleSummary) -> Value {
+    json!({
+        "font": m.font, "size": m.size, "bold": m.bold, "italic": m.italic, "color": m.color.map(hex_of),
+        "letter_spacing": m.letter_spacing, "shift": m.shift.map(BaselineShift::key), "underline": m.underline, "url": m.url,
+    })
+}
+
+/// `text.styles`: the first selected text's runs, paragraphs, and what a range shares.
+fn styles_of(s: &mut Session, p: &Value) -> Result<Value> {
+    let t = s
+        .selected_elements()
+        .into_iter()
+        .find_map(|(_, e)| match &e.kind {
+            ElementKind::Text(t) => Some(t.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| EngineError::State("select a text block".into()))?;
+    let (start, end) = range_param(p, t.char_count())?;
+    let runs: Vec<Value> = t
+        .styled_runs()
+        .iter()
+        .map(|r| {
+            let mut v = style_json(&r.style);
+            v["chars"] = json!(r.chars);
+            v
+        })
+        .collect();
+    let range = rt::paragraphs_in(&t.text, start, end);
+    let paras = t.paragraph_styles();
+    let shared = |f: &dyn Fn(&ParagraphStyle) -> Value| -> Value {
+        let mut it = paras.iter().enumerate().filter(|(i, _)| range.contains(i)).map(|(_, q)| f(q));
+        let first = it.next().unwrap_or(Value::Null);
+        if it.all(|v| v == first) { first } else { Value::Null }
+    };
+    let paragraph = json!({
+        "align": shared(&|q| json!(align_key(q.align))),
+        "indent": shared(&|q| json!(q.indent)),
+        "left_margin": shared(&|q| json!(q.left_margin)),
+        "right_margin": shared(&|q| json!(q.right_margin)),
+        "line_spacing": shared(&|q| json!(q.line_spacing)),
+    });
+    Ok(json!({
+        "text": t.text,
+        "runs": runs,
+        "paragraphs": paras.iter().map(para_json).collect::<Vec<_>>(),
+        "start": start,
+        "end": end,
+        "selection": summary_json(&rt::summarize(&t.styled_runs(), start, end)),
+        "paragraph": paragraph,
+    }))
 }
 
 fn fonts(_: &mut Session, _: &Value) -> Result<Value> {
@@ -536,8 +868,17 @@ fn fonts(_: &mut Session, _: &Value) -> Result<Value> {
     Ok(json!({"families": f.families(), "default": f.resolve("")}))
 }
 
-/// A text block as a plain shape with the same outlines (Break Apart).
-pub(crate) fn to_shape(t: &TextBlock) -> anicraft_doc::Shape {
-    let path: Arc<Path> = t.outline.clone();
-    anicraft_doc::Shape { path, fill: Some(anicraft_doc::Paint::Solid(t.color)), stroke: None, fill_rule: anicraft_geom::FillRule::NonZero, merge: false, warp: None }
+/// A text block as plain shapes with the same outlines, one per colour (Break Apart).
+pub(crate) fn to_shapes(t: &TextBlock) -> Vec<anicraft_doc::Shape> {
+    t.fill_paths()
+        .into_iter()
+        .filter(|(_, _, p)| !p.cmds.is_empty() || t.fills.is_empty())
+        .map(|(color, _, path)| anicraft_doc::Shape { path, fill: Some(anicraft_doc::Paint::Solid(color)), stroke: None, fill_rule: anicraft_geom::FillRule::NonZero, merge: false, warp: None })
+        .collect()
+}
+
+/// The one style a block's runtime text is laid out in (its first run's), for fields a script
+/// or the viewer changes (ADR 0066).
+pub(crate) fn style_of(t: &TextBlock) -> TextStyle {
+    TextStyle { font: t.font.clone(), size: t.size, bold: t.bold, italic: t.italic, color: t.color, align: t.align, letter_spacing: t.letter_spacing, line_spacing: t.line_spacing }
 }

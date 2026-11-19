@@ -8,7 +8,21 @@ look at frames and export through the same commands the app uses.
 anicraft-cli mcp                      # a new, empty document
 anicraft-cli mcp scene.anicraft       # open a document
 anicraft-cli mcp --sample             # the sample animation
+anicraft-cli mcp --bridge 9878        # the AniCraft window you have open (below)
 ```
+
+## Headless or live
+
+Without `--bridge` the server edits a document of its own, with no window: good for pipelines and
+batch work. Save it (`file.save`) to keep the result.
+
+With `--bridge <port>` the same tools act on the AniCraft window you have open, started with
+`anicraft --control <port>`: every edit appears there at once, and Ctrl+Z undoes it
+(`docs/control-protocol.md`, ADR 0104). The server starts even when AniCraft isn't open (an
+assistant starts its servers when it starts) and connects on the first tool call; until AniCraft is
+open with remote control, the tools answer with how to start it. Close and reopen AniCraft whenever
+you like: the next call reconnects, with no need to restart the assistant. It finds the run's token
+in `control.json` in AniCraft's settings folder, so there is nothing to copy.
 
 The server talks MCP's stdio transport: JSON-RPC 2.0, one message per line on stdin and stdout.
 It speaks protocol revisions 2025-06-18, 2025-03-26 and 2024-11-05.
@@ -23,6 +37,19 @@ Most clients take a server entry like this one (use the full path to `anicraft-c
     "anicraft": {
       "command": "/path/to/anicraft-cli",
       "args": ["mcp", "/path/to/scene.anicraft"]
+    }
+  }
+}
+```
+
+For live editing, start AniCraft with `--control 9878` (a desktop shortcut is handy) and use:
+
+```json
+{
+  "mcpServers": {
+    "anicraft": {
+      "command": "C:\\path\\to\\anicraft-cli.exe",
+      "args": ["mcp", "--bridge", "9878"]
     }
   }
 }
@@ -43,6 +70,11 @@ with every release, and `anicraft_commands` lets it find what it needs. Frames i
 0-based, as everywhere in the engine (the CLI's own `--frame` flags are 1-based, as in the
 timeline).
 
+Saved commands (ADR 0097) run through `anicraft_run` too: `macro.run` with `{"path": …}` (a
+saved command's file) or `{"steps": [{"cmd", "params"}]}` runs the steps as one undo step, and
+unlike `anicraft_run_script` a failing step leaves the document as it was. `macro.history` and
+`macro.save` turn the session's undo steps into a saved command.
+
 ## Safety
 
 * Everything runs through the engine's commands, so params are checked and every edit can be
@@ -54,3 +86,6 @@ timeline).
   save, import, export), as with the CLI. Only connect clients you trust with those files.
 * A failing command comes back as a tool result marked as an error, so the assistant can read
   the message and try again; it never stops the server.
+* Live (`--bridge`): an edit whose answer was lost (AniCraft closed mid-call) is never sent again,
+  since it may have been made; the assistant is told to check with `anicraft_document`. While you
+  are dragging, the assistant's edits wait until you let go, so the two stay separate undo steps.

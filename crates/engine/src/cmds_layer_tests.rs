@@ -154,7 +154,7 @@ fn layer_properties_set_everything_as_one_step_or_nothing() {
     let (mut s, top, bottom) = two_walks();
     let undo = s.history.undo_len();
     let r = run(&mut s, "layer.set_properties", json!({"layer": bottom.0, "name": "Sky", "color": "#123456", "outline": true, "height": 200, "locked": true, "visible": false, "onion": false, "type": "guide"}));
-    assert_eq!(r, json!({"layer": bottom.0, "name": "Sky", "type": "guide", "mask": null, "color": "#123456", "outline": true, "height": 200, "visible": false, "locked": true, "onion": false}));
+    assert_eq!(r, json!({"layer": bottom.0, "name": "Sky", "type": "guide", "mask": null, "color": "#123456", "outline": true, "height": 200, "opacity": 100.0, "visible": false, "locked": true, "onion": false}));
     assert_eq!(s.history.undo_len(), undo + 1, "one undo step");
     assert_eq!(run(&mut s, "layer.properties", json!({"layer": bottom.0})), r);
     // The same type again changes nothing (a masked layer stays masked by the same mask).

@@ -96,43 +96,9 @@ fn flv(data: &[u8]) -> Option<Video> {
 /// then every block bottom row first, left to right, each a 16-bit size and zlib-compressed BGR
 /// pixels, bottom row first. A key frame has every block.
 fn screen_video(p: &[u8]) -> Option<Video> {
-    let h0 = u16::from_be_bytes([*p.first()?, *p.get(1)?]);
-    let h1 = u16::from_be_bytes([*p.get(2)?, *p.get(3)?]);
-    let (bw, w) = ((usize::from(h0 >> 12) + 1) * 16, usize::from(h0 & 0x0fff));
-    let (bh, h) = ((usize::from(h1 >> 12) + 1) * 16, usize::from(h1 & 0x0fff));
-    if w == 0 || h == 0 || w > MAX_BITMAP_EDGE as usize || h > MAX_BITMAP_EDGE as usize {
-        return None;
-    }
-    let mut rgba = vec![0u8; w * h * 4];
-    let mut at = 4usize;
-    // Block rows from the bottom of the picture.
-    for by in 0..h.div_ceil(bh) {
-        for bx in 0..w.div_ceil(bw) {
-            let (x0, y0) = (bx * bw, by * bh);
-            let (cw, ch) = (bw.min(w - x0), bh.min(h - y0));
-            let size = usize::from(u16::from_be_bytes([*p.get(at)?, *p.get(at + 1)?]));
-            let packed = p.get(at + 2..at + 2 + size)?;
-            at += 2 + size;
-            if size == 0 {
-                // An unchanged block can't be in a key frame.
-                return None;
-            }
-            let want = cw * ch * 3;
-            let bgr = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(packed, want).ok()?;
-            if bgr.len() != want {
-                return None;
-            }
-            for (row, line) in bgr.chunks_exact(cw * 3).enumerate() {
-                // Rows count up from the bottom; the bitmap's rows count down from the top.
-                let y = h - 1 - (y0 + row);
-                for (col, px) in line.as_chunks::<3>().0.iter().enumerate() {
-                    let i = (y * w + x0 + col) * 4;
-                    rgba.get_mut(i..i + 4)?.copy_from_slice(&[px[2], px[1], px[0], 255]);
-                }
-            }
-        }
-    }
-    Some(Video::Frame { width: w as u32, height: h as u32, rgba })
+    let max_rgba_bytes = (MAX_BITMAP_EDGE as usize).checked_mul(MAX_BITMAP_EDGE as usize)?.checked_mul(4)?;
+    let frame = craft_video::screen_video::decode_keyframe(p, MAX_BITMAP_EDGE, max_rgba_bytes)?;
+    Some(Video::Frame { width: frame.width, height: frame.height, rgba: frame.rgba })
 }
 
 #[cfg(test)]

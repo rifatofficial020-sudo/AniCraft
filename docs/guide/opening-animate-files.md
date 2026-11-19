@@ -111,8 +111,10 @@ These come across, but look a little different from Animate, and the report coun
   (played without an effect).
 * **Video playback.** Videos other than Screen Video (Sorenson H.263, On2 VP6, H.264, linked
   MPEG-4 files) are named in the report, not shown; their instances are left out.
-* Frame comments, filters on text, and linkage classes on bitmaps and sounds.
+* Frame comments, and linkage classes on bitmaps and sounds.
 * Camera layers and bone armatures don't come across as a camera or an armature.
+* **Layer parenting** doesn't come across: parented layers open as plain layers. Parent them
+  again in the timeline's [parenting view](timeline.md#layer-parenting).
 * Anything AniCraft doesn't recognise at all is counted as "other elements".
 
 ## Fonts
@@ -130,6 +132,8 @@ computers without the font.
 * A `.fla` saved by **Flash CS4 or earlier** uses an older format AniCraft can't read. AniCraft
   says so: open it in Animate and save it again, then open that copy.
 * A renamed `.fla` still opens; AniCraft recognises it by what is inside.
+* Flash and Animate write most `.fla` files with a small slip in the archive's closing record
+  (it overstates the size of the file list). AniCraft opens them as Animate does.
 * Archives made by different zip tools open, large ones included: a zipped XFL folder (the
   document inside one top folder, with or without the `__MACOSX` folder macOS adds), and a
   self-extracting archive renamed to `.fla`. A zip holding several documents in their own

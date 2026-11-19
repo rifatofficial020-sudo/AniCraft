@@ -444,7 +444,17 @@ mod tests {
             Some(ElementKind::Shape(sh)) => sh.clone(),
             _ => panic!("a shape"),
         };
-        assert_eq!(shape(&app).stroke.map(|s| s.color), Some(Rgba::hex(0x00ff00)));
+        // A raw rectangle is a fill plus its stroke pieces (ADR 0042), and the pieces take the colour.
+        let strokes: Vec<Rgba> = app
+            .s
+            .selected_elements()
+            .iter()
+            .filter_map(|(_, e)| match &e.kind {
+                ElementKind::Shape(sh) => sh.stroke.as_ref().map(|s| s.color),
+                _ => None,
+            })
+            .collect();
+        assert!(!strokes.is_empty() && strokes.iter().all(|c| *c == Rgba::hex(0x00ff00)), "{strokes:?}");
         // A gradient goes to the fill whatever is active.
         let ball = app.s.doc.swatches.iter().position(|w| w.name == "Blue ball").unwrap();
         apply(&mut app, ball);

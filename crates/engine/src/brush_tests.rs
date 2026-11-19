@@ -143,6 +143,68 @@ fn paint_normal_covers_and_merges_with_raw_shapes() {
 }
 
 #[test]
+fn a_wash_stays_its_own_shape_and_composites() {
+    let mut s = blank(false);
+    run(&mut s, "draw.rect", json!({"x": 100, "y": 100, "w": 200, "h": 100, "fill": BLUE, "stroke": null}));
+    let r = run(&mut s, "draw.brush", json!({"points": stroke(50.0, 150.0, 350.0, 150.0), "size": 20, "color": "#ff000080"}));
+    assert_eq!(r["merged"], false, "a wash is not cut into the drawing");
+    let blue = shapes(&s).iter().filter(|(sh, _)| fill_of(sh) == Some(Rgba::hex(0x0000ff))).count();
+    assert_eq!(blue, 1, "the rectangle behind the wash is still one shape");
+    let drawn = shapes(&s);
+    let wash = drawn.iter().find(|(sh, _)| fill_of(sh).is_some_and(|c| c.r > 0.9 && c.a < 1.0)).expect("the wash");
+    let wash_a = fill_of(&wash.0).expect("solid wash").a;
+    assert!(!wash.0.merge && (wash_a - 128.0 / 255.0).abs() < 0.01, "{wash_a}");
+    // A second wash of the same colour crosses it and stays separate, so the overlap darkens.
+    run(&mut s, "draw.brush", json!({"points": stroke(200.0, 60.0, 200.0, 240.0), "size": 20, "color": "#ff000080"}));
+    let washes = shapes(&s).iter().filter(|(sh, _)| fill_of(sh).is_some_and(|c| c.a < 1.0)).count();
+    assert_eq!(washes, 2, "washes of one colour do not join");
+    let px = |x, y| anicraft_render::render_frame(&s.doc, 0, 1.0).unwrap().pixel(x, y).unwrap();
+    let one = px(120, 150);
+    let two = px(200, 150);
+    let bare = px(150, 120);
+    assert!(bare[2] > 0.9 && bare[0] < 0.1, "blue only: {bare:?}");
+    assert!(one[0] > 0.35 && one[0] < 0.65 && one[2] > 0.35 && one[2] < 0.65, "one wash over blue: {one:?}");
+    assert!(two[0] > one[0] + 0.1 && two[2] < one[2] - 0.1, "two washes darken: {one:?} {two:?}");
+}
+
+#[test]
+fn pressure_opacity_and_a_clear_gradient_stay_separate() {
+    let mut s = blank(false);
+    let pts: Vec<Value> = (0..=20).map(|i| json!([i as f32 * 10.0, 80.0, 0.25])).collect();
+    let r = run(&mut s, "draw.brush", json!({"points": pts, "size": 16, "color": RED, "pressure_opacity": true, "pressure_size": false}));
+    assert_eq!(r["merged"], false);
+    let drawn = shapes(&s);
+    let (sh, _) = drawn.last().expect("the stroke");
+    let a = fill_of(sh).expect("a solid").a;
+    assert!(!sh.merge && (a - 0.25).abs() < 0.02, "average pressure is the alpha: {a}");
+
+    let mut g = blank(false);
+    run(&mut g, "draw.rect", json!({"x": 40, "y": 40, "w": 80, "h": 40, "fill": BLUE, "stroke": null}));
+    run(&mut g, "paint.set_fill", json!({"type": "linear", "selection": false, "stops": [{"offset": 0, "color": "#ff0000ff"}, {"offset": 1, "color": "#ff000000"}]}));
+    let r = run(&mut g, "draw.brush", json!({"points": stroke(20.0, 60.0, 140.0, 60.0), "size": 12}));
+    assert_eq!(r["merged"], false);
+    assert_eq!(shapes(&g).iter().filter(|(sh, _)| fill_of(sh) == Some(Rgba::hex(0x0000ff))).count(), 1, "the rectangle is not cut");
+    assert!(shapes(&g).iter().any(|(sh, _)| matches!(sh.fill, Some(Paint::Linear { .. })) && !sh.merge));
+
+    // An opaque gradient still joins the drawing.
+    let mut o = blank(false);
+    run(&mut o, "draw.rect", json!({"x": 40, "y": 40, "w": 80, "h": 40, "fill": BLUE, "stroke": null}));
+    run(&mut o, "paint.set_fill", json!({"type": "linear", "selection": false, "stops": [{"offset": 0, "color": "#ff0000"}, {"offset": 1, "color": "#00ff00"}]}));
+    let r = run(&mut o, "draw.brush", json!({"points": stroke(20.0, 60.0, 140.0, 60.0), "size": 12}));
+    assert_eq!(r["merged"], true);
+}
+
+#[test]
+fn a_translucent_paint_brush_line_does_not_merge() {
+    let mut s = blank(false);
+    let r = run(&mut s, "draw.brush", json!({"points": stroke(10.0, 10.0, 80.0, 10.0), "size": 8, "as_stroke": true, "color": "#ff000080"}));
+    assert_ne!(r["merged"], true);
+    let (sh, _) = &shapes(&s)[0];
+    let a = sh.stroke.as_ref().map(|st| st.color.a).unwrap_or(1.0);
+    assert!(!sh.merge && (a - 128.0 / 255.0).abs() < 0.01, "{a}");
+}
+
+#[test]
 fn paint_behind_only_fills_empty_areas() {
     for object in [false, true] {
         let mut s = blank(object);
@@ -306,4 +368,56 @@ fn a_pressured_paint_brush_line_is_raw_now() {
     let all = shapes(&s);
     assert_eq!(all.len(), 1);
     assert!(all[0].0.merge && all[0].0.stroke.as_ref().is_some_and(|st| st.profile.is_some()));
+}
+
+/// A small deterministic generator for the stroke fuzz below.
+struct Lcg(u64);
+impl Lcg {
+    fn next(&mut self) -> f32 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((self.0 >> 40) as f32) / ((1u64 << 24) as f32)
+    }
+}
+
+/// About one turn (6.28 exactly, not τ: the seeds below were found with it).
+const TURN: f32 = 157.0 / 25.0;
+
+/// A hand-like stroke: a wobbly curve between two random points.
+fn wobbly(r: &mut Lcg, n: usize) -> Vec<[f32; 2]> {
+    let (x0, y0, x1, y1) = (60.0 + r.next() * 380.0, 60.0 + r.next() * 280.0, 60.0 + r.next() * 380.0, 60.0 + r.next() * 280.0);
+    let (amp, waves, phase) = (5.0 + r.next() * 40.0, 0.5 + r.next() * 2.5, r.next() * TURN);
+    let (dx, dy) = (x1 - x0, y1 - y0);
+    let len = (dx * dx + dy * dy).sqrt().max(1.0);
+    (0..=n)
+        .map(|i| {
+            let t = i as f32 / n as f32;
+            let w = amp * (t * waves * TURN + phase).sin();
+            [x0 + dx * t - dy / len * w, y0 + dy * t + dx / len * w]
+        })
+        .collect()
+}
+
+/// #308: brush strokes that cross earlier ones never make the earlier drawing disappear. Each
+/// scenario paints seven wobbly strokes of one colour in merge drawing, and the same strokes as
+/// separate objects for reference: wherever the reference is painted along a stroke's centre,
+/// the merged drawing is too (a point or two may differ where a thin stroke's edge moves by the
+/// snapping distance). Before the planarity check in the merge, four of these 120 scenarios
+/// lost most or all of the drawing (the last one every stroke).
+#[test]
+fn crossing_brush_strokes_keep_what_was_drawn() {
+    for seed in (0..116u64).chain([196, 218, 354, 28]) {
+        let mut r = Lcg(seed * 7919 + 13);
+        let (mut s, mut reference) = (blank(false), blank(true));
+        let size = [3.0, 5.0, 8.0, 14.0][(seed % 4) as usize];
+        let mut drawn: Vec<[f32; 2]> = Vec::new();
+        for k in 0..7 {
+            let pts = wobbly(&mut r, 40);
+            let p = json!({"points": pts, "size": size, "color": RED});
+            run(&mut s, "draw.brush", p.clone());
+            run(&mut reference, "draw.brush", p);
+            drawn.extend(pts.iter().copied());
+            let lost = drawn.iter().map(|p| Vec2::new(p[0], p[1])).filter(|&p| top_at(&reference, p).is_some() && top_at(&s, p).is_none()).count();
+            assert!(lost <= 2, "seed {seed}, size {size}, stroke {k}: {lost} of {} painted points are gone", drawn.len());
+        }
+    }
 }

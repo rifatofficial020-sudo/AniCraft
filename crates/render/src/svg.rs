@@ -79,8 +79,9 @@ pub fn to_svg(dl: &DisplayList, stage: &Stage) -> String {
     // Groups that fade as one become `<g opacity>` around their run of items.
     let chains = crate::group_chains(&dl.groups);
     let mut open: Vec<u32> = Vec::new();
-    for item in dl.items.iter().filter(|it| it.masks.is_none() && !it.guide) {
+    for (index, item) in dl.items.iter().enumerate().filter(|(_, it)| it.masks.is_none() && !it.guide) {
         let Some(d) = stage_path(item) else { continue };
+        let link = dl.links.binary_search_by_key(&(index as u32), |l| l.0).ok().and_then(|i| dl.links.get(i)).and_then(|l| anicraft_doc::safe_url(&l.1));
         let want = item.group.and_then(|g| chains.get(g as usize)).map_or(&[][..], Vec::as_slice);
         let keep = open.iter().zip(want).take_while(|(o, g)| o == g).count();
         while open.len() > keep {
@@ -103,7 +104,14 @@ pub fn to_svg(dl: &DisplayList, stage: &Stage) -> String {
             open.push(g);
         }
         let clip = item.clip.filter(|&c| (c as usize) < dl.clip_parents.len()).map(|c| clip_attrs(dl, c)).unwrap_or_default();
+        // Characters with a link (ADR 0085) are a link in the SVG.
+        if let Some(url) = &link {
+            let _ = write!(body, "<a href=\"{}\">", attr_escape(url));
+        }
         draw(item, &d, &clip, &mut body, &mut defs, &mut grad, &mut images);
+        if link.is_some() {
+            body.push_str("</a>");
+        }
     }
     for _ in open {
         body.push_str("</g>");
@@ -583,7 +591,7 @@ mod tests {
             *spread = anicraft_doc::Spread::Reflect;
         }
         let items = vec![item(Path::rect(0.0, 0.0, 60.0, 60.0), Some(rad)), item(Path::rect(0.0, 0.0, 10.0, 10.0), Some(lin))];
-        let svg = to_svg(&DisplayList { clip_modes: Vec::new(), items, clip_parents: vec![], groups: Vec::new() }, &stage());
+        let svg = to_svg(&DisplayList { links: Vec::new(), clip_modes: Vec::new(), items, clip_parents: vec![], groups: Vec::new() }, &stage());
         assert!(svg.contains("spreadMethod=\"repeat\"") && svg.contains("spreadMethod=\"reflect\""), "{svg}");
         assert!(svg.contains("color-interpolation=\"linearRGB\""), "{svg}");
         assert!(svg.contains("fx=\"40\" fy=\"30\""), "focal point half way along the ring's x axis: {svg}");
@@ -612,7 +620,7 @@ mod tests {
         a.stroke = Some(Stroke::new(Rgba::BLACK, 3.0));
         a.color = ColorTransform::alpha(0.5);
         a.fill_rule = FillRule::EvenOdd;
-        let svg = to_svg(&DisplayList { clip_modes: Vec::new(), items: vec![a], clip_parents: vec![], groups: Vec::new() }, &stage());
+        let svg = to_svg(&DisplayList { links: Vec::new(), clip_modes: Vec::new(), items: vec![a], clip_parents: vec![], groups: Vec::new() }, &stage());
         assert!(svg.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"50\" viewBox=\"0 0 100 50\">"));
         assert!(svg.contains("<rect width=\"100\" height=\"50\" fill=\"#ffffff\"/>"), "background");
         assert!(svg.contains("d=\"M5 7L25 7L25 27L5 27Z\" fill=\"#ff0000\" fill-opacity=\"0.5\" fill-rule=\"evenodd\""), "{svg}");
@@ -627,7 +635,7 @@ mod tests {
             let mut a = item(Path::line(Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0)), None);
             a.transform = Affine::scale(2.0, 2.0);
             a.stroke = Some(st);
-            to_svg(&DisplayList { clip_modes: Vec::new(), items: vec![a], clip_parents: vec![], groups: Vec::new() }, &stage())
+            to_svg(&DisplayList { links: Vec::new(), clip_modes: Vec::new(), items: vec![a], clip_parents: vec![], groups: Vec::new() }, &stage())
         };
         // The default style is written as before: round, no dashes.
         let svg = svg_of(Stroke::new(Rgba::BLACK, 3.0));
@@ -647,7 +655,7 @@ mod tests {
     fn variable_width_strokes_are_written_as_filled_outlines() {
         let mut a = item(Path::line(Vec2::new(0.0, 10.0), Vec2::new(80.0, 10.0)), Some(Paint::Solid(Rgba::hex(0xff0000))));
         a.stroke = Some(Stroke::new(Rgba::hex(0x0000ff), 6.0).with_profile(anicraft_doc::ProfilePreset::TaperBoth.profile()));
-        let svg = to_svg(&DisplayList { clip_modes: Vec::new(), items: vec![a], clip_parents: vec![], groups: Vec::new() }, &stage());
+        let svg = to_svg(&DisplayList { links: Vec::new(), clip_modes: Vec::new(), items: vec![a], clip_parents: vec![], groups: Vec::new() }, &stage());
         assert!(!svg.contains("stroke-width"), "no SVG stroke: {svg}");
         assert!(svg.contains("fill=\"#0000ff\""), "the outline is filled in the stroke colour");
         assert!(svg.contains("fill=\"#ff0000\""), "the shape's own fill stays");
@@ -664,7 +672,7 @@ mod tests {
         outer.masks = Some(0);
         let mut inner = item(Path::ellipse(25.0, 25.0, 10.0, 10.0), Some(Paint::Solid(Rgba::BLACK)));
         inner.masks = Some(1);
-        let svg = to_svg(&DisplayList { clip_modes: Vec::new(), items: vec![g, outer, inner], clip_parents: vec![None, Some(0)], groups: Vec::new() }, &stage());
+        let svg = to_svg(&DisplayList { links: Vec::new(), clip_modes: Vec::new(), items: vec![g, outer, inner], clip_parents: vec![None, Some(0)], groups: Vec::new() }, &stage());
         assert!(svg.contains("gradientTransform=\"matrix(1 0 0 1 20 0)\" x1=\"0\" y1=\"0\" x2=\"10\" y2=\"0\""), "{svg}");
         assert!(svg.contains("<stop offset=\"1\" stop-color=\"#ffffff\" stop-opacity=\"0.25\"/>"));
         assert!(svg.contains("<clipPath id=\"c1\" clipPathUnits=\"userSpaceOnUse\" clip-path=\"url(#c0)\">"), "nested clip");
@@ -717,7 +725,7 @@ mod tests {
         let clear = item(Path::rect(0.0, 0.0, 1.0, 1.0), Some(Paint::Solid(Rgba::TRANSPARENT)));
         let mut lost = item(Path::rect(0.0, 0.0, 1.0, 1.0), Some(Paint::Solid(Rgba::BLACK)));
         lost.clip = Some(7);
-        let svg = to_svg(&DisplayList { clip_modes: Vec::new(), items: vec![bad, empty, clear, lost], clip_parents: vec![Some(3)], groups: Vec::new() }, &stage());
+        let svg = to_svg(&DisplayList { links: Vec::new(), clip_modes: Vec::new(), items: vec![bad, empty, clear, lost], clip_parents: vec![Some(3)], groups: Vec::new() }, &stage());
         assert_eq!(svg.matches("<path").count(), 1, "{svg}");
         assert!(svg.contains("<clipPath id=\"c0\" clipPathUnits=\"userSpaceOnUse\"></clipPath>"), "a malformed clip clips everything");
         assert!(!svg.contains("NaN") && !svg.contains("inf"));
@@ -751,7 +759,7 @@ mod group_tests {
             smooth: true,
             warp: None,
         };
-        let dl = DisplayList { clip_modes: Vec::new(), items: vec![it(None), it(Some(0)), it(Some(1)), it(Some(0)), it(None)], clip_parents: vec![], groups: vec![Group { parent: None, alpha: 0.5, blend: Default::default(), filters: Default::default(), clip: None }, Group { parent: Some(0), alpha: 0.25, blend: Default::default(), filters: Default::default(), clip: None }] };
+        let dl = DisplayList { links: Vec::new(), clip_modes: Vec::new(), items: vec![it(None), it(Some(0)), it(Some(1)), it(Some(0)), it(None)], clip_parents: vec![], groups: vec![Group { parent: None, alpha: 0.5, blend: Default::default(), filters: Default::default(), clip: None }, Group { parent: Some(0), alpha: 0.25, blend: Default::default(), filters: Default::default(), clip: None }] };
         let svg = to_svg(&dl, &Stage { width: 4, height: 4, fps: 24.0, background: Rgba::WHITE });
         assert!(svg.contains("<g opacity=\"0.5\">") && svg.contains("<g opacity=\"0.25\">"), "{svg}");
         assert_eq!(svg.matches("<g ").count(), svg.matches("</g>").count(), "balanced");
@@ -759,4 +767,21 @@ mod group_tests {
         let order: Vec<&str> = svg.split('<').filter_map(|t| t.split([' ', '>']).next()).filter(|t| ["path", "g", "/g"].contains(t)).collect();
         assert_eq!(order, ["path", "g", "path", "g", "path", "/g", "path", "/g", "path"], "{svg}");
     }
+}
+
+/// `s` safe inside a double-quoted XML attribute.
+fn attr_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }

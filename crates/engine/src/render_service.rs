@@ -372,6 +372,12 @@ impl FrameCache {
         self.bytes = self.bytes.saturating_sub(cpu);
         self.native_bytes = self.native_bytes.saturating_sub(gpu);
     }
+    /// Forgets every picture (the document they show is no longer on screen, ADR 0112).
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.bytes = 0;
+        self.native_bytes = 0;
+    }
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -573,6 +579,12 @@ impl RenderService {
     pub fn busy(&self) -> bool {
         let q = self.queue();
         !q.busy.is_empty() || !q.urgent.is_empty() || !q.prefetch.is_empty()
+    }
+
+    /// Forgets every finished picture, in memory and on the GPU: an editor showing another
+    /// document calls it, so the one put aside keeps no pictures (ADR 0112).
+    pub fn forget_pictures(&self) {
+        self.cache().clear();
     }
 
     /// `(images, bytes, hits, misses)`.

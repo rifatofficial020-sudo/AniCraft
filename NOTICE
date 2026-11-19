@@ -28,6 +28,11 @@ Official builds also embed, from the shared craft-fonts build input (CRAFT_FONTS
   with the package as OFL-Inter.txt and OFL-JetBrainsMono.txt.
 
 Rust crates (about 420 across all platforms) are permissively licensed (MIT, Apache-2.0, BSD,
-ISC, Zlib, BSL-1.0, Unicode-3.0, Unlicense, 0BSD). Where a crate offers a copyleft alternative,
+ISC, Zlib, BSL-1.0, Unicode-3.0, Unlicense, 0BSD), with two exceptions that come in through
+the shared Craft libraries:
+  symphonia and its sub-crates (sound decoding): Mozilla Public License 2.0, used unmodified.
+  Their source code is at https://github.com/pdeljanov/Symphonia (see ATTRIBUTION.md).
+  jpeg-encoder (JPEG export): MIT or Apache-2.0, with portions under the IJG licence.
+  This software is based in part on the work of the Independent JPEG Group. Where a crate offers a copyleft alternative,
 AniCraft uses it under its permissive licence. Binary releases ship the full licence texts of
 all crates (see docs/legal/compliance.md, "Release checklist").

@@ -240,7 +240,7 @@ fn list(app: &mut App, ui: &mut egui::Ui, t: &Tree) {
                 p.rect_filled(rect, T.rc(), if on { T.accent_dim } else { T.hover });
             }
             if on {
-                p.rect_filled(Rect::from_min_size(rect.left_top(), vec2(3.0, rect.height())), 0.0, T.accent);
+                crate::theme::accent_bar(p, Rect::from_min_size(rect.left_top(), vec2(3.0, rect.height())));
             }
             let indent = 6.0 + r.depth.min(24) as f32 * 14.0;
             let chevron = Rect::from_center_size(pos2(rect.left() + indent + 6.0, rect.center().y), vec2(12.0, 12.0));

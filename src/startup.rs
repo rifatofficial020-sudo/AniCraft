@@ -9,9 +9,11 @@
 //!
 //! A driver can also crash the process or hang, which nothing inside it can catch. Each attempt
 //! leaves a marker in the log folder until the window has drawn a few frames; if the next start
-//! finds one, the previous start died in that attempt, so it goes last this time. The log (the
-//! previous run's is kept beside it) records each attempt, the graphics adapter and driver,
-//! panics, and a note when the window is still not up after a while.
+//! finds one, the previous start died in that attempt, so it goes last, this time and for the
+//! starts after it ([`DIED_STARTS`], #335: going last for one start only brought the crash back
+//! on every second start). The log (the previous run's is kept beside it) records each attempt,
+//! the graphics adapter and driver, panics, and a note when the window is still not up after a
+//! while.
 
 use crate::prefs::WindowBackend;
 use std::io::Write;
@@ -70,7 +72,8 @@ impl Attempt {
 /// The attempts in order: `forced` (the command line) or else `chosen` (Preferences) first, then
 /// the platform's order `platform`, each once. The attempts named in `last` (the previous start
 /// crashed or hung in one; a session lost its graphics device in another, ADR 0092) go last, in
-/// that order.
+/// that order; except `forced`, which is tried first whatever happened before (it was asked for
+/// just now).
 pub fn plan(forced: Option<WindowBackend>, chosen: WindowBackend, platform: &[(WindowBackend, bool)], last: &[String]) -> Vec<Attempt> {
     let mut out: Vec<Attempt> = Vec::new();
     let first = forced.unwrap_or(chosen);
@@ -89,6 +92,7 @@ pub fn plan(forced: Option<WindowBackend>, chosen: WindowBackend, platform: &[(W
     for dead in last {
         if let Some(i) = out.iter().position(|a| a.label() == *dead)
             && out.len() > 1
+            && !(i == 0 && forced.is_some_and(|f| f != WindowBackend::Auto))
         {
             let a = out.remove(i);
             out.push(a);
@@ -115,6 +119,91 @@ fn lost_record_text(label: &str, left: u32) -> String {
     format!("{label}\n{left}\n")
 }
 
+/// Starts a way that killed a start goes last for (this one included): the first time it does,
+/// then each time it does so again when it gets its chance back (a driver update may have fixed
+/// it, so it isn't written off for ever; a broken one costs a crash ever more rarely).
+pub const DIED_STARTS: [u32; 3] = [5, 25, 100];
+/// Ways remembered at once (there are three or four to try).
+const MAX_DIED: usize = 8;
+
+/// A way of opening the window that killed a start (#335): its label, the starts it still goes
+/// last for, and how many times in a row it has done so.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Died {
+    pub label: String,
+    pub left: u32,
+    pub strikes: u32,
+}
+
+/// The record of ways that killed a start: a line each, `left`, `strikes` and the label,
+/// separated by tabs. Lines that don't read are left out.
+pub fn died_records(text: &str) -> Vec<Died> {
+    let most = DIED_STARTS.iter().copied().max().unwrap_or(0);
+    let mut out: Vec<Died> = Vec::new();
+    for l in text.lines().take(MAX_DIED * 4) {
+        let mut parts = l.splitn(3, '\t');
+        let (Some(left), Some(strikes), Some(label)) = (parts.next(), parts.next(), parts.next()) else { continue };
+        let (Ok(left), Ok(strikes)) = (left.trim().parse::<u32>(), strikes.trim().parse::<u32>()) else { continue };
+        let label: String = label.trim().chars().take(200).collect();
+        if label.is_empty() || strikes == 0 || out.len() >= MAX_DIED || out.iter().any(|d| d.label == label) {
+            continue;
+        }
+        out.push(Died { label, left: left.min(most), strikes: strikes.min(DIED_STARTS.len() as u32) });
+    }
+    out
+}
+
+fn died_text(records: &[Died]) -> String {
+    records.iter().map(|d| format!("{}\t{}\t{}\n", d.left, d.strikes, d.label)).collect()
+}
+
+/// This start's turn of the record: `marker` is the way the previous start died in, if it did.
+/// Returns the record to keep and the ways to try last now (the one that just died last of all).
+/// A way whose starts are used up stays in the record with none left: it gets its chance, and
+/// goes when it comes up ([`came_up`]) or is held back longer when it dies again.
+pub fn died_turn(mut records: Vec<Died>, marker: Option<&str>) -> (Vec<Died>, Vec<String>) {
+    if let Some(m) = marker {
+        strike(&mut records, m);
+    }
+    let mut last = Vec::new();
+    for d in &mut records {
+        if d.left > 0 {
+            d.left -= 1;
+            last.push(d.label.clone());
+        }
+    }
+    (records, last)
+}
+
+/// `label` failed once more: it goes to the end of the record, held back for the next span of
+/// [`DIED_STARTS`].
+fn strike(records: &mut Vec<Died>, label: &str) {
+    let strikes = records.iter().find(|d| d.label == label).map_or(1, |d| d.strikes.saturating_add(1)).min(DIED_STARTS.len() as u32);
+    records.retain(|d| d.label != label);
+    if records.len() >= MAX_DIED {
+        records.remove(0);
+    }
+    let left = DIED_STARTS.get(strikes.saturating_sub(1) as usize).copied().unwrap_or(1);
+    records.push(Died { label: label.to_string(), left, strikes });
+}
+
+/// A way that failed before the window was up (an error or a panic, caught: the next way is
+/// tried at once), in the record as a start that died is: the next starts don't open and close
+/// a window with it first. This start counts as its first.
+pub fn failed_turn(mut records: Vec<Died>, label: &str) -> Vec<Died> {
+    strike(&mut records, label);
+    if let Some(d) = records.last_mut() {
+        d.left = d.left.saturating_sub(1);
+    }
+    records
+}
+
+/// The window came up with `label`: it works, so it is no longer held back.
+pub fn came_up(mut records: Vec<Died>, label: &str) -> Vec<Died> {
+    records.retain(|d| d.label != label);
+    records
+}
+
 /// Longest log written in one run: enough for any start-up, bounded however long AniCraft runs.
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
 /// Frames the window draws before the start counts as working.
@@ -126,6 +215,7 @@ const LOG_NAME: &str = "anicraft.log";
 const PREVIOUS_LOG_NAME: &str = "anicraft.previous.log";
 const MARKER_NAME: &str = "starting";
 const LOST_NAME: &str = "graphics-lost";
+const DIED_NAME: &str = "start-died";
 
 struct Log {
     dir: PathBuf,
@@ -143,8 +233,9 @@ static REOPEN: Mutex<Option<Option<PathBuf>>> = Mutex::new(None);
 
 /// Opens the log in `dir` for this run (the previous run's becomes `anicraft.previous.log`) and
 /// returns the attempts to try last: the one an earlier session lost its graphics device in (for
-/// [`LOST_STARTS`] starts, ADR 0092), then the one the previous start died in, if its marker is
-/// still there. Panics are written to the log from now on.
+/// [`LOST_STARTS`] starts, ADR 0092), then the ones a start died in (for [`DIED_STARTS`]
+/// starts), the previous start's last of all if its marker is still there. Panics are written
+/// to the log from now on.
 pub fn begin(dir: Option<PathBuf>) -> Vec<String> {
     let Some(dir) = dir else { return Vec::new() };
     let _ = std::fs::create_dir_all(&dir);
@@ -159,6 +250,10 @@ pub fn begin(dir: Option<PathBuf>) -> Vec<String> {
             let _ = std::fs::remove_file(dir.join(LOST_NAME));
         }
     }
+    // A way that killed a start goes last for several starts, not just this one (#335).
+    let before = std::fs::read_to_string(dir.join(DIED_NAME)).map(|t| died_records(&t)).unwrap_or_default();
+    let (died, died_last) = died_turn(before, died_in.as_deref());
+    write_died(&dir, &died);
     let _ = std::fs::rename(dir.join(LOG_NAME), dir.join(PREVIOUS_LOG_NAME));
     let file = std::fs::File::create(dir.join(LOG_NAME)).ok();
     if let Ok(mut g) = LOG.lock() {
@@ -176,10 +271,32 @@ pub fn begin(dir: Option<PathBuf>) -> Vec<String> {
     if let Some((l, left)) = &lost {
         line(&format!("a session lost its graphics device with {l}: trying it late ({left} more start(s) counting this one)"));
     }
-    if let Some(d) = &died_in {
-        line(&format!("the previous start stopped while opening the window with {d}: trying it last"));
+    for d in died.iter().filter(|d| died_last.contains(&d.label)) {
+        let (label, starts) = (&d.label, d.left + 1);
+        if died_in.as_deref() == Some(label.as_str()) {
+            line(&format!("the previous start stopped while opening the window with {label}: trying it last ({starts} start(s) counting this one)"));
+        } else {
+            line(&format!("an earlier start stopped while opening the window with {label}: trying it last ({starts} more start(s) counting this one)"));
+        }
     }
-    lost.map(|(l, _)| l).into_iter().chain(died_in).collect()
+    lost.map(|(l, _)| l).into_iter().chain(died_last).collect()
+}
+
+/// The current attempt failed before its window was up: the next starts try it last
+/// ([`failed_turn`]).
+pub fn failed_to_open() {
+    let Some(label) = current() else { return };
+    let Some(dir) = LOG.lock().ok().and_then(|g| g.as_ref().map(|l| l.dir.clone())) else { return };
+    let before = std::fs::read_to_string(dir.join(DIED_NAME)).map(|t| died_records(&t)).unwrap_or_default();
+    write_died(&dir, &failed_turn(before, &label));
+}
+
+fn write_died(dir: &std::path::Path, records: &[Died]) {
+    if records.is_empty() {
+        let _ = std::fs::remove_file(dir.join(DIED_NAME));
+    } else {
+        let _ = std::fs::write(dir.join(DIED_NAME), died_text(records));
+    }
 }
 
 /// The window's graphics device was lost after it was up (ADR 0092): the next [`LOST_STARTS`]
@@ -269,9 +386,18 @@ pub fn trying(a: &Attempt, n: usize, of: usize) {
 pub fn frame() {
     if FRAMES.fetch_add(1, Ordering::Relaxed) + 1 == STARTED_AFTER {
         line(&format!("the window is up ({STARTED_AFTER} frames drawn)"));
-        let marker = LOG.lock().ok().and_then(|g| g.as_ref().map(|l| l.dir.join(MARKER_NAME)));
-        if let Some(m) = marker {
-            let _ = std::fs::remove_file(m);
+        let dir = LOG.lock().ok().and_then(|g| g.as_ref().map(|l| l.dir.clone()));
+        if let Some(dir) = dir {
+            let _ = std::fs::remove_file(dir.join(MARKER_NAME));
+            // It works: no longer held back for having killed a start.
+            if let (Some(label), Ok(text)) = (current(), std::fs::read_to_string(dir.join(DIED_NAME))) {
+                let before = died_records(&text);
+                let after = came_up(before.clone(), &label);
+                if after != before {
+                    line(&format!("{label} works: no longer tried last"));
+                    write_died(&dir, &after);
+                }
+            }
         }
     }
 }
@@ -317,6 +443,8 @@ mod tests {
     use super::*;
     use WindowBackend::*;
 
+    /// An order with whatever wgpu finds first (as macOS and Linux have; the plan is the same
+    /// for any order).
     const WINDOWS: &[(WindowBackend, bool)] = &[(Auto, false), (Dx12, true), (OpenGl, false)];
 
     fn labels(v: &[Attempt]) -> Vec<String> {
@@ -374,6 +502,63 @@ mod tests {
         assert_eq!(labels(&plan(None, Auto, &[], &[])), ["wgpu (automatic)"], "never nothing to try");
     }
 
+    /// #335: a way that crashed the process at start goes last for five starts, not one (it
+    /// came back on every second start), then gets its chance; dying again holds it back for
+    /// 25, then 100. Each way is remembered on its own, and one that comes up is forgotten.
+    #[test]
+    fn a_way_that_killed_a_start_stays_last_for_several_starts() {
+        const AUTO: &str = "wgpu (automatic)";
+        const LOW: &str = "wgpu DirectX 12, low-power GPU";
+        let (mut rec, last) = died_turn(Vec::new(), Some(AUTO));
+        assert_eq!((last, rec.clone()), (vec![AUTO.to_string()], vec![Died { label: AUTO.into(), left: 4, strikes: 1 }]));
+        // The four starts after it too; the sixth tries it first again.
+        for _ in 0..4 {
+            let (r, last) = died_turn(rec, None);
+            assert_eq!(last, [AUTO]);
+            rec = r;
+        }
+        let (rec, last) = died_turn(rec, None);
+        assert!(last.is_empty());
+        assert_eq!(rec, [Died { label: AUTO.into(), left: 0, strikes: 1 }], "kept, to know it if it dies again");
+        // It dies again: 25 starts. And again: 100, and no more than that.
+        let (rec, _) = died_turn(rec, Some(AUTO));
+        assert_eq!(rec, [Died { label: AUTO.into(), left: 24, strikes: 2 }]);
+        let (rec, _) = died_turn(rec, Some(AUTO));
+        let (rec, _) = died_turn(rec, Some(AUTO));
+        assert_eq!(rec, [Died { label: AUTO.into(), left: 99, strikes: 3 }]);
+        // A second way dies while the first is held back: both go last, the newest last of all
+        // (two ways taking turns to crash was the trap of remembering only one).
+        let (rec, last) = died_turn(rec, Some(LOW));
+        assert_eq!(last, [AUTO, LOW]);
+        assert_eq!(labels(&plan(None, Auto, WINDOWS, &last)), ["OpenGL", AUTO, LOW]);
+        // The way that came up is forgotten; the other stays.
+        assert_eq!(came_up(rec.clone(), LOW).len(), 1);
+        assert_eq!(came_up(rec.clone(), "OpenGL"), rec);
+        // A way that failed without killing the start counts the same, this start included.
+        assert_eq!(failed_turn(Vec::new(), AUTO), [Died { label: AUTO.into(), left: 4, strikes: 1 }]);
+        // The record reads back as written, and survives nonsense.
+        assert_eq!(died_records(&died_text(&rec)), rec);
+        assert_eq!(died_records("4\t1\twgpu Vulkan\nrubbish\n\t\t\n9999\t99\tOpenGL\n4\t1\twgpu Vulkan\n-1\t1\tx\n3\t0\ty"), [
+            Died { label: "wgpu Vulkan".into(), left: 4, strikes: 1 },
+            Died { label: "OpenGL".into(), left: 100, strikes: 3 },
+        ]);
+        let many: String = (0..100).map(|i| format!("1\t1\tway {i}\n")).collect();
+        assert_eq!(died_records(&many).len(), MAX_DIED);
+        let mut full = died_records(&many);
+        strike(&mut full, "one more");
+        assert_eq!(full.len(), MAX_DIED, "never more than a handful");
+    }
+
+    /// What `--renderer` asks for is tried first even if it failed before (it was asked for
+    /// now); the choice in Preferences is not, so a choice that crashes can't lock AniCraft out.
+    #[test]
+    fn the_command_line_is_tried_first_whatever_happened_before() {
+        let dead = ["wgpu Vulkan".to_string()];
+        assert_eq!(labels(&plan(Some(Vulkan), Auto, WINDOWS, &dead)).first().map(String::as_str), Some("wgpu Vulkan"));
+        assert_eq!(labels(&plan(None, Vulkan, WINDOWS, &dead)).last().map(String::as_str), Some("wgpu Vulkan"));
+        assert_eq!(labels(&plan(Some(Auto), Auto, WINDOWS, &["wgpu (automatic)".into()])).last().map(String::as_str), Some("wgpu (automatic)"), "--renderer wgpu is the usual order");
+    }
+
     /// ADR 0092: a session that lost its graphics device mid-way makes the next starts try that
     /// way late (after a start that died in a driver, which goes last of all), for
     /// [`LOST_STARTS`] starts; then the fastest way gets its chance again.
@@ -414,12 +599,38 @@ mod tests {
         assert!(started());
         assert!(!dir.join(MARKER_NAME).exists());
         assert_eq!(log_path(), Some(dir.join(LOG_NAME)));
-        // The window lost its device mid-session: the next starts try it late, then not.
+        // The window lost its device mid-session: the next starts try it late, then not. The
+        // way the start died in is still held back (#335), after it.
         lost_mid_session();
         for left in (1..=LOST_STARTS).rev() {
-            assert_eq!(begin(Some(dir.clone())).first().map(String::as_str), Some("OpenGL"), "{left} start(s) left");
+            assert_eq!(begin(Some(dir.clone())), ["OpenGL", "wgpu DirectX 12, low-power GPU"], "{left} start(s) left");
         }
-        assert!(begin(Some(dir.clone())).is_empty(), "the record is used up");
+        assert_eq!(begin(Some(dir.clone())), ["wgpu DirectX 12, low-power GPU"], "the loss's record is used up");
+        assert!(begin(Some(dir.clone())).is_empty(), "and the dead start's: 5 starts, counting the one after it");
+        // It gets its chance, and dies again: held back five times as long.
+        trying(&Attempt { backend: Dx12, low_power: true }, 1, 3);
+        for start in 0..DIED_STARTS[1] {
+            assert_eq!(begin(Some(dir.clone())), ["wgpu DirectX 12, low-power GPU"], "start {start}");
+            // Each of those starts comes up another way, which changes nothing for this one.
+            trying(&Attempt { backend: OpenGl, low_power: false }, 2, 3);
+            (0..STARTED_AFTER).for_each(|_| frame());
+        }
+        assert!(begin(Some(dir.clone())).is_empty());
+        // This time it comes up: forgotten, so a later death starts from five again.
+        trying(&Attempt { backend: Dx12, low_power: true }, 1, 3);
+        (0..STARTED_AFTER).for_each(|_| frame());
+        assert!(!dir.join(DIED_NAME).exists(), "it works: nothing is held back");
+        // A way that fails before its window is up (an error, a caught panic) is held back the
+        // same way, so the next starts don't flash a window with it first.
+        trying(&Attempt { backend: Auto, low_power: false }, 1, 3);
+        failed_to_open();
+        trying(&Attempt { backend: OpenGl, low_power: false }, 2, 3);
+        (0..STARTED_AFTER).for_each(|_| frame());
+        for _ in 1..DIED_STARTS[0] {
+            assert_eq!(begin(Some(dir.clone())), ["wgpu (automatic)"]);
+        }
+        assert!(begin(Some(dir.clone())).is_empty());
+        let _ = std::fs::remove_file(dir.join(DIED_NAME));
         // A panic is written down.
         let _ = std::panic::catch_unwind(|| panic!("the driver said no"));
         assert!(std::fs::read_to_string(dir.join(LOG_NAME)).unwrap().contains("the driver said no"));

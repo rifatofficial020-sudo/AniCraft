@@ -27,7 +27,6 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use anicraft_doc::{Cap, Dash, ElementKind, GradientStop, Join, Paint, Rgba, Shape, Spread, Stroke, StrokeStyle, MAX_FOCAL};
-use anicraft_geom::svg::parse_path_data;
 use anicraft_geom::{Affine, FillRule, Path, Rect, Vec2};
 use anicraft_text::{FaceMatch, Fonts};
 use anicraft_xml::Element as X;
@@ -36,7 +35,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 mod clip;
+mod path_data;
 mod text;
+
+pub use path_data::parse_path_data;
 
 #[cfg(test)]
 mod clip_tests;
@@ -59,6 +61,10 @@ pub enum SvgError {
     Xml(#[from] anicraft_xml::XmlError),
     #[error("this is not an SVG drawing (its root element is <{0}>)")]
     NotSvg(String),
+    /// The bytes could not be read as SVG text within the shared limits (SVGZ unpacking, text
+    /// encoding, entity expansion, nesting, attributes).
+    #[error(transparent)]
+    Preflight(#[from] craft_svg::preflight::Error),
 }
 
 /// What could not come across, by kind ("2 images"), and the fonts the text asks for that
@@ -167,7 +173,8 @@ pub fn import_with_fonts(bytes: &[u8], fonts: &Fonts) -> Result<SvgImport, SvgEr
 }
 
 fn import_from(bytes: &[u8], fonts: Option<&Fonts>) -> Result<SvgImport, SvgError> {
-    let root = anicraft_xml::parse_mixed(bytes, TEXT_CONTENT)?;
+    let text = svg_text(bytes)?;
+    let root = anicraft_xml::parse_mixed(text.as_bytes(), TEXT_CONTENT)?;
     if local(&root.name) != "svg" {
         return Err(SvgError::NotSvg(root.name.clone()));
     }
@@ -196,6 +203,32 @@ fn import_from(bytes: &[u8], fonts: Option<&Fonts>) -> Result<SvgImport, SvgErro
     b.children(&root, &base, &style, 1.0, 0, 0);
     let layers = b.layers();
     Ok(SvgImport { width: w, height: h, layers, report: b.report })
+}
+
+/// The document as UTF-8 text: SVGZ unpacked and UTF-16 or Latin-1 decoded within the shared
+/// size limit, and hostile markup (entity bombs, very wide elements, deep nesting) refused before
+/// the XML reader builds a tree. The XML itself is left to `anicraft_xml`, which accepts what
+/// drawing tools write loosely (an undeclared `xlink:` prefix).
+fn svg_text(bytes: &[u8]) -> Result<std::borrow::Cow<'_, str>, SvgError> {
+    use craft_svg::guard;
+    use craft_svg::preflight::{Error, Limits};
+    let limits = Limits::default();
+    let text = craft_svg::svgz::text(bytes, limits.bytes).map_err(Error::from)?;
+    // svgz::text limits the source or inflated bytes, not the UTF-8 length after Latin-1
+    // (or UTF-16) decoding. A 40 MiB Latin-1 file of non-ASCII would become ~80 MiB here.
+    if text.len() > limits.bytes {
+        return Err(Error::Text(craft_svg::svgz::Error::TooLarge(limits.bytes)).into());
+    }
+    if guard::entities_expand_past(&text, limits.entity_bytes) {
+        return Err(Error::Entities.into());
+    }
+    if guard::too_wide(&text, limits.attributes, limits.attribute_work) {
+        return Err(Error::TooWide(limits.attributes).into());
+    }
+    if guard::deeper_than(&text, limits.depth) {
+        return Err(Error::TooDeep(limits.depth).into());
+    }
+    Ok(text)
 }
 
 /// The element's `id`, as an element name.
@@ -325,103 +358,94 @@ fn transform(s: &str) -> Affine {
     if m.is_finite() { m } else { Affine::IDENTITY }
 }
 
-fn named(name: &str) -> Option<u32> {
-    Some(match name {
-        "black" => 0x000000,
-        "white" => 0xffffff,
-        "red" => 0xff0000,
-        "lime" => 0x00ff00,
-        "green" => 0x008000,
-        "blue" => 0x0000ff,
-        "yellow" => 0xffff00,
-        "cyan" | "aqua" => 0x00ffff,
-        "magenta" | "fuchsia" => 0xff00ff,
-        "gray" | "grey" => 0x808080,
-        "silver" => 0xc0c0c0,
-        "maroon" => 0x800000,
-        "olive" => 0x808000,
-        "purple" => 0x800080,
-        "teal" => 0x008080,
-        "navy" => 0x000080,
-        "orange" => 0xffa500,
-        "pink" => 0xffc0cb,
-        "brown" => 0xa52a2a,
-        "gold" => 0xffd700,
-        "indigo" => 0x4b0082,
-        "violet" => 0xee82ee,
-        "coral" => 0xff7f50,
-        "salmon" => 0xfa8072,
-        "tomato" => 0xff6347,
-        "crimson" => 0xdc143c,
-        "khaki" => 0xf0e68c,
-        "beige" => 0xf5f5dc,
-        "ivory" => 0xfffff0,
-        "tan" => 0xd2b48c,
-        "chocolate" => 0xd2691e,
-        "sienna" => 0xa0522d,
-        "turquoise" => 0x40e0d0,
-        "skyblue" => 0x87ceeb,
-        "steelblue" => 0x4682b4,
-        "royalblue" => 0x4169e1,
-        "darkblue" => 0x00008b,
-        "lightblue" => 0xadd8e6,
-        "darkgreen" => 0x006400,
-        "lightgreen" => 0x90ee90,
-        "forestgreen" => 0x228b22,
-        "darkred" => 0x8b0000,
-        "darkgray" | "darkgrey" => 0xa9a9a9,
-        "lightgray" | "lightgrey" => 0xd3d3d3,
-        "dimgray" | "dimgrey" => 0x696969,
-        "darkorange" => 0xff8c00,
-        "orchid" => 0xda70d6,
-        "plum" => 0xdda0dd,
-        "lavender" => 0xe6e6fa,
-        "slategray" | "slategrey" => 0x708090,
-        "whitesmoke" => 0xf5f5f5,
-        "gainsboro" => 0xdcdcdc,
-        _ => return None,
-    })
-}
-
-/// A CSS colour (`#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`, `rgb()`, `rgba()`, a name).
+/// A CSS colour (`#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`, `rgb()`/`hsl()`, a name).
+/// `transparent` stays here: the shared parser treats it as an error so callers that
+/// need an opaque colour are not surprised.
 fn color(v: &str) -> Option<Rgba> {
     let v = v.trim();
-    let lower = v.to_ascii_lowercase();
-    if let Some(h) = lower.strip_prefix('#') {
-        let expand = |s: &str| s.chars().flat_map(|c| [c, c]).collect::<String>();
-        return match h.len() {
-            3 | 4 => Rgba::parse_hex(&expand(h)),
-            6 | 8 => Rgba::parse_hex(h),
-            _ => None,
-        };
-    }
-    if let Some(args) = lower.strip_prefix("rgba(").or_else(|| lower.strip_prefix("rgb(")) {
-        let args = args.trim_end_matches(')');
-        let parts: Vec<&str> = args.split([',', ' ', '/']).filter(|p| !p.is_empty()).collect();
-        let chan = |p: &str| -> Option<f32> {
-            match p.strip_suffix('%') {
-                Some(pc) => pc.parse::<f32>().ok().map(|x| x / 100.0),
-                None => p.parse::<f32>().ok().map(|x| x / 255.0),
-            }
-            .filter(|x| x.is_finite())
-            .map(|x| x.clamp(0.0, 1.0))
-        };
-        let alpha = |p: &str| -> Option<f32> {
-            match p.strip_suffix('%') {
-                Some(pc) => pc.parse::<f32>().ok().map(|x| x / 100.0),
-                None => p.parse::<f32>().ok(),
-            }
-            .filter(|x| x.is_finite())
-            .map(|x| x.clamp(0.0, 1.0))
-        };
-        let (r, g, b) = (chan(parts.first()?)?, chan(parts.get(1)?)?, chan(parts.get(2)?)?);
-        let a = parts.get(3).map_or(Some(1.0), |p| alpha(p))?;
-        return Some(Rgba::new(r, g, b, a));
-    }
-    if lower == "transparent" {
+    if v.eq_ignore_ascii_case("transparent") {
         return Some(Rgba::TRANSPARENT);
     }
-    named(&lower).map(Rgba::hex)
+    if let Some(rgba) = rgba_from_shared(v) {
+        return Some(rgba);
+    }
+    // CSS clips out-of-range rgb()/rgba() channels; the shared parser rejects them. Clip
+    // and try once more so `fill="rgb(300,0,0)"` still becomes red, as it did before the pin.
+    rgba_from_shared(&clipped_rgb(v)?)
+}
+
+fn rgba_from_shared(v: &str) -> Option<Rgba> {
+    let (c, a) = craft_svg::color::parse_color_alpha(v).ok()?;
+    Some(Rgba::new(f32::from(c.r) / 255.0, f32::from(c.g) / 255.0, f32::from(c.b) / 255.0, a))
+}
+
+/// `rgb()`/`rgba()` with each channel clipped to its range (0–255, or 0%–100%). Other
+/// colour forms are left alone so the shared parser's errors still stand.
+///
+/// At most four components are collected, so a 60 MiB `rgb(0,0,0,0,0,…)` does not
+/// allocate millions of slices before being rejected. Number-form channels are
+/// emitted as integers: the shared parser rejects a decimal such as `127.5`.
+fn clipped_rgb(v: &str) -> Option<String> {
+    let lower = v.trim().to_ascii_lowercase();
+    let (name, rest) = lower.split_once('(')?;
+    if name != "rgb" && name != "rgba" {
+        return None;
+    }
+    let body = rest.trim().strip_suffix(')')?;
+    let mut parts: Vec<&str> = Vec::with_capacity(4);
+    if body.contains(',') {
+        for p in body.split(',') {
+            if parts.len() >= 4 {
+                return None;
+            }
+            parts.push(p.trim());
+        }
+    } else {
+        let (channels, alpha) = match body.split_once('/') {
+            Some((channels, alpha)) => (channels, Some(alpha.trim())),
+            None => (body, None),
+        };
+        for p in channels.split_whitespace() {
+            if parts.len() >= 4 {
+                return None;
+            }
+            parts.push(p);
+        }
+        if let Some(alpha) = alpha {
+            if parts.len() >= 4 {
+                return None;
+            }
+            parts.push(alpha);
+        }
+    }
+    if parts.len() != 3 && parts.len() != 4 {
+        return None;
+    }
+    let clip_rgb = |p: &str| -> Option<String> {
+        if let Some(pc) = p.strip_suffix('%') {
+            let n: f32 = pc.parse().ok().filter(|x: &f32| x.is_finite())?;
+            return Some(format!("{}%", n.clamp(0.0, 100.0)));
+        }
+        let n: f32 = p.parse().ok().filter(|x: &f32| x.is_finite())?;
+        // The shared parser rejects non-percentage decimals; CSS 8-bit channels are integers.
+        Some(format!("{}", n.clamp(0.0, 255.0).round() as u8))
+    };
+    let clip_alpha = |p: &str| -> Option<String> {
+        if let Some(pc) = p.strip_suffix('%') {
+            let n: f32 = pc.parse().ok().filter(|x: &f32| x.is_finite())?;
+            return Some(format!("{}%", n.clamp(0.0, 100.0)));
+        }
+        let n: f32 = p.parse().ok().filter(|x: &f32| x.is_finite())?;
+        Some(format!("{}", n.clamp(0.0, 1.0)))
+    };
+    let r = clip_rgb(parts[0])?;
+    let g = clip_rgb(parts[1])?;
+    let b = clip_rgb(parts[2])?;
+    if let Some(a) = parts.get(3) {
+        Some(format!("rgb({r}, {g}, {b}, {})", clip_alpha(a)?))
+    } else {
+        Some(format!("rgb({r}, {g}, {b})"))
+    }
 }
 
 // ----- style ------------------------------------------------------------------------------------

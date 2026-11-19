@@ -2,7 +2,7 @@
 
 use crate::import::{Report, XflError, import_with, import_with_fonts};
 use crate::text::GUTTER;
-use anicraft_doc::{Document, Element, ElementKind, LineType, Paint, Rgba, TextAlign, TextBlock, TextKind, evaluate};
+use anicraft_doc::{BaselineShift, Document, Element, ElementKind, LineType, Paint, Rgba, TextAlign, TextBlock, TextKind, evaluate};
 use anicraft_text::Fonts;
 use std::sync::Arc;
 
@@ -75,38 +75,61 @@ fn fixed_width_fields_wrap_and_auto_size_ones_do_not() {
 }
 
 #[test]
-fn runs_in_different_styles_become_blocks_stacked_line_by_line() {
+fn runs_keep_their_styles_in_one_block() {
     let Some((fonts, family)) = fonts() else { return };
-    let title = format!(r##"face="{family}" size="30" bold="true" fillColor="#112233""##);
-    let body = format!(r##"face="{family}" size="12" fillColor="#445566""##);
-    // A title line, two body lines (the second continues in a separate run of the same style),
-    // then a line that mixes both styles: most of its characters are body text.
-    let runs = [run("Title&#xD;", &title), run("line one&#xD;line ", &body), run("two&#xD;", &body), run("Big", &title), run(" and mostly small", &body), run("&#xD;&#xD;", &body)].concat();
+    let title = format!(r##"face="{family}" size="30" bold="true" fillColor="#112233" alignment="center""##);
+    let body = format!(r##"face="{family}" size="12" fillColor="#445566" indent="8" leftMargin="4""##);
+    let sup = format!(r##"face="{family}" size="12" fillColor="#445566" characterPosition="superscript" url="https://example.org""##);
+    // A title line, body lines (the second continues in a separate run of the same style), a
+    // line that mixes both styles and a superscript, then trailing empty lines.
+    let runs = [run("Title&#xD;", &title), run("line one&#xD;line ", &body), run("two&#xD;", &body), run("Big", &title), run(" and small", &body), run("2", &sup), run("&#xD;&#xD;", &body)].concat();
     let field = format!(r#"<DOMStaticText autoExpand="true"><matrix><Matrix tx="10" ty="20"/></matrix><textRuns>{runs}</textRuns></DOMStaticText>"#);
     let (doc, report) = import_doc(&doc_with(&field), fonts);
     let t = texts(&doc);
-    let blocks: Vec<(&str, f32, bool)> = t.iter().map(|(_, b)| (b.text.as_str(), b.size, b.bold)).collect();
-    assert_eq!(blocks, [("Title", 30.0, true), ("line one\nline two\nBig and mostly small", 12.0, false)], "trailing empty lines are dropped");
-    assert_eq!(t[1].1.color, Rgba::hex(0x445566));
-    // The body starts where the title's next line would.
-    let title_layout = fonts.layout("Title", &anicraft_text::Style { family: family.clone(), size: 30.0, bold: true, ..Default::default() }).unwrap();
-    let (y0, y1) = (t[0].0.transform.translation().y, t[1].0.transform.translation().y);
-    assert!((y0 - (20.0 + GUTTER)).abs() < 1e-4);
-    assert!((y1 - y0 - title_layout.line_height).abs() < 1e-3, "{y0} → {y1}, line height {}", title_layout.line_height);
-    assert_eq!(t[0].0.transform.translation().x, t[1].0.transform.translation().x, "left-aligned blocks share the left edge");
-    assert_eq!(report.skipped.get("lines with mixed text styles (drawn in their main style)"), Some(&1));
+    assert_eq!(t.len(), 1, "one field, one block");
+    let b = &t[0].1;
+    assert_eq!(b.text, "Title\nline one\nline two\nBig and small2", "trailing empty lines are dropped");
+    let runs: Vec<(u32, f32, bool, BaselineShift)> = b.styled_runs().iter().map(|r| (r.chars, r.style.size, r.style.bold, r.style.shift)).collect();
+    assert_eq!(runs, [(6, 30.0, true, BaselineShift::Normal), (18, 12.0, false, BaselineShift::Normal), (3, 30.0, true, BaselineShift::Normal), (10, 12.0, false, BaselineShift::Normal), (1, 12.0, false, BaselineShift::Superscript)]);
+    assert_eq!(b.styled_runs()[1].style.color, Rgba::hex(0x445566));
+    assert_eq!(b.styled_runs()[4].style.url, "https://example.org");
+    // Paragraphs take their layout from the run they start in.
+    let aligns: Vec<TextAlign> = b.paragraph_styles().iter().map(|p| p.align).collect();
+    assert_eq!(aligns, [TextAlign::Center, TextAlign::Left, TextAlign::Left, TextAlign::Center]);
+    assert_eq!((b.paragraph_styles()[1].indent, b.paragraph_styles()[1].left_margin), (8.0, 4.0));
+    // Colours become fill pieces; the element sits at the field's matrix plus the gutter.
+    assert_eq!(b.fills.len(), 3, "two colours, one with a link");
+    assert!((t[0].0.transform.translation().y - (20.0 + GUTTER)).abs() < 1e-4);
+    assert!(report.skipped.is_empty(), "{report:?}");
 }
 
 #[test]
-fn centred_auto_size_blocks_centre_on_each_other() {
+fn xfl_runs_round_trip_through_the_file() {
+    let Some((fonts, family)) = fonts() else { return };
+    let a = format!(r##"face="{family}" size="20" fillColor="#ff0000""##);
+    let b = format!(r##"face="{family}" size="10" italic="true" characterPosition="subscript""##);
+    let field = format!(r#"<DOMStaticText><textRuns>{}{}</textRuns></DOMStaticText>"#, run("H", &a), run("2O", &b));
+    let (doc, _) = import_doc(&doc_with(&field), fonts);
+    let json = serde_json::to_string(&doc).unwrap();
+    let back: Document = serde_json::from_str(&json).unwrap();
+    let (x, y) = (texts(&doc), texts(&back));
+    assert_eq!((&x[0].1.runs, &x[0].1.fills, &x[0].1.outline), (&y[0].1.runs, &y[0].1.fills, &y[0].1.outline));
+    assert_eq!(y[0].1.runs.len(), 2);
+}
+
+#[test]
+fn centred_lines_centre_on_each_other() {
     let Some((fonts, family)) = fonts() else { return };
     let a = format!(r#"face="{family}" size="40" alignment="center""#);
     let b = format!(r#"face="{family}" size="12" alignment="center""#);
     let field = format!(r#"<DOMStaticText autoExpand="true"><textRuns>{}{}</textRuns></DOMStaticText>"#, run("WIDE HEADLINE&#xD;", &a), run("small", &b));
     let (doc, _) = import_doc(&doc_with(&field), fonts);
     let t = texts(&doc);
-    let centre = |i: usize| t[i].0.transform.translation().x + t[i].1.box_width * 0.5;
-    assert!((centre(0) - centre(1)).abs() < 0.01, "{} vs {}", centre(0), centre(1));
+    let b = &t[0].1;
+    let (head, small) = (b.fill_paths()[0].2.bounds(), b.outline.bounds());
+    // The block is as wide as the headline, and the small line sits in its middle.
+    assert!((head.center().x - b.box_width * 0.5).abs() < 2.0, "{head:?} in {}", b.box_width);
+    assert!((small.center().x - b.box_width * 0.5).abs() < 2.0);
 }
 
 #[test]
@@ -120,7 +143,7 @@ fn missing_fonts_fall_back_and_are_reported() {
     );
     let (doc, report) = import_doc(&doc_with(&field), fonts);
     let t = texts(&doc);
-    assert_eq!(t.len(), 3);
+    assert_eq!(t.len(), 2, "one block per field");
     assert_eq!((t[0].1.bold, t[0].1.italic), (true, true), "the face name says bold italic");
     assert!(fonts.families().contains(&t[0].1.font), "laid out in an installed family: {}", t[0].1.font);
     assert_eq!(report.missing_fonts.iter().map(String::as_str).collect::<Vec<_>>(), ["No Such Face", "Zz Missing Mono"]);
@@ -157,10 +180,13 @@ fn dynamic_and_input_text_become_fields_with_their_names() {
     assert_eq!(report.runs.get("dynamic text fields"), Some(&1));
     assert_eq!(report.runs.get("input text fields"), Some(&2));
     assert_eq!(report.kept.get("text field variables (ActionScript 1.0 and 2.0)"), Some(&1));
-    for (what, n) in [("justified text (drawn left-aligned)", 1), ("vertical text (drawn horizontal)", 1), ("first-line indents", 1), ("superscript and subscript (drawn on the line)", 1)] {
+    for (what, n) in [("justified text (drawn left-aligned)", 1), ("vertical text (drawn horizontal)", 1)] {
         assert_eq!(report.skipped.get(what), Some(&n), "{what}: {report:?}");
     }
     assert!(report.missing_fonts.is_empty(), "no face asks for the default family");
+    // Indents and superscripts are kept now (ADR 0085).
+    let st = &t[3].1;
+    assert_eq!((st.indent, st.shift), (5.0, anicraft_doc::BaselineShift::Superscript));
     // Every non-interactive render draws the authored text in its box, with its border.
     let dl = evaluate(&doc, 0);
     assert!(dl.items.iter().any(|i| i.stroke.is_some()), "the border");

@@ -124,6 +124,44 @@ fn f7_on_a_keyframe_makes_a_blank_one_next_instead_of_clearing() {
     assert_eq!(spans(&s, b), vec![(0, 1), (1, 3)]);
 }
 
+/// #272: with frames 3..=5 selected, F7 makes each of them a blank keyframe and F6 makes each a
+/// keyframe of what it showed, on every selected layer, in one undo step. Keyframes already in
+/// the range keep their drawings.
+#[test]
+fn f6_and_f7_over_a_range_key_every_frame() {
+    let mut s = Session::default();
+    let a = layer_with(&mut s, &[(0, 10)]);
+    let b = layer_with(&mut s, &[(0, 4), (4, 6)]);
+    for (layer, frame) in [(a, 0), (b, 0), (b, 4)] {
+        s.layer = layer;
+        s.set_frame(frame);
+        run(&mut s, "draw.rect", json!({"x": 0, "y": 0, "w": 10, "h": 10}));
+    }
+    let drawings = |s: &Session, id| s.timeline().layer(id).unwrap().keyframes.iter().map(|k| k.elements.len()).collect::<Vec<_>>();
+    let before = s.doc.clone();
+    run(&mut s, "timeline.insert_blank_keyframe", json!({"layers": [a.0, b.0], "frame": 3, "count": 3}));
+    assert_eq!(spans(&s, a), vec![(0, 3), (3, 1), (4, 1), (5, 5)]);
+    assert_eq!(drawings(&s, a), vec![1, 0, 0, 0], "the frames before the range keep the drawing");
+    // Layer b already had a keyframe at 4: it stays, with its drawing.
+    assert_eq!(spans(&s, b), vec![(0, 3), (3, 1), (4, 1), (5, 5)]);
+    assert_eq!(drawings(&s, b), vec![1, 0, 1, 0]);
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(s.doc, before, "one undo step for the whole range");
+
+    // F6 over the same range: each frame is a keyframe showing what it showed.
+    run(&mut s, "timeline.insert_keyframe", json!({"layers": [a.0, b.0], "frame": 3, "count": 3}));
+    assert_eq!(spans(&s, a), vec![(0, 3), (3, 1), (4, 1), (5, 5)]);
+    assert_eq!(drawings(&s, a), vec![1, 1, 1, 1]);
+    assert_eq!(spans(&s, b), vec![(0, 3), (3, 1), (4, 1), (5, 5)]);
+    assert_eq!(drawings(&s, b), vec![1, 1, 1, 1]);
+
+    // The range is checked, and stops at the last frame the timeline allows.
+    assert!(s.execute("timeline.insert_blank_keyframe", &json!({"frame": 0, "count": 0})).is_err());
+    assert!(s.execute("timeline.insert_keyframe", &json!({"frame": 0, "count": 10_001})).is_err());
+    let _ = s.execute("timeline.insert_blank_keyframe", &json!({"layer": a.0, "frame": MAX_FRAME - 1, "count": 50}));
+    assert!(s.timeline().layer(a).unwrap().end_frame() <= MAX_FRAME + 1);
+}
+
 #[test]
 fn advance_at_the_last_frame_stays_in_range() {
     let mut s = Session::default();

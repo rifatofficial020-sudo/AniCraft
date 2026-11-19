@@ -26,9 +26,9 @@ pub fn specs() -> Vec<CommandSpec> {
         c("element.select", "Select Elements", "", None, "{ids: [..], add?: bool, toggle?: bool, layer?} selects elements on any visible, unlocked layer at the playhead (ids are unique; `layer` looks only there); `toggle` takes each one that is selected out of the selection and adds the others (Shift+Space on a stage element); the active layer becomes the first one's unless it has some of them", false, select),
         c("element.pick", "Select at Point", "", None, "{x, y, add?: bool, view?: stage|camera} the topmost element there on a visible, unlocked layer; `add` (Shift) adds it to the selection, or lets go of it, on any layer; with `view: camera` the point is on the movie's picture as the camera shows it (each layer through its depth)", false, pick),
         c("element.translate", "Move", "", None, "{dx, dy, snap?, from?: [x, y]} moves the selection, on every layer; with `snap` (a distance) one of its corners or ends, or its box's corners or centre (the nearest to `from`), then snaps within that distance by the snap engine's priority (ADR 0076): a point, guide, line or fill edge of the rest, the grid, a whole pixel", true, translate),
-        c("element.set_transform", "Transform", "", None, "{x?, y?, sx?, sy?, rotation? (degrees)}", true, |s, p| s.each_layer(true, |s| set_transform(s, p))),
-        c("element.set_fill", "Fill Colour", "", None, "{color: \"#rrggbb\" | null}", true, |s, p| s.each_layer(false, |s| set_fill(s, p))),
-        c("element.set_stroke", "Stroke", "", None, "{color?: \"#rrggbb\" | null, width?, profile?: uniform|taper_both|taper_start|taper_end|bulge|pinch | [[t, left, right], ..], cap?, join?, miter?, style?, dash?, dash_offset?, dot_spacing? (as stroke.set_style)}", true, |s, p| s.each_layer(false, |s| set_stroke(s, p))),
+        c("element.set_transform", "Transform", "", None, "{x?, y?, sx?, sy?, rotation? (degrees)} x and y place the registration point. A new scale or rotation alone is applied about a symbol instance's transformation point when it has one (modify.transformation_point), else about the registration point", true, |s, p| s.each_layer(true, |s| set_transform(s, p))),
+        c("element.set_fill", "Fill Colour", "", None, "{color: \"#rrggbb\" | \"#rrggbbaa\" | null, or on: true | false} (the alpha is the fill's own; 00 is a clear fill, not the same as null. on: false turns the fill off like null; on: true puts back the fill each shape had before, else the tool's fill colour. With only raw lines selected the fill goes to what they surround)", true, |s, p| s.each_layer(false, |s| set_fill(s, p))),
+        c("element.set_stroke", "Stroke", "", None, "{on?: true | false (false removes the stroke like color: null; true puts back the stroke each shape had before, else the tool's), color?: \"#rrggbb\" | \"#rrggbbaa\" | null, width?, profile?: uniform|taper_both|taper_start|taper_end|bulge|pinch | [[t, left, right], ..], cap?, join?, miter?, style?, dash?, dash_offset?, dot_spacing? (as stroke.set_style)}", true, |s, p| s.each_layer(false, |s| set_stroke(s, p))),
         c("element.set_alpha", "Alpha", "", None, "{alpha: 0..1} sets the alpha multiplier and keeps the rest of the colour effect (None becomes Alpha; Brightness and Tint become Advanced below 1)", true, |s, p| s.each_layer(true, |s| set_alpha(s, p))),
         c("element.set_color_effect", "Colour Effect", "", None, "{style?: none|brightness|tint|advanced|alpha (default: the style the values belong to, else each element's own), alpha? (%, 0..100), brightness? (%, -100..100), tint? (#rrggbb), tint_amount? (%, 0..100), red_multiplier?, green_multiplier?, blue_multiplier?, alpha_multiplier? (%, -100..100), red_offset?, green_offset?, blue_offset?, alpha_offset? (-255..255)} on every selected element (ADR 0056); values not given keep each element's own. A new style starts from the look it can keep: Advanced is exactly the effect before, Alpha keeps the opacity, Brightness and Tint start at 0 %. The camera has no opacity (no Alpha style, alpha multiplier or offset)", true, |s, p| s.each_layer(true, |s| set_color_effect(s, p))),
         c("element.set_blend", "Blending", "", None, "{mode: normal|layer|darken|multiply|lighten|screen|overlay|hardlight|add|subtract|difference|invert|alpha|erase} on the selected movie clip and button instances", true, |s, p| s.each_layer(false, |s| set_blend(s, p))),
@@ -357,8 +357,10 @@ fn set_transform(s: &mut Session, p: &Value) -> Result<Value> {
             return Err(EngineError::Param("scale must be between 0.001 and 1000 in magnitude".into()));
         }
     }
-    let els = s.selected_elements_mut()?;
-    for e in els {
+    let units = raw_drawings(s);
+    let in_unit = |id: &ElementId| units.iter().any(|(ids, _)| ids.contains(id));
+    let mut els = s.selected_elements_mut()?;
+    for e in els.iter_mut().filter(|e| !in_unit(&e.id)) {
         let mut d: Decomposed = e.transform.decompose();
         if let Some(v) = x {
             d.tx = v;
@@ -375,40 +377,165 @@ fn set_transform(s: &mut Session, p: &Value) -> Result<Value> {
         if let Some(v) = rot {
             d.rotation = v.to_radians();
         }
-        e.transform = d.compose();
+        // A new scale or rotation turns an instance about its transformation point (ADR
+        // 0111); a position given places the registration point, as always.
+        let m = d.compose();
+        e.transform = if x.is_none() && y.is_none() { e.about_pivot(m) } else { m };
+    }
+    // A raw drawing turns and scales as one shape, about the centre of its pieces (#297): every
+    // piece takes the change that gives its first piece the values asked for.
+    for (ids, bounds) in &units {
+        let Some(reference) = ids.first().and_then(|id| els.iter().find(|e| e.id == *id)).map(|e| e.transform) else { continue };
+        let m = drawing_change(&reference, bounds.center(), [x, y, sx, sy, rot]);
+        for e in els.iter_mut().filter(|e| ids.contains(&e.id)) {
+            e.transform = m.mul(&e.transform);
+        }
     }
     Ok(json!({"ok": true}))
 }
 
-fn shapes_mut(s: &mut Session) -> Result<Vec<&mut Shape>> {
-    let shapes: Vec<&mut Shape> = s
-        .selected_elements_mut()?
+/// The selected raw drawings of two or more pieces on the active layer: raw pieces that touch,
+/// such as a fill and the strokes on its edges (ADR 0042), and their combined bounds.
+fn raw_drawings(s: &Session) -> Vec<(Vec<ElementId>, anicraft_geom::Rect)> {
+    let layer = s.layer;
+    let (ids, boxes): (Vec<ElementId>, Vec<anicraft_geom::Rect>) = s
+        .selected_elements()
         .into_iter()
-        .filter_map(|e| match &mut e.kind {
-            ElementKind::Shape(sh) => Some(sh),
-            ElementKind::Symbol { .. } | ElementKind::Text(_) | ElementKind::Camera | ElementKind::Group { .. } => None,
+        .filter(|(l, e)| *l == layer && crate::merge::mergeable(e).is_some())
+        .map(|(l, e)| (e.id, s.element_bounds_on(l, e.id)))
+        .filter(|(_, b)| !b.is_empty())
+        .unzip();
+    crate::merge::touching_groups(&boxes)
+        .into_iter()
+        .filter(|g| g.len() > 1)
+        .map(|g| {
+            let members: Vec<ElementId> = g.iter().filter_map(|&i| ids.get(i).copied()).collect();
+            let b = g.iter().filter_map(|&i| boxes.get(i)).fold(anicraft_geom::Rect::EMPTY, |r, b| r.union(b));
+            (members, b)
         })
-        .collect();
-    if shapes.is_empty() {
-        return Err(EngineError::State("the selection has no shapes (symbol instances use alpha/tint; text has its own colour)".into()));
+        .collect()
+}
+
+/// The stage-space change that gives `reference` the asked-for `[x, y, sx, sy, rotation°]`:
+/// scale, rotation and skew about `pivot`, then a move for the position.
+fn drawing_change(reference: &Affine, pivot: Vec2, [x, y, sx, sy, rot]: [Option<f32>; 5]) -> Affine {
+    let from = reference.decompose();
+    let mut to = from;
+    if let Some(v) = sx {
+        to.sx = v;
     }
-    Ok(shapes)
+    if let Some(v) = sy {
+        to.sy = v;
+    }
+    if let Some(v) = rot {
+        to.rotation = v.to_radians();
+    }
+    let linear = |d: &Decomposed| Decomposed { tx: 0.0, ty: 0.0, ..*d }.compose();
+    let turn = linear(&from).inverse().map_or(Affine::IDENTITY, |inv| linear(&to).mul(&inv));
+    let m = Affine::translate(pivot.x, pivot.y).mul(&turn).mul(&Affine::translate(-pivot.x, -pivot.y));
+    let at = m.mul(reference).translation();
+    Affine::translate(x.map_or(0.0, |v| v - at.x), y.map_or(0.0, |v| v - at.y)).mul(&m)
+}
+
+/// What `element.set_fill` does with the fill.
+enum Switch {
+    /// Remove it, remembering it for [`Switch::On`].
+    Off,
+    /// Put back what each shape had before it was turned off, else the tool's.
+    On,
+    Set(Paint),
 }
 
 fn set_fill(s: &mut Session, p: &Value) -> Result<Value> {
-    let fill = if p.get("color").is_some_and(Value::is_null) {
-        None
-    } else {
-        Some(Paint::Solid(opt_color(p, "color")?.ok_or_else(|| EngineError::Param("param 'color' is required".into()))?))
+    let null = p.get("color").is_some_and(Value::is_null);
+    let fill = match (opt_bool(p, "on")?, if null { None } else { opt_color(p, "color")? }) {
+        (Some(false), _) => Switch::Off,
+        (_, Some(c)) => Switch::Set(Paint::Solid(c)),
+        (Some(true), None) => Switch::On,
+        (None, None) if null => Switch::Off,
+        (None, None) => return Err(EngineError::Param("param 'color' is required (or on: true | false)".into())),
     };
-    for sh in shapes_mut(s)? {
-        sh.fill = fill.clone();
-    }
+    let mut memory = std::mem::take(&mut s.paint_memory);
+    let result = set_fill_with(s, &fill, &mut memory);
+    s.paint_memory = memory;
+    result?;
     Ok(json!({"ok": true}))
 }
 
+fn set_fill_with(s: &mut Session, fill: &Switch, memory: &mut crate::PaintMemory) -> Result<()> {
+    let sel = s.selection.on(s.layer);
+    let tool = Paint::Solid(s.style.fill);
+    // A raw outline's pieces are lines: a fill on each would have no area (#291). The fill
+    // belongs to what they surround.
+    let is_line = |sh: &Shape| sh.merge && sh.stroke.is_some() && sh.fill.is_none();
+    let (mut lines, mut shapes, mut filled) = (anicraft_geom::Rect::EMPTY, 0usize, 0usize);
+    for e in s.selected_elements_mut()? {
+        let (id, m) = (e.id, e.transform);
+        let ElementKind::Shape(sh) = &mut e.kind else { continue };
+        shapes += 1;
+        match fill {
+            Switch::Off => {
+                // Remembered, so the Fill checkbox brings it back as it was (#292).
+                if let Some(was) = sh.fill.take() {
+                    memory.remember_fill(id, was);
+                }
+                filled += 1;
+            }
+            _ if is_line(sh) => lines = lines.union(&crate::merge::reach(sh, &m)),
+            Switch::On => {
+                sh.fill = Some(memory.fills.get(&id).cloned().unwrap_or_else(|| tool.clone()));
+                filled += 1;
+            }
+            Switch::Set(paint) => {
+                sh.fill = Some(paint.clone());
+                filled += 1;
+            }
+        }
+    }
+    if shapes == 0 {
+        return Err(EngineError::State("the selection has no shapes (symbol instances use alpha/tint; text has its own colour)".into()));
+    }
+    if filled > 0 || lines.is_empty() {
+        return Ok(());
+    }
+    // Only lines are selected. A raw fill they surround that was turned off comes back…
+    let kf = s.editable_keyframe()?;
+    let mut back = Vec::new();
+    for e in kf.elements.iter_mut() {
+        let inside = matches!(&e.kind, ElementKind::Shape(sh) if sh.merge && sh.fill.is_none() && sh.stroke.is_none() && !sel.contains(&e.id) && {
+            let b = sh.path.bounds().transformed(&e.transform);
+            !b.is_empty() && b.min.x >= lines.min.x && b.min.y >= lines.min.y && b.max.x <= lines.max.x && b.max.y <= lines.max.y
+        });
+        if !inside {
+            continue;
+        }
+        let paint = match fill {
+            Switch::Set(paint) => paint.clone(),
+            _ => memory.fills.get(&e.id).cloned().unwrap_or_else(|| tool.clone()),
+        };
+        if let ElementKind::Shape(sh) = &mut Arc::make_mut(e).kind {
+            sh.fill = Some(paint);
+            back.push(e.id);
+        }
+    }
+    if !back.is_empty() {
+        return crate::cmds_raw::remerge_in_place(s, &back);
+    }
+    // …else the area they close off is filled, as the Paint Bucket fills it.
+    let paint = match fill {
+        Switch::Set(paint) => paint.clone(),
+        _ => tool,
+    };
+    if crate::cmds_paint::fill_enclosed(s, lines.center(), paint)? {
+        return Ok(());
+    }
+    Err(EngineError::State("the selected lines don't close off an area to fill; close the outline, or click inside it with the Paint Bucket".into()))
+}
+
 pub(crate) fn set_stroke(s: &mut Session, p: &Value) -> Result<Value> {
-    let remove = p.get("color").is_some_and(Value::is_null);
+    let on = opt_bool(p, "on")?;
+    let remove = on == Some(false) || (on.is_none() && p.get("color").is_some_and(Value::is_null));
+    let restore = on == Some(true);
     let color = opt_color(p, "color")?;
     let width = opt_f32(p, "width")?;
     if width.is_some_and(|w| !(0.0..=1000.0).contains(&w)) {
@@ -418,12 +545,43 @@ pub(crate) fn set_stroke(s: &mut Session, p: &Value) -> Result<Value> {
     let default = s.style.clone();
     // Checked once up front, so a bad style param changes nothing.
     opt_stroke_style(p, &default.line, default.stroke_width)?;
-    for sh in shapes_mut(s)? {
+    let mut memory = std::mem::take(&mut s.paint_memory);
+    let result = set_stroke_with(s, p, (remove, restore), (color, width, profile), &default, &mut memory);
+    s.paint_memory = memory;
+    result
+}
+
+type StrokeEdit = (Option<anicraft_doc::Rgba>, Option<f32>, Option<Option<anicraft_doc::WidthProfile>>);
+
+fn set_stroke_with(s: &mut Session, p: &Value, (remove, restore): (bool, bool), (color, width, profile): StrokeEdit, default: &crate::ToolStyle, memory: &mut crate::PaintMemory) -> Result<Value> {
+    let mut shapes = Vec::new();
+    for e in s.selected_elements_mut()? {
+        if let ElementKind::Shape(sh) = &mut e.kind {
+            shapes.push((e.id, sh));
+        }
+    }
+    if shapes.is_empty() {
+        return Err(EngineError::State("the selection has no shapes (symbol instances use alpha/tint; text has its own colour)".into()));
+    }
+    // A raw drawing's outline is its own stroke pieces (ADR 0042). When the selection holds
+    // strokes for the change, its raw fills take none of their own, which would draw the outline
+    // a second time over the pieces (#389). Lines whose stroke was turned off count as strokes:
+    // they are what turning it on again brings back.
+    let was_line = |id: &ElementId| restore && memory.strokes.contains_key(id);
+    let strokes_selected = shapes.iter().any(|(id, sh)| sh.merge && (sh.stroke.is_some() || was_line(id)));
+    for (id, sh) in shapes {
         if remove {
-            sh.stroke = None;
+            // Remembered, so the Stroke checkbox brings it back as it was (#393).
+            if let Some(was) = sh.stroke.take() {
+                memory.remember_stroke(id, was);
+            }
             continue;
         }
-        let mut st = sh.stroke.take().unwrap_or_else(|| default.new_stroke(default.stroke, default.stroke_width));
+        let remembered = if restore { memory.strokes.get(&id).cloned() } else { None };
+        if strokes_selected && sh.merge && sh.stroke.is_none() && remembered.is_none() {
+            continue;
+        }
+        let mut st = sh.stroke.take().or(remembered).unwrap_or_else(|| default.new_stroke(default.stroke, default.stroke_width));
         if let Some(c) = color {
             st.color = c;
         }
@@ -824,7 +982,7 @@ pub(crate) fn convert_to_symbol(s: &mut Session, p: &Value) -> Result<Value> {
         name: String::new(),
         transform: Affine::translate(center.x, center.y),
         color: ColorEffect::default(),
-        kind: ElementKind::Symbol { symbol: sym_id, loop_mode: LoopMode::Loop, first_frame: 0, blend: anicraft_doc::BlendMode::Normal, filters: Vec::new(), events: Vec::new() },
+        kind: ElementKind::Symbol { symbol: sym_id, loop_mode: LoopMode::Loop, first_frame: 0, blend: anicraft_doc::BlendMode::Normal, filters: Vec::new(), events: Vec::new(), pivot: None },
     };
     // Children are stored relative to the registration point (the selection centre).
     let to_local = Affine::translate(-center.x, -center.y);
@@ -891,15 +1049,17 @@ fn break_apart(s: &mut Session, _: &Value) -> Result<Value> {
             objects.push(c);
             continue;
         }
-        // Text breaks apart into a shape with the same outlines.
+        // Text breaks apart into shapes with the same outlines, one per colour (ADR 0085).
         if let ElementKind::Text(t) = &e.kind
             && sel.contains(&e.id)
         {
-            let mut c = (*e).clone();
-            c.id = ElementId(s.doc.alloc_id());
-            c.kind = ElementKind::Shape(crate::cmds_text::to_shape(t));
-            fresh_ids.push(c.id);
-            out.push(Arc::new(c));
+            for shape in crate::cmds_text::to_shapes(t) {
+                let mut c = (*e).clone();
+                c.id = ElementId(s.doc.alloc_id());
+                c.kind = ElementKind::Shape(shape);
+                fresh_ids.push(c.id);
+                out.push(Arc::new(c));
+            }
             continue;
         }
         // A group breaks apart into its members (Animate's Ctrl+B on a group ungroups it).
@@ -945,6 +1105,11 @@ fn break_apart(s: &mut Session, _: &Value) -> Result<Value> {
         }
     }
     if fresh_ids.is_empty() && objects.is_empty() {
+        // Already broken apart all the way (#299: a second or third Break Apart on text).
+        let sel = s.selection.on(s.layer);
+        if s.elements_on(s.layer).iter().filter(|e| sel.contains(&e.id)).all(|e| crate::merge::mergeable(e).is_some()) {
+            return Err(EngineError::State("the selection is raw shapes already: there is nothing left to break apart".into()));
+        }
         return Err(EngineError::State("the selection has no symbol instances, groups, text or drawing objects to break apart".into()));
     }
     s.editable_keyframe()?.elements = out;
@@ -1041,7 +1206,7 @@ fn place_symbol(s: &mut Session, sym: SymbolId, x: f32, y: f32) -> Result<Elemen
         name: String::new(),
         transform: Affine::translate(x, y),
         color: ColorEffect::default(),
-        kind: ElementKind::Symbol { symbol: sym, loop_mode: LoopMode::Loop, first_frame: 0, blend: anicraft_doc::BlendMode::Normal, filters: Vec::new(), events: Vec::new() },
+        kind: ElementKind::Symbol { symbol: sym, loop_mode: LoopMode::Loop, first_frame: 0, blend: anicraft_doc::BlendMode::Normal, filters: Vec::new(), events: Vec::new(), pivot: None },
     };
     s.editable_keyframe()?.elements.push(Arc::new(el));
     Ok(id)

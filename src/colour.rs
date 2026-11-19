@@ -1,6 +1,7 @@
 //! Colour swatches and the colour picker (#201, #246, #248), as Animate's swatch popup: a click
 //! on a swatch opens the web-safe palette with the colours used lately below it, a hex field,
-//! and the full mixer (hue, saturation and value, alpha) one click away.
+//! and, when the colour has opacity, an Alpha row (0 % clear, 100 % opaque). The mixer
+//! (hue, saturation and value) is one click away.
 //!
 //! The 216 web-safe colours are the open standard cube (each channel 00, 33, 66, 99, CC or FF),
 //! laid out as the usual six-by-six blocks: red steps across the blocks, green down a block and
@@ -118,6 +119,69 @@ fn remember(ctx: &egui::Context, popup: Id, c: [u8; 3]) {
     });
 }
 
+/// The picker's eyedropper (ADR 0109, #288): while a picker popup is open, a click on the stage
+/// takes the colour drawn there. The picker and the stage are apart in the interface, so they
+/// meet here, by frame number: the picker says it is showing, the stage says the pointer is
+/// over it and hands back what it sampled, and the picker takes that and closes.
+#[derive(Clone, Copy, Default)]
+struct Dropper {
+    /// The picker that showed last, and the frame it showed in.
+    open: Option<(Id, u64)>,
+    /// The frame the pointer was last over the stage with a picker open.
+    over_stage: Option<u64>,
+    /// A colour sampled from the stage for picker `.0`, and the frame it was sampled in.
+    picked: Option<(Id, [u8; 3], u64)>,
+}
+
+fn dropper_id() -> Id {
+    Id::new("anicraft.colour.dropper")
+}
+
+fn dropper(ctx: &egui::Context) -> Dropper {
+    ctx.data(|d| d.get_temp(dropper_id())).unwrap_or_default()
+}
+
+/// Whether something recorded in frame `then` still counts: this frame or the one before (the
+/// stage and the panels draw in either order).
+fn fresh(ctx: &egui::Context, then: u64) -> bool {
+    ctx.cumulative_frame_nr().saturating_sub(then) <= 1
+}
+
+/// The picker that takes a colour clicked on the stage: one showing in a popup now.
+pub(crate) fn picking(ctx: &egui::Context) -> Option<Id> {
+    dropper(ctx).open.filter(|(_, frame)| fresh(ctx, *frame)).map(|(id, _)| id)
+}
+
+/// The stage, each frame the pointer is over it while a picker is open: the popup then stays
+/// open through a click there.
+pub(crate) fn over_stage(ctx: &egui::Context) {
+    let frame = ctx.cumulative_frame_nr();
+    ctx.data_mut(|d| d.get_temp_mut_or_default::<Dropper>(dropper_id()).over_stage = Some(frame));
+}
+
+/// The stage hands picker `to` the colour clicked on it.
+pub(crate) fn pick_from_stage(ctx: &egui::Context, to: Id, c: [u8; 3]) {
+    let frame = ctx.cumulative_frame_nr();
+    ctx.data_mut(|d| d.get_temp_mut_or_default::<Dropper>(dropper_id()).picked = Some((to, c, frame)));
+    ctx.request_repaint();
+}
+
+/// The colour the stage handed picker `popup`, once (one never collected is dropped).
+fn take_picked(ctx: &egui::Context, popup: Id) -> Option<[u8; 3]> {
+    let (to, c, frame) = dropper(ctx).picked?;
+    let stale = !fresh(ctx, frame);
+    if stale || to == popup {
+        ctx.data_mut(|d| d.get_temp_mut_or_default::<Dropper>(dropper_id()).picked = None);
+    }
+    (!stale && to == popup).then_some(c)
+}
+
+/// How a picker popup closes: on a click outside it, except a click on the stage, which picks
+/// a colour first (the picker closes itself once it has it).
+pub(crate) fn close_behavior(ctx: &egui::Context) -> egui::PopupCloseBehavior {
+    if dropper(ctx).over_stage.is_some_and(|frame| fresh(ctx, frame)) { egui::PopupCloseBehavior::IgnoreClicks } else { egui::PopupCloseBehavior::CloseOnClickOutside }
+}
+
 /// A new popup opening adds its first change as a new recent colour.
 pub(crate) fn new_session(ctx: &egui::Context) {
     ctx.data_mut(|d| d.get_temp_mut_or_default::<Recent>(recent_id()).from = None);
@@ -163,11 +227,18 @@ pub fn popup_for(ui: &egui::Ui, anchor: &Response, popup: Id, c: &mut [u8; 4], a
         new_session(ui.ctx());
     }
     let mut changed = false;
-    let shown = egui::Popup::menu(anchor).id(popup).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+    let shown = egui::Popup::menu(anchor).id(popup).close_behavior(close_behavior(ui.ctx())).show(|ui| {
         changed = picker(ui, popup, c, alpha, none);
     });
-    if let Some(r) = shown {
-        name_popup(&r.response, tr!("Colour picker"));
+    match shown {
+        Some(r) => name_popup(&r.response, tr!("Colour picker")),
+        // A tap that reached the stage and closed the popup in one frame still picks.
+        None => {
+            if let Some(p) = take_picked(ui.ctx(), popup) {
+                *c = [p[0], p[1], p[2], c[3]];
+                changed = true;
+            }
+        }
     }
     changed
 }
@@ -185,6 +256,16 @@ pub(crate) fn picker(ui: &mut egui::Ui, popup: Id, c: &mut [u8; 4], alpha: bool,
     let view_id = Id::new("anicraft.colour.view");
     let mut view: View = ui.data(|d| d.get_temp(view_id)).unwrap_or_default();
     let mut changed = false;
+    // The eyedropper: this picker is the one a click on the stage gives its colour to; the
+    // alpha stays as set (what is sampled is the colour as drawn, which is opaque).
+    let frame = ui.ctx().cumulative_frame_nr();
+    ui.data_mut(|d| d.get_temp_mut_or_default::<Dropper>(dropper_id()).open = Some((popup, frame)));
+    if let Some(p) = take_picked(ui.ctx(), popup) {
+        *c = [p[0], p[1], p[2], c[3]];
+        remember(ui.ctx(), popup, p);
+        changed = true;
+        egui::Popup::close_all(ui.ctx());
+    }
     ui.horizontal(|ui| {
         let before = view;
         ui.selectable_value(&mut view, View::Swatches, tr!("Swatches")).on_hover_text(tr!("The web-safe palette and the colours used lately"));
@@ -230,15 +311,32 @@ pub(crate) fn picker(ui: &mut egui::Ui, popup: Id, c: &mut [u8; 4], alpha: bool,
             remember(ui.ctx(), popup, [h[0], h[1], h[2]]);
             changed = true;
         }
-        if alpha {
+    });
+    ui.label(text(Type::Caption, tr!("Or click anything on the stage to take its colour.")));
+    // Its own row, with the word on it. A bare percent beside the hex does not read as opacity.
+    if alpha {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let tip = tr!("Alpha: 0 % is clear, 100 % opaque");
+            ui.label(tr!("Alpha")).on_hover_text(tip);
             let mut pct = f32::from(c[3]) / 255.0 * 100.0;
-            let r = with_type(ui, Type::Data, |ui| ui.add(egui::DragValue::new(&mut pct).range(0.0..=100.0).suffix(" %").max_decimals(0))).named(tr!("Alpha"));
-            if r.on_hover_text(tr!("Alpha: 0 % is clear, 100 % opaque")).changed() {
+            ui.spacing_mut().slider_width = 148.0;
+            // The theme's slider rail is the popup's own colour, so the bar would vanish into it.
+            let name = tr!("Alpha");
+            let bar = ui.scope(|ui| {
+                let v = ui.visuals_mut();
+                v.widgets.inactive.bg_fill = T.hover;
+                v.selection.bg_fill = T.accent;
+                ui.add(egui::Slider::new(&mut pct, 0.0..=100.0).show_value(false))
+            }).inner.named(name);
+            let num = with_type(ui, Type::Data, |ui| ui.add(egui::DragValue::new(&mut pct).range(0.0..=100.0).suffix(" %").max_decimals(0).speed(0.5))).named(name);
+            let r = bar.union(num);
+            if r.on_hover_text(tip).changed() {
                 c[3] = (pct.clamp(0.0, 100.0) / 100.0 * 255.0).round() as u8;
                 changed = true;
             }
-        }
-    });
+        });
+    }
     changed
 }
 
@@ -411,5 +509,46 @@ mod tests {
             remember(&ctx, a, [v, v, v]);
         }
         assert_eq!(list(&ctx).len(), RECENT, "bounded");
+    }
+
+    #[test]
+    fn a_click_on_the_stage_gives_the_open_picker_its_colour_once() {
+        let ctx = egui::Context::default();
+        let (a, b) = (Id::new("fill_popup"), Id::new("stroke_popup"));
+        let mut c = [10, 20, 30, 128];
+        let frame = |ctx: &egui::Context, id: Id, c: &mut [u8; 4]| {
+            let mut changed = false;
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| changed = picker(ui, id, c, true, None));
+            out.textures_delta.clear();
+            changed
+        };
+        assert_eq!(picking(&ctx), None, "no picker, no eyedropper");
+        assert_eq!(close_behavior(&ctx), egui::PopupCloseBehavior::CloseOnClickOutside);
+        // The picker shows: the stage is its eyedropper, and nothing has changed.
+        assert!(!frame(&ctx, a, &mut c));
+        assert_eq!(picking(&ctx), Some(a));
+        // The pointer over the stage keeps the popup open through the click that picks.
+        over_stage(&ctx);
+        assert_eq!(close_behavior(&ctx), egui::PopupCloseBehavior::IgnoreClicks);
+        // The stage hands over the colour clicked: the picker takes it, alpha kept, once.
+        pick_from_stage(&ctx, a, [200, 100, 50]);
+        assert!(frame(&ctx, a, &mut c));
+        assert_eq!(c, [200, 100, 50, 128]);
+        assert!(ctx.data(|d| d.get_temp::<Recent>(recent_id())).is_some_and(|r| r.colours.first() == Some(&[200, 100, 50])), "and it joins the colours used lately");
+        assert!(!frame(&ctx, a, &mut c), "taken once");
+        // Another picker doesn't take a colour meant for this one, and one never collected
+        // (the picker closed first) is dropped rather than turning up later.
+        pick_from_stage(&ctx, a, [1, 2, 3]);
+        let mut other = [9, 9, 9, 255];
+        assert!(!frame(&ctx, b, &mut other));
+        assert_eq!(other, [9, 9, 9, 255]);
+        for _ in 0..3 {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+            out.textures_delta.clear();
+        }
+        assert_eq!(picking(&ctx), None, "the picker closed: the stage is the tools' again");
+        assert_eq!(close_behavior(&ctx), egui::PopupCloseBehavior::CloseOnClickOutside);
+        assert!(!frame(&ctx, a, &mut c));
+        assert_eq!(c, [200, 100, 50, 128], "the stale colour is gone");
     }
 }

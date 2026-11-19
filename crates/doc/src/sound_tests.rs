@@ -205,7 +205,7 @@ fn nested(kind: SymbolKind, len: u32, inner: &[(u32, u32, Option<FrameSound>)], 
                 name: String::new(),
                 transform: Default::default(),
                 color: Default::default(),
-                kind: ElementKind::Symbol { symbol: SymbolId(50), loop_mode, first_frame, blend: Default::default(), filters: Vec::new(), events: Vec::new() },
+                kind: ElementKind::Symbol { symbol: SymbolId(50), loop_mode, first_frame, blend: Default::default(), filters: Vec::new(), events: Vec::new(), pivot: None },
             }));
             Arc::new(k)
         })

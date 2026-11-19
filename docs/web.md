@@ -65,13 +65,15 @@ autosave) work. On another host, serve over HTTPS for the same reason. Compressi
   shows as missing (the browser never gives its path back): open it again with Open.
 * **Leaving the page** with unsaved changes asks first.
 * **Shortcuts** are the desktop ones; on a Mac they use ⌘.
+* **Sound playback** uses Web Audio (ADR 0095): playback, scrubbing, previews and Test Movie,
+  with the playhead following the sound. The browser opens sound on the first play (a click).
+  Where a browser has no Web Audio, playback is silent with a notice.
 
 ## Not in the web editor yet
 
 | Missing | Why, and what to do meanwhile |
 |---|---|
 | Video export | It runs ffmpeg, which a page can't start. The menu item is dimmed; export a GIF, PNG sequence or HTML page. |
-| Sound playback | Through Web Audio (ADR 0095), as on the desktop: playback, scrubbing, previews and Test Movie, the playhead following the sound. The browser opens sound on the first play (a click). Where a browser has no Web Audio, playback is silent with a notice. |
 | GPU stage | The stage draws on the CPU, on one thread. The GPU renderer builds for the web but isn't wired to WebGPU yet. |
 | Installing plug-ins | Plug-ins live in a folder on the computer. Use the desktop app. |
 | Fonts on your computer | A page can't see them. Text uses the bundled faces. |

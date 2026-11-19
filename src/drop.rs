@@ -652,9 +652,10 @@ mod tests {
         run(&mut app, &[dir.join("notes.txt")], Spot::Stage(0.0, 0.0));
         assert!(app.s.doc == before);
         assert!(app.status.as_ref().is_some_and(|s| s.error && s.text.contains("notes.txt")));
-        // A document over unsaved work asks first.
+        // A document over unsaved work opens in a tab of its own (ADR 0112): nothing to ask.
         run(&mut app, &[dir.join("other.anicraft")], Spot::Stage(0.0, 0.0));
-        assert!(app.confirm.is_some());
+        assert!(app.confirm.is_none());
+        assert!(crate::tabs::infos(&app).iter().any(|t| t.dirty), "the unsaved work is still open");
     }
 
     /// Documents the system hands the running app (macOS Finder, the Dock; ADR 0062) arrive as
@@ -684,20 +685,22 @@ mod tests {
         assert_eq!(app.s.path.as_deref(), Some(walk.as_path()));
         assert!(app.start.is_none(), "the start screen gave way");
         assert!(app.status.as_ref().is_some_and(|s| s.text.contains("photo.png")), "{:?}", app.status.as_ref().map(|s| &s.text));
-        // While running, over unsaved work: it asks first, and nothing changes until it's answered.
+        // While running, over unsaved work: it opens in a tab of its own, and the work stays
+        // open in its tab (ADR 0112).
         app.run("layer.new", json!({}));
         assert!(app.s.is_dirty());
         push_request(SystemRequest::Open(vec![other.clone()]));
         frame(&mut app);
-        assert!(app.confirm.as_ref().is_some_and(|c| c.id == "file.open"), "the unsaved-changes guard asks");
-        assert_eq!(app.s.path.as_deref(), Some(walk.as_path()));
-        app.confirm = None;
+        assert!(app.confirm.is_none());
+        assert_eq!(app.s.path.as_deref(), Some(other.as_path()));
+        assert_eq!(crate::tabs::infos(&app).iter().map(|t| (t.path.clone(), t.dirty)).collect::<Vec<_>>(), [(Some(walk.clone()), true), (Some(other.clone()), false)]);
         // Only files AniCraft can't open: one clear message, nothing else.
         push_request(SystemRequest::Open(vec![dir.join("notes.txt")]));
         frame(&mut app);
         assert!(app.status.as_ref().is_some_and(|s| s.error && s.text.contains("notes.txt")));
         assert!(app.confirm.is_none());
         // The Dock's Quit closes the editor's window, which the close guard intercepts.
+        app.allow_close = true;
         push_request(SystemRequest::Quit);
         let out = frame(&mut app);
         let closes = out.viewport_output.get(&egui::ViewportId::ROOT).is_some_and(|v| v.commands.contains(&egui::ViewportCommand::Close));

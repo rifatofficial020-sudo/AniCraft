@@ -1,5 +1,10 @@
 //! Filter presets (ADR 0091): named filter lists of the user's own, as Animate's Filters panel
-//! keeps them (Save as Preset, apply, rename, delete).
+//! keeps them (Save as Preset, apply, rename, delete), and the built-in ones (ADR 0099).
+//!
+//! The built-in presets are AniCraft's own, written here from the filters' parameters (no
+//! other product's presets or values). They are always there: they can't be renamed, replaced
+//! or deleted, only hidden from the menu, and a hidden one still applies by name, so a script
+//! or a plug-in that names one works on every computer.
 //!
 //! Like the user's brushes (ADR 0068) the presets belong to the session, not the document: they
 //! survive New and Open, the desktop app keeps them in its preferences and puts them back at
@@ -8,7 +13,7 @@
 //! instances: a preset edited or deleted later never changes artwork behind the artist's back.
 
 use crate::{EngineError, Result};
-use anicraft_doc::FilterEntry;
+use anicraft_doc::{Filter, FilterEntry, FilterSide, Rgba};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -53,11 +58,52 @@ fn same_name(a: &str, b: &str) -> bool {
     a.trim().to_lowercase() == b.trim().to_lowercase()
 }
 
-/// The user's filter presets, in the order they were saved; names are unique, case aside.
+/// The built-in presets' names (English; the interface translates them where it draws them),
+/// in the order the menu shows them.
+pub const BUILTIN_NAMES: [&str; 8] = ["Soft Shadow", "Hard Shadow", "Neon Glow", "Outline", "Emboss", "Engrave", "Soft Focus", "Greyscale"];
+
+/// The built-in presets (ADR 0099), in menu order. The values are AniCraft's own.
+pub fn builtins() -> Vec<FilterPreset> {
+    let shadow = |blur: f32, strength: f32, quality: u8, angle: f32, distance: f32| Filter::DropShadow { blur_x: blur, blur_y: blur, strength, quality, angle, distance, color: Rgba::BLACK, inner: false, knockout: false, hide_object: false };
+    let glow = |blur: f32, strength: f32, color: u32| Filter::Glow { blur_x: blur, blur_y: blur, strength, quality: 3, color: Rgba::hex(color), inner: false, knockout: false };
+    // A bevel lit from `angle`'s far side (45: light from the top left, so the edge looks raised;
+    // 225: from the bottom right, so it looks cut in).
+    let bevel = |angle: f32| Filter::Bevel { blur_x: 3.0, blur_y: 3.0, strength: 1.2, quality: 3, angle, distance: 2.0, shadow_color: Rgba::BLACK, highlight_color: Rgba::WHITE, side: FilterSide::Inner, knockout: false };
+    let lists: [Vec<Filter>; 8] = [
+        vec![shadow(12.0, 0.45, 3, 60.0, 6.0)],
+        vec![shadow(0.0, 0.5, 1, 45.0, 5.0)],
+        // A tight bright core inside a wide halo.
+        vec![glow(4.0, 2.2, 0x9ff6ff), glow(22.0, 1.3, 0x1fb6ff)],
+        // A small glow at full strength reads as a line round the artwork.
+        vec![glow(3.0, 10.0, 0x000000)],
+        vec![bevel(45.0)],
+        vec![bevel(225.0)],
+        vec![Filter::Blur { blur_x: 6.0, blur_y: 6.0, quality: 3 }],
+        vec![Filter::AdjustColor { brightness: 0.0, contrast: 0.0, saturation: -100.0, hue: 0.0 }],
+    ];
+    BUILTIN_NAMES.iter().zip(lists).map(|(name, filters)| FilterPreset { name: (*name).to_string(), filters: filters.iter().map(|f| FilterEntry::from(f.sanitized())).collect() }).collect()
+}
+
+/// The built-in preset called `name` (case aside), as it is written.
+pub fn builtin_name(name: &str) -> Option<&'static str> {
+    BUILTIN_NAMES.into_iter().find(|n| same_name(n, name))
+}
+
+/// Whether `name` is a built-in preset's.
+pub fn is_builtin_name(name: &str) -> bool {
+    builtin_name(name).is_some()
+}
+
+/// The user's filter presets, in the order they were saved; names are unique, case aside, and
+/// never a built-in preset's. With them, which built-in presets the user has hidden from the
+/// menu (kept apart in the preferences, so the list of presets stays what older builds read).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct FilterLibrary {
     presets: Vec<FilterPreset>,
+    /// Built-in presets hidden from the menu, by name as [`BUILTIN_NAMES`] writes it.
+    #[serde(skip)]
+    hidden: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -90,7 +136,52 @@ impl FilterLibrary {
 
     /// The same library with every entry sanitized (after deserializing preferences).
     pub fn sanitized(self) -> FilterLibrary {
-        FilterLibrary::from_values(self.presets.into_iter().filter_map(|p| serde_json::to_value(p).ok()))
+        let mut lib = FilterLibrary::from_values(self.presets.into_iter().filter_map(|p| serde_json::to_value(p).ok()));
+        lib.restore_hidden(&self.hidden);
+        lib
+    }
+
+    /// The built-in presets hidden from the menu.
+    pub fn hidden(&self) -> &[String] {
+        &self.hidden
+    }
+
+    pub fn is_hidden(&self, name: &str) -> bool {
+        self.hidden.iter().any(|h| same_name(h, name))
+    }
+
+    /// The built-in presets the menu shows: all but the hidden ones.
+    pub fn shown_builtins(&self) -> Vec<FilterPreset> {
+        builtins().into_iter().filter(|p| !self.is_hidden(&p.name)).collect()
+    }
+
+    /// Sets which built-in presets are hidden, from the preferences: names that aren't a
+    /// built-in preset's are dropped.
+    pub fn restore_hidden(&mut self, names: &[String]) {
+        self.hidden = BUILTIN_NAMES.into_iter().filter(|b| names.iter().take(MAX_PRESETS).any(|n| same_name(n, b))).map(str::to_string).collect();
+    }
+
+    /// Hides the built-in preset `name` from the menu, or shows it again. Its name as written.
+    pub fn set_hidden(&mut self, name: &str, hidden: bool) -> Result<String> {
+        let Some(builtin) = builtin_name(name) else {
+            return Err(match self.find(name) {
+                Some(p) => EngineError::Param(format!("'{}' is a preset of yours; only built-in presets are hidden (delete it instead)", p.name)),
+                None => Self::missing(name),
+            });
+        };
+        self.hidden.retain(|h| !same_name(h, builtin));
+        if hidden {
+            self.hidden.push(builtin.to_string());
+            // In menu order, so the preferences don't change with the order of hiding.
+            let kept = std::mem::take(&mut self.hidden);
+            self.restore_hidden(&kept);
+        }
+        Ok(builtin.to_string())
+    }
+
+    /// The preset called `name`: one of the user's, or a built-in one (hidden or not).
+    pub fn resolve(&self, name: &str) -> Option<FilterPreset> {
+        self.find(name).cloned().or_else(|| builtins().into_iter().find(|p| same_name(&p.name, name)))
     }
 
     pub fn position(&self, name: &str) -> Option<usize> {
@@ -109,6 +200,9 @@ impl FilterLibrary {
     /// and whether it replaced one.
     pub fn save(&mut self, name: &str, filters: &[FilterEntry]) -> Result<(String, bool)> {
         let p = FilterPreset { name: name.to_string(), filters: filters.to_vec() }.sanitized().ok_or_else(|| EngineError::Param("a filter preset needs a name".into()))?;
+        if let Some(b) = builtin_name(&p.name) {
+            return Err(EngineError::Param(format!("'{b}' is a built-in filter preset; save yours under another name")));
+        }
         if p.filters.is_empty() {
             return Err(EngineError::State("there are no filters to save; add one first".into()));
         }
@@ -136,7 +230,7 @@ impl FilterLibrary {
         let base = p.name.clone();
         let mut name = base.clone();
         let mut k = 2;
-        while self.position(&name).is_some() {
+        while self.position(&name).is_some() || is_builtin_name(&name) {
             if k > MAX_PRESETS + 10 {
                 return Err(EngineError::State("too many filter presets of that name".into()));
             }
@@ -149,8 +243,14 @@ impl FilterLibrary {
     }
 
     pub fn rename(&mut self, name: &str, to: &str) -> Result<String> {
-        let i = self.position(name).ok_or_else(|| Self::missing(name))?;
+        let i = self.position(name).ok_or_else(|| match builtin_name(name) {
+            Some(b) => EngineError::Param(format!("'{b}' is a built-in filter preset; it keeps its name")),
+            None => Self::missing(name),
+        })?;
         let to = clean_name(to).ok_or_else(|| EngineError::Param("a filter preset needs a name".into()))?;
+        if let Some(b) = builtin_name(&to) {
+            return Err(EngineError::Param(format!("'{b}' is a built-in filter preset's name")));
+        }
         if self.position(&to).is_some_and(|j| j != i) {
             return Err(EngineError::Param(format!("you already have a filter preset named '{to}'")));
         }
@@ -161,7 +261,10 @@ impl FilterLibrary {
     }
 
     pub fn delete(&mut self, name: &str) -> Result<FilterPreset> {
-        let i = self.position(name).ok_or_else(|| Self::missing(name))?;
+        let i = self.position(name).ok_or_else(|| match builtin_name(name) {
+            Some(b) => EngineError::Param(format!("'{b}' is a built-in filter preset: it can't be deleted, only hidden (filter.preset_hide)")),
+            None => Self::missing(name),
+        })?;
         Ok(self.presets.remove(i))
     }
 

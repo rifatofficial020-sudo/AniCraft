@@ -22,7 +22,7 @@ fn panel(sx: f32, sy: f32, guides: bool) -> Document {
         name: String::new(),
         transform: Affine::translate(20.0, 20.0).mul(&Affine::scale(sx, sy)),
         color: ColorEffect::default(),
-        kind: ElementKind::Symbol { symbol: SymbolId(4), loop_mode: Default::default(), first_frame: 0, blend: Default::default(), filters: Vec::new(), events: Vec::new() },
+        kind: ElementKind::Symbol { symbol: SymbolId(4), loop_mode: Default::default(), first_frame: 0, blend: Default::default(), filters: Vec::new(), events: Vec::new(), pivot: None },
     };
     let mut k = Keyframe::new(0, 1);
     k.elements.push(Arc::new(inst));

@@ -1,13 +1,14 @@
-//! The filter list of movie clip and button instances (ADR 0025, 0091): replacing it
-//! (`element.set_filters`), reordering, switching filters on and off, removing them, copying
-//! and pasting them between instances, and the user's filter presets.
+//! The filter list of movie clip and button instances and of text (ADR 0025, 0091, 0099):
+//! replacing it (`element.set_filters`), reordering, switching filters on and off, removing
+//! them, copying and pasting them between objects, and filter presets: the user's own and the
+//! built-in ones.
 //!
-//! Every edit acts on each selected movie clip and button instance (graphics take no filters,
-//! as in Animate) and is one undo step. A filter at an index acts where an instance has one;
-//! the command fails only when it acts nowhere. Copied filters and presets live in the session,
+//! Every edit acts on each selected movie clip, button and text (graphics take no filters, as
+//! in Animate) and is one undo step. A filter at an index acts where an object has one; the
+//! command fails only when it acts nowhere. Copied filters and presets live in the session,
 //! outside the document and its undo history.
 
-use crate::filter_library::{FilterLibrary, MAX_FILE_BYTES, MAX_FILTERS, MAX_PRESETS};
+use crate::filter_library::{FilterLibrary, MAX_FILE_BYTES, MAX_FILTERS, MAX_PRESETS, builtins};
 use crate::params::*;
 use crate::{CommandSpec, EngineError, Result, Session};
 use anicraft_doc::{ElementKind, FilterEntry, SymbolId, SymbolKind};
@@ -16,17 +17,18 @@ use serde_json::{Value, json};
 pub fn specs() -> Vec<CommandSpec> {
     let c = |id, label, params, mutates, run| CommandSpec { id, label, menu: "", shortcut: None, params, mutates, run };
     vec![
-        c("filter.move", "Move Filter", "{from, to} moves the filter at index `from` (0 is the first, applied first) to index `to` in the selected movie clip and button instances' lists; the order changes how they draw", true, (|s, p| s.each_layer(false, |s| move_filter(s, p))) as crate::RunFn),
+        c("filter.move", "Move Filter", "{from, to} moves the filter at index `from` (0 is the first, applied first) to index `to` in the lists of the selected movie clips, buttons and text; the order changes how they draw", true, (|s, p| s.each_layer(false, |s| move_filter(s, p))) as crate::RunFn),
         c("filter.enable", "Enable Filter", "{enabled: bool, index? (default: every filter)} switches a filter on or off; a filter switched off keeps its settings and draws nothing", true, |s, p| s.each_layer(false, |s| enable(s, p))),
-        c("filter.remove", "Remove Filter", "{index? (default: every filter)} removes a filter from the selected movie clip and button instances", true, |s, p| s.each_layer(false, |s| remove(s, p))),
-        c("filter.copy", "Copy Filters", "{index? (default: every filter)} copies the selected instance's filters (one, or all), for Paste Filters", false, copy),
-        c("filter.paste", "Paste Filters", "{replace? (default false: added after the instances' own)} pastes the copied filters onto the selected movie clip and button instances", true, |s, p| s.each_layer(false, |s| paste(s, p))),
-        c("filter.preset_list", "Filter Presets", "{} your filter presets, each a name and its filters", false, preset_list),
-        c("filter.preset_save", "Save Filter Preset", "{name, filters? (a list as element.set_filters takes; default: the selected instance's)} saves a filter preset of your own (kept in your preferences; a name you have already is replaced, after asking)", false, preset_save),
-        c("filter.preset_apply", "Apply Filter Preset", "{name} gives the selected movie clip and button instances the preset's filters, replacing theirs (as Animate does)", true, |s, p| s.each_layer(false, |s| preset_apply(s, p))),
-        c("filter.preset_rename", "Rename Filter Preset", "{name, to}", false, preset_rename),
-        c("filter.preset_delete", "Delete Filter Preset", "{name} deletes a filter preset (asks first: it can't be undone; artwork that used it keeps its filters)", false, preset_delete),
-        c("filter.preset_export", "Export Filter Presets", "{path, names? (default: all)} writes your filter presets to a small JSON file", false, preset_export),
+        c("filter.remove", "Remove Filter", "{index? (default: every filter)} removes a filter from the selected movie clips, buttons and text", true, |s, p| s.each_layer(false, |s| remove(s, p))),
+        c("filter.copy", "Copy Filters", "{index? (default: every filter)} copies the filters of the selected movie clip, button or text (one, or all), for Paste Filters", false, copy),
+        c("filter.paste", "Paste Filters", "{replace? (default false: added after their own)} pastes the copied filters onto the selected movie clips, buttons and text", true, |s, p| s.each_layer(false, |s| paste(s, p))),
+        c("filter.preset_list", "Filter Presets", "{} → {presets: your filter presets, each a name and its filters; builtin: the built-in ones (ADR 0099), each with its name, filters and whether you have hidden it}", false, preset_list),
+        c("filter.preset_save", "Save Filter Preset", "{name, filters? (a list as element.set_filters takes; default: the selected object's)} saves a filter preset of your own (kept in your preferences; a name you have already is replaced, after asking; a built-in preset's name is refused)", false, preset_save),
+        c("filter.preset_apply", "Apply Filter Preset", "{name: one of yours, or a built-in one (Soft Shadow, Hard Shadow, Neon Glow, Outline, Emboss, Engrave, Soft Focus, Greyscale)} gives the selected movie clips, buttons and text the preset's filters, replacing theirs (as Animate does)", true, |s, p| s.each_layer(false, |s| preset_apply(s, p))),
+        c("filter.preset_rename", "Rename Filter Preset", "{name, to} (your own presets; the built-in ones keep their names)", false, preset_rename),
+        c("filter.preset_delete", "Delete Filter Preset", "{name} deletes a filter preset of yours (asks first: it can't be undone; artwork that used it keeps its filters). Built-in presets can't be deleted, only hidden (filter.preset_hide)", false, preset_delete),
+        c("filter.preset_hide", "Hide Built-in Filter Preset", "{name, hidden? (default true; false shows it again)} hides a built-in filter preset from the presets menu, or shows it again (kept in your preferences; a hidden preset still applies by name)", false, preset_hide),
+        c("filter.preset_export", "Export Filter Presets", "{path, names? (default: all of yours; built-in ones may be named)} writes filter presets to a small JSON file", false, preset_export),
         c("filter.preset_import", "Import Filter Presets", "{path} adds the presets in a filter preset file to yours (a name you have already gets a number)", false, preset_import),
     ]
 }
@@ -62,29 +64,39 @@ pub(crate) fn parse_list(list: Option<&Value>) -> Result<Vec<FilterEntry>> {
     Ok(filters.iter().map(FilterEntry::sanitized).collect())
 }
 
-/// Runs `edit` on the filter list of each selected movie clip and button instance; `edit`
-/// says whether it changed that list. Fails when no instance takes filters, or none changed
-/// (`nothing` says why).
+/// What to select for a filter command.
+const SELECT: &str = "select a movie clip or button instance, or text";
+
+/// Runs `edit` on the filter list of each selected movie clip, button and text (ADR 0099);
+/// `edit` says whether it changed that list. Fails when nothing selected takes filters, or
+/// none changed (`nothing` says why).
 fn edit_lists(s: &mut Session, nothing: &str, mut edit: impl FnMut(&mut Vec<FilterEntry>) -> bool) -> Result<usize> {
     let kinds: std::collections::HashMap<SymbolId, SymbolKind> = s.doc.library.iter().map(|x| (x.id, x.kind)).collect();
     let (mut set, mut clips, mut graphics) = (0, 0, 0);
     for e in s.selected_props_mut()? {
-        if let ElementKind::Symbol { symbol, filters, .. } = &mut e.kind {
-            if kinds.get(symbol) == Some(&SymbolKind::Graphic) {
-                graphics += 1;
-                continue;
-            }
-            clips += 1;
-            if edit(filters) {
-                set += 1;
+        if matches!(&e.kind, ElementKind::Symbol { symbol, .. } if kinds.get(symbol) == Some(&SymbolKind::Graphic)) {
+            graphics += 1;
+            continue;
+        }
+        // Only what takes filters is touched (a text block shared with another keyframe is
+        // copied when its list is asked for).
+        if e.kind.filters().is_none() {
+            continue;
+        }
+        let mut list = e.kind.filters().map(<[FilterEntry]>::to_vec).unwrap_or_default();
+        clips += 1;
+        if edit(&mut list) {
+            set += 1;
+            if let Some(slot) = e.kind.filters_mut() {
+                *slot = list;
             }
         }
     }
     if clips == 0 {
         return Err(EngineError::State(if graphics > 0 {
-            "filters apply to movie clip and button instances; set the symbol's Type to Movie Clip first".into()
+            "filters apply to movie clip and button instances and to text; set the symbol's Type to Movie Clip first".into()
         } else {
-            "select a movie clip or button instance".into()
+            SELECT.into()
         }));
     }
     if set == 0 {
@@ -93,7 +105,7 @@ fn edit_lists(s: &mut Session, nothing: &str, mut edit: impl FnMut(&mut Vec<Filt
     Ok(set)
 }
 
-/// Filters for the selected movie clip and button instances (Animate offers them on those only).
+/// Filters for the selected movie clip and button instances and text (as Animate offers them).
 pub(crate) fn set_filters(s: &mut Session, p: &Value) -> Result<Value> {
     let filters = parse_list(p.get("filters"))?;
     let set = edit_lists(s, "", |f| {
@@ -164,23 +176,23 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"removed": set}))
 }
 
-/// The filters of the first selected movie clip or button instance, as it shows now.
+/// The filters of the first selected movie clip, button or text, as it shows now.
 fn selected_list(s: &Session) -> Result<Vec<FilterEntry>> {
     let kinds: std::collections::HashMap<SymbolId, SymbolKind> = s.doc.library.iter().map(|x| (x.id, x.kind)).collect();
     s.selected_elements()
         .into_iter()
         .find_map(|(_, e)| match &e.kind {
-            ElementKind::Symbol { symbol, filters, .. } if kinds.get(symbol).is_some_and(|k| *k != SymbolKind::Graphic) => Some(filters.clone()),
-            _ => None,
+            ElementKind::Symbol { symbol, .. } if kinds.get(symbol).is_none_or(|k| *k == SymbolKind::Graphic) => None,
+            kind => kind.filters().map(<[FilterEntry]>::to_vec),
         })
-        .ok_or_else(|| EngineError::State("select a movie clip or button instance".into()))
+        .ok_or_else(|| EngineError::State(SELECT.into()))
 }
 
 fn copy(s: &mut Session, p: &Value) -> Result<Value> {
     let list = selected_list(s)?;
     let chosen = match index(p, "index")? {
         Some(i) => vec![list.get(i).cloned().ok_or_else(|| EngineError::Param(no_filter(i)))?],
-        None if list.is_empty() => return Err(EngineError::State("the instance has no filters to copy".into())),
+        None if list.is_empty() => return Err(EngineError::State("the selection has no filters to copy".into())),
         None => list,
     };
     let n = chosen.len();
@@ -204,7 +216,7 @@ fn put(s: &mut Session, add: &[FilterEntry], replace: bool) -> Result<usize> {
         true
     });
     match set {
-        Err(_) if full => Err(EngineError::State(format!("an instance has at most {MAX_FILTERS} filters; remove some first"))),
+        Err(_) if full => Err(EngineError::State(format!("an object has at most {MAX_FILTERS} filters; remove some first"))),
         other => other,
     }
 }
@@ -221,7 +233,22 @@ fn preset_json(p: &crate::filter_library::FilterPreset) -> Value {
 }
 
 fn preset_list(s: &mut Session, _: &Value) -> Result<Value> {
-    Ok(json!({"presets": s.filter_presets.presets().iter().map(preset_json).collect::<Vec<_>>()}))
+    let builtin: Vec<Value> = builtins()
+        .iter()
+        .map(|p| {
+            let mut v = preset_json(p);
+            v["hidden"] = json!(s.filter_presets.is_hidden(&p.name));
+            v
+        })
+        .collect();
+    Ok(json!({"presets": s.filter_presets.presets().iter().map(preset_json).collect::<Vec<_>>(), "builtin": builtin}))
+}
+
+/// Hides a built-in preset from the presets menu, or shows it again (ADR 0099).
+fn preset_hide(s: &mut Session, p: &Value) -> Result<Value> {
+    let hidden = opt_bool(p, "hidden")?.unwrap_or(true);
+    let name = s.filter_presets.set_hidden(str_req(p, "name")?, hidden)?;
+    Ok(json!({"name": name, "hidden": hidden, "hidden_presets": s.filter_presets.hidden()}))
 }
 
 fn preset_save(s: &mut Session, p: &Value) -> Result<Value> {
@@ -236,7 +263,7 @@ fn preset_save(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn preset_apply(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_req(p, "name")?;
-    let preset = s.filter_presets.find(name).cloned().ok_or_else(|| EngineError::Param(format!("you have no filter preset named '{}'", name.chars().take(64).collect::<String>())))?;
+    let preset = s.filter_presets.resolve(name).ok_or_else(|| EngineError::Param(format!("there is no filter preset named '{}'", name.chars().take(64).collect::<String>())))?;
     let set = put(s, &preset.filters, true)?;
     Ok(json!({"name": preset.name, "filters": preset.filters.len(), "set": set}))
 }
@@ -261,7 +288,7 @@ fn preset_export(s: &mut Session, p: &Value) -> Result<Value> {
             .take(MAX_PRESETS * 2)
             .map(|n| {
                 let n = n.as_str().ok_or_else(bad)?;
-                s.filter_presets.find(n).cloned().ok_or_else(|| EngineError::Param(format!("you have no filter preset named '{}'", n.chars().take(64).collect::<String>())))
+                s.filter_presets.resolve(n).ok_or_else(|| EngineError::Param(format!("there is no filter preset named '{}'", n.chars().take(64).collect::<String>())))
             })
             .collect::<Result<_>>()?,
         Some(_) => return Err(bad()),

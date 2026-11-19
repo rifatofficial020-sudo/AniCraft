@@ -13,7 +13,7 @@ const B2: BoneId = BoneId(21);
 const SEG: SymbolId = SymbolId(1);
 
 fn instance(id: ElementId, x: f32, y: f32) -> Arc<Element> {
-    let kind = ElementKind::Symbol { symbol: SEG, loop_mode: LoopMode::Loop, first_frame: 0, blend: BlendMode::Normal, filters: Vec::new(), events: Vec::new() };
+    let kind = ElementKind::Symbol { symbol: SEG, loop_mode: LoopMode::Loop, first_frame: 0, blend: BlendMode::Normal, filters: Vec::new(), events: Vec::new(), pivot: None };
     Arc::new(Element { id, name: String::new(), transform: Affine::translate(x, y), color: ColorEffect::default(), kind })
 }
 

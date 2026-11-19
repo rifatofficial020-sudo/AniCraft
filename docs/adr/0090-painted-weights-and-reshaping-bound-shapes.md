@@ -111,7 +111,7 @@ PR. Nothing in this ADR makes it harder: weights and reshaping are per skin.
 
 ## Not yet
 
-* Instances and shapes in one armature (above); more than one shape per armature.
+* ~~Instances and shapes in one armature (above); more than one shape per armature~~: ADR 0098.
 * Reshaping at a posed frame (the Pen's Alt-click to add a point works, as it is
   `path.add_point`); drawing new subpaths into a bound shape; a weight brush that paints across several bones at once (normalise-locked bones, mirror).
 * A filled heat mesh across the shape's interior (the overlay is on its outline and points),

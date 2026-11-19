@@ -12,7 +12,7 @@ const N1: ElementId = ElementId(30);
 const N2: ElementId = ElementId(31);
 
 fn bone(id: BoneId, parent: ElementId, child: ElementId, head: Vec2, tail: Vec2) -> Bone {
-    Bone::new(id, parent, child, head, tail, Affine::IDENTITY)
+    Bone::in_shape(id, TAIL, parent, child, head, tail)
 }
 
 /// A tail 200 px long and 20 px thick along y = 0 (anchors every 25 px along both edges), with
@@ -35,7 +35,7 @@ fn rig() -> (Armature, Vec<Arc<Element>>) {
     let path = Arc::new(outline());
     let mut arm = Armature {
         bones: vec![bone(B1, TAIL, N1, Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0)), bone(B2, N1, N2, Vec2::new(100.0, 0.0), Vec2::new(200.0, 0.0))],
-        skin: Some(Skin::new(TAIL, path.clone())),
+        skins: vec![Skin::new(TAIL, path.clone())],
         ..Default::default()
     };
     rebind(&mut arm);
@@ -65,7 +65,7 @@ fn turned(p: Vec2, j: Vec2, a: f32) -> Vec2 {
 #[test]
 fn automatic_weights_sum_to_one_and_follow_the_nearest_bone() {
     let (arm, _) = rig();
-    let skin = arm.skin.as_ref().unwrap();
+    let skin = arm.skins.first().unwrap();
     let pts = anchors(&skin.rest);
     assert_eq!(skin.points.len(), pts.len(), "one binding per anchor");
     for (b, p) in skin.points.iter().zip(&pts) {
@@ -90,14 +90,14 @@ fn the_rest_pose_reproduces_the_shape_exactly() {
     let drawn = path_of(&els);
     // No pose, and a pose that lists every bone at 0.
     for pose in [Pose::default(), Pose(vec![crate::JointAngle::new(B1, 0.0), crate::JointAngle::new(B2, 0.0)])] {
-        let rest = deform(&arm, &pose).unwrap();
+        let rest = deform(&arm, &arm.skins[0], &pose);
         assert!(Arc::ptr_eq(&rest, &drawn), "the very path as drawn");
         assert!(!apply(&arm, &mut els, &pose), "nothing changes");
     }
     // A pose that turns one bone leaves the anchors only the other bone moves bit for bit.
     let mut pose = Pose::default();
     pose.set(B2, 0.7);
-    let bent = deform(&arm, &pose).unwrap();
+    let bent = deform(&arm, &arm.skins[0], &pose);
     assert_eq!(bent.cmds[1], drawn.cmds[1], "x = 25 follows the first bone only");
     assert_eq!(bent.cmds[0], drawn.cmds[0]);
 }
@@ -110,7 +110,7 @@ fn a_quarter_bend_turns_bound_points_about_the_joint() {
     pose.set(B2, FRAC_PI_2);
     assert!(apply(&arm, &mut els, &pose));
     let bent = path_of(&els);
-    let skin = arm.skin.as_ref().unwrap();
+    let skin = arm.skins.first().unwrap();
     let joint = Vec2::new(100.0, 0.0);
     let (rest, now) = (anchors(&drawn), anchors(&bent));
     for ((b, r), n) in skin.points.iter().zip(&rest).zip(&now) {
@@ -138,7 +138,7 @@ fn a_quarter_bend_turns_bound_points_about_the_joint() {
     // Turning the first bone carries the second: the tip goes round the root joint too.
     let mut pose = Pose::default();
     pose.set(B1, FRAC_PI_2);
-    let tip = anchors(&deform(&arm, &pose).unwrap())[8];
+    let tip = anchors(&deform(&arm, &arm.skins[0], &pose))[8];
     assert!(close(tip, turned(Vec2::new(200.0, -10.0), Vec2::new(0.0, 0.0), FRAC_PI_2), 1e-3), "{tip:?}");
 }
 
@@ -217,25 +217,25 @@ fn every_export_sees_the_bent_shape_and_files_keep_it() {
     let json = serde_json::to_string(&d).unwrap();
     let back: Document = serde_json::from_str(&json).unwrap();
     assert_eq!(back, d);
-    assert!(back.timeline(0).layers[0].armature.as_ref().unwrap().skin.is_some());
+    assert!(back.timeline(0).layers[0].armature.as_ref().unwrap().skin(TAIL).is_some());
     // The joint nodes' ids are counted, so new ids never collide with them.
     assert!(d.next_id > N2.0);
     // An armature written before shape armatures reads as one without a skin.
     let old: Armature = serde_json::from_str(r#"{"bones": []}"#).unwrap();
-    assert!(old.skin.is_none());
+    assert!(old.skins.is_empty());
     assert!(!serde_json::to_string(&old).unwrap().contains("skin"));
 }
 
 #[test]
 fn sanitize_repairs_hostile_skins() {
     let (mut arm, _) = rig();
-    let skin = arm.skin.as_mut().unwrap();
+    let skin = arm.skins.first_mut().unwrap();
     skin.points.truncate(3);
     skin.points[0] = Binding { bones: vec![Influence(B1, f32::NAN), Influence(BoneId(99), 1.0), Influence(B2, 3.0), Influence(B2, 1.0)], manual: true };
     skin.points[1] = Binding { bones: vec![Influence(B1, -1.0)], manual: false };
     skin.points[2] = Binding { bones: vec![], manual: true };
     assert!(arm.sanitize());
-    let skin = arm.skin.as_ref().unwrap();
+    let skin = arm.skins.first().unwrap();
     assert_eq!(skin.points.len(), anchors(&skin.rest).len(), "one per anchor again");
     assert_eq!(skin.points[0].bones, vec![Influence(B2, 1.0)], "unknown bones, NaN and repeats go; the rest sums to 1");
     assert!(!skin.points[1].bones.is_empty(), "an automatic anchor left with nothing is bound again");
@@ -249,25 +249,25 @@ fn sanitize_repairs_hostile_skins() {
     let (mut arm, _) = rig();
     arm.bones.push(bone(BoneId(41), N2, TAIL, Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0)));
     arm.sanitize();
-    assert!(arm.skin.is_none() || arm.bones.iter().all(|b| b.child != TAIL));
+    assert!(arm.bones.iter().all(|b| b.child != TAIL), "a joint node is no shape");
 }
 
 #[test]
 fn hand_binding_survives_new_bones() {
     let (mut arm, _) = rig();
-    let skin = arm.skin.as_mut().unwrap();
+    let skin = arm.skins.first_mut().unwrap();
     skin.points[1] = Binding { bones: vec![Influence(B2, 1.0)], manual: true };
     skin.points[2] = Binding { bones: vec![], manual: true };
     arm.bones.push(bone(BoneId(22), N2, ElementId(32), Vec2::new(200.0, 0.0), Vec2::new(210.0, 0.0)));
     rebind(&mut arm);
-    let skin = arm.skin.as_ref().unwrap();
+    let skin = arm.skins.first().unwrap();
     assert_eq!(skin.points[1].bones, vec![Influence(B2, 1.0)], "kept as bound by hand");
     assert!(skin.points[2].bones.is_empty(), "kept unbound");
     // Taking its bone away sends a hand-bound anchor back to automatic.
     let mut arm = arm.clone();
     arm.bones.retain(|b| b.id != B2 && b.id != BoneId(22));
     rebind(&mut arm);
-    assert_eq!(arm.skin.as_ref().unwrap().points[1].bones, vec![Influence(B1, 1.0)]);
+    assert_eq!(arm.skins.first().unwrap().points[1].bones, vec![Influence(B1, 1.0)]);
 }
 
 /// Skinning cost: a shape of 2,000 anchors on 16 bones, posed (debug builds are slower).
@@ -287,14 +287,14 @@ fn skinning_is_fast() {
         let parent = if i == 0 { TAIL } else { ElementId(100 + i - 1) };
         bones.push(bone(BoneId(200 + i), parent, ElementId(100 + i), Vec2::new(50.0 * i as f32, 0.0), Vec2::new(50.0 * (i + 1) as f32, 0.0)));
     }
-    let mut arm = Armature { bones, skin: Some(Skin::new(TAIL, Arc::new(p))), ..Default::default() };
+    let mut arm = Armature { bones, skins: vec![Skin::new(TAIL, Arc::new(p))], ..Default::default() };
     let t = std::time::Instant::now();
     rebind(&mut arm);
     let bind = t.elapsed();
     let pose = Pose(arm.bones.iter().map(|b| crate::JointAngle::new(b.id, 0.1)).collect());
     let t = std::time::Instant::now();
     for _ in 0..10 {
-        std::hint::black_box(deform(&arm, &pose));
+        std::hint::black_box(deform(&arm, &arm.skins[0], &pose));
     }
     let per = t.elapsed() / 10;
     println!("2,000 anchors × 16 bones: bind {bind:?}, deform {per:?}");

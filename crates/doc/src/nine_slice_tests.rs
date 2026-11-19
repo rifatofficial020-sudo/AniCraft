@@ -11,7 +11,7 @@ fn el(id: u64, transform: Affine, kind: ElementKind) -> Element {
 }
 
 fn instance(of: SymbolId, transform: Affine) -> Element {
-    el(1, transform, ElementKind::Symbol { symbol: of, loop_mode: Default::default(), first_frame: 0, blend: Default::default(), filters: Vec::new(), events: Vec::new() })
+    el(1, transform, ElementKind::Symbol { symbol: of, loop_mode: Default::default(), first_frame: 0, blend: Default::default(), filters: Vec::new(), events: Vec::new(), pivot: None })
 }
 
 /// A 100×40 rounded rectangle (corner radius 10) at the symbol's origin, guides 10 in from each

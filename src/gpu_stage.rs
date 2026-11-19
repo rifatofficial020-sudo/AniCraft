@@ -125,6 +125,94 @@ pub fn wanted(pref: StageRenderer) -> StageRenderer {
     }
 }
 
+// ----- when stage work may be submitted on the window's device (ADR 0105) ----------------------
+
+/// The gate stage work on the window's device is submitted through: open while the window's
+/// thread runs the app's frame, closed while it may be reconfiguring a surface.
+#[cfg(gpu_stage)]
+static GATE: std::sync::OnceLock<std::sync::Arc<anicraft_gpu::SubmitGate>> = std::sync::OnceLock::new();
+/// The window a waiting submission asks for a frame (the window opens again with a new one
+/// after its device was lost, ADR 0092).
+#[cfg(gpu_stage)]
+static WAKE: std::sync::Mutex<Option<egui::Context>> = std::sync::Mutex::new(None);
+/// Submissions that went ahead without a frame, as last written to the log.
+#[cfg(gpu_stage)]
+static GATE_TIMEOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(gpu_stage)]
+fn gate(ctx: &egui::Context) -> &'static std::sync::Arc<anicraft_gpu::SubmitGate> {
+    use std::sync::PoisonError;
+    let mut wake = WAKE.lock().unwrap_or_else(PoisonError::into_inner);
+    if wake.as_ref() != Some(ctx) {
+        *wake = Some(ctx.clone());
+    }
+    drop(wake);
+    GATE.get_or_init(|| {
+        std::sync::Arc::new(anicraft_gpu::SubmitGate::new(|| {
+            let ctx = WAKE.lock().unwrap_or_else(PoisonError::into_inner).clone();
+            if let Some(ctx) = ctx {
+                ctx.request_repaint();
+            }
+        }))
+    })
+}
+
+/// The app's frame, for the stage renderer: while this lives the window's thread is inside
+/// [`eframe::App::ui`], so it isn't reconfiguring a surface and stage work may be submitted.
+#[must_use]
+pub struct InFrame(());
+
+/// Call first thing in the frame, on the window's thread; keep the result until the frame ends.
+#[cfg_attr(not(gpu_stage), allow(unused_variables))]
+pub fn in_frame(ctx: &egui::Context) -> InFrame {
+    #[cfg(gpu_stage)]
+    {
+        let gate = gate(ctx);
+        gate.open();
+        // Work that waited for a frame that never came (a window that draws none) went ahead:
+        // said once per tenfold, it is the old race's way back in.
+        let timeouts = gate.waited().1;
+        let said = GATE_TIMEOUTS.load(std::sync::atomic::Ordering::Relaxed);
+        if timeouts > 0 && (said == 0 || timeouts >= said.saturating_mul(10)) {
+            GATE_TIMEOUTS.store(timeouts, std::sync::atomic::Ordering::Relaxed);
+            crate::startup::line(&format!("stage work was submitted without waiting for a frame {timeouts} time(s) (the window drew none for {} ms)", anicraft_gpu::SUBMIT_WAIT.as_millis()));
+        }
+    }
+    InFrame(())
+}
+
+impl Drop for InFrame {
+    fn drop(&mut self) {
+        #[cfg(gpu_stage)]
+        if let Some(gate) = GATE.get() {
+            gate.close();
+        }
+    }
+}
+
+/// Inside the frame, around a window of its own drawn at once (Test Movie, a floating panel):
+/// eframe sets that window's surface up and draws it inside the call, so stage work waits
+/// there too.
+#[must_use]
+pub struct Paused(());
+
+pub fn paused() -> Paused {
+    #[cfg(gpu_stage)]
+    if let Some(gate) = GATE.get() {
+        gate.close();
+    }
+    Paused(())
+}
+
+impl Drop for Paused {
+    fn drop(&mut self) {
+        #[cfg(gpu_stage)]
+        if let Some(gate) = GATE.get() {
+            gate.open();
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct GpuStage {
     #[cfg(gpu_stage)]
@@ -284,10 +372,17 @@ mod imp {
     /// The window's device first (no readback); a device of our own when that can't work.
     fn start(window: Option<RenderState>) -> Result<GpuRenderer, String> {
         let shared = match &window {
-            Some(rs) => match GpuRenderer::shared(&rs.adapter, rs.device.clone(), rs.queue.clone()) {
-                Ok(g) => return Ok(g),
-                Err(e) => Some(e.to_string()),
-            },
+            // Through the gate: the window reconfigures its surface between frames (ADR 0105).
+            Some(rs) => {
+                let on_window = match super::GATE.get() {
+                    Some(gate) => GpuRenderer::shared_gated(&rs.adapter, rs.device.clone(), rs.queue.clone(), gate.clone()),
+                    None => GpuRenderer::shared(&rs.adapter, rs.device.clone(), rs.queue.clone()),
+                };
+                match on_window {
+                    Ok(g) => return Ok(g),
+                    Err(e) => Some(e.to_string()),
+                }
+            }
             None => None,
         };
         GpuRenderer::new().map_err(|e| match shared {
@@ -583,6 +678,58 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR 0105 (#264, #309): stage work on the window's device is submitted while the app's
+    /// frame runs, and waits (asking for a frame) while the window may be reconfiguring its
+    /// surface: between frames, and while a window of its own is drawn inside the frame.
+    #[cfg(gpu_stage)]
+    #[test]
+    fn stage_work_is_submitted_only_inside_the_frame() {
+        use std::time::{Duration, Instant};
+
+        let ctx = egui::Context::default();
+        let frame = in_frame(&ctx);
+        let gate = GATE.get().cloned().unwrap();
+        let submit = |gate: &std::sync::Arc<anicraft_gpu::SubmitGate>| {
+            let g = gate.clone();
+            std::thread::spawn(move || g.run(|| ()))
+        };
+        // Until `n` submissions have had to wait (the worker is at the gate).
+        let waiting = |n: u64| {
+            let until = Instant::now() + Duration::from_secs(30);
+            while gate.waited().0 < n && Instant::now() < until {
+                std::thread::yield_now();
+            }
+            gate.waited().0 >= n
+        };
+        let waits = gate.waited().0;
+        // Inside the frame: at once, without waiting.
+        submit(&gate).join().unwrap();
+        assert_eq!(gate.waited().0, waits, "nothing waits inside the frame");
+        // While a floating window or Test Movie draws inside the frame: it waits for that.
+        let floating = paused();
+        let work = submit(&gate);
+        assert!(waiting(waits + 1), "it waits while a window is being set up");
+        let held = !work.is_finished();
+        drop(floating);
+        work.join().unwrap();
+        drop(frame);
+        // Between frames: it waits, asks the window for a frame, and runs when the frame comes.
+        let work = submit(&gate);
+        assert!(waiting(waits + 2), "it waits between frames");
+        let held = held && !work.is_finished();
+        assert!(ctx.has_requested_repaint(), "the waiting work asks for a frame");
+        let frame = in_frame(&ctx);
+        work.join().unwrap();
+        drop(frame);
+        // The window's own thread never waits (it can't be reconfiguring while it submits).
+        gate.run(|| ());
+        assert_eq!(gate.waited().0, waits + 2);
+        // Each was held until its frame came, unless this machine stalled the test for the
+        // whole wait (then the submission went ahead, and was counted).
+        assert!(held || gate.waited().1 > 0, "work was submitted while the gate was closed");
+
+    }
 
     /// The backoff (ADR 0092): growing pauses, a bounded number of tries, a resize bringing a
     /// try forward (not too soon), and a long good run starting the count afresh.

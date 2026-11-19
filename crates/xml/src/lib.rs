@@ -244,6 +244,13 @@ mod tests {
         assert_eq!(root.text, "&bad;&amp c");
     }
 
+    /// A numeric character reference is digits only (XML 1.0 §4.1): a sign makes it text.
+    #[test]
+    fn numeric_references_with_a_sign_stay_text() {
+        let root = parse(b"<a>a&#+65;b&#x+41;c&#-65;d&#65;&#x41;e</a>").unwrap();
+        assert_eq!(root.text, "a&#+65;b&#x+41;c&#-65;dAAe");
+    }
+
     #[test]
     fn mixed_text_stays_ordered_and_plain_indentation_stays_dropped() {
         let root = parse_mixed(b"<svg><text>Hello <tspan>big</tspan> world&amp;<!-- c --> more</text><g>\n  <path/>\n</g></svg>", &["text", "tspan"])

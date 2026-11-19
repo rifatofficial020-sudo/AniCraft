@@ -285,6 +285,7 @@ pub fn multi_frames(tl: &Timeline, playhead: u32, first: u32, last: u32) -> Vec<
 fn keep_layers(dl: &mut DisplayList, layers: &[LayerId]) {
     let set: HashSet<LayerId> = layers.iter().copied().collect();
     dl.items.retain(|i| set.contains(&i.layer) || (i.masks.is_some() && i.group.is_none()));
+    dl.links.clear();
 }
 
 /// The parts as one list, layer by layer: each layer's items from every part, in part order,

@@ -277,7 +277,13 @@ impl Session {
     /// timeline at its playhead where its instance stands, over the timelines it sits in dimmed.
     pub fn stage_picture(&self) -> Arc<StagePicture> {
         let Some(view) = self.edit_view() else {
-            return Arc::new(StagePicture { doc: self.doc.clone(), frame: self.doc.scene_start(self.scene).saturating_add(self.frame), state: self.state, front: None });
+            // The stage picture is a movie frame (`stage_start + frame`), and a playhead moved
+            // past the scene's last frame would otherwise land in the next scene (#305): the
+            // editor shows the active scene alone, at its last frame.
+            let scene = self.scene.min(self.doc.scenes.len().saturating_sub(1));
+            let last = self.doc.timeline(scene).frame_count().saturating_sub(1);
+            let frame = self.doc.scene_start(scene).saturating_add(self.frame.min(last));
+            return Arc::new(StagePicture { doc: self.doc.clone(), frame, state: self.state, front: None });
         };
         let mut h = std::collections::hash_map::DefaultHasher::new();
         (self.state, self.scene, self.frame).hash(&mut h);
@@ -378,7 +384,7 @@ fn placed(doc: &mut Document, timeline: Timeline, transform: Affine, frame: u32,
         name: String::new(),
         transform,
         color,
-        kind: ElementKind::Symbol { symbol, loop_mode: LoopMode::SingleFrame, first_frame: frame, blend: Default::default(), filters: Vec::new(), events: Vec::new() },
+        kind: ElementKind::Symbol { symbol, loop_mode: LoopMode::SingleFrame, first_frame: frame, blend: Default::default(), filters: Vec::new(), events: Vec::new(), pivot: None },
     }));
     let mut layer = Layer::new(LayerId(doc.alloc_id()), "");
     layer.keyframes.push(Arc::new(k));

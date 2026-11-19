@@ -159,3 +159,43 @@ fn the_commands_add_report_and_remove() {
     assert!(crate::cmds_plugin::plugin_may_call("desktop.integrate").is_err());
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// #348: another installer's icon cache in the user's icon folder listed only its own icons,
+/// and GTK trusted it (adding icons to the size folders doesn't change the theme folder's
+/// time), so the launcher and dock showed a generic icon. Adding ours now brings the folder's
+/// time past the cache's, which makes GTK read the folders; where there is no cache, none is
+/// made and nothing is touched.
+#[test]
+fn an_icon_cache_made_before_our_icons_no_longer_hides_them() {
+    use crate::cmds_desktop::outdate_icon_cache;
+    let (root, appimage, data) = setup("icon-cache");
+    let theme = data.join("icons").join("hicolor");
+    install(&appimage, &data).unwrap();
+    assert!(theme.join("128x128").join("apps").join(format!("{APP_ID}.png")).is_file());
+    assert!(!outdate_icon_cache(&theme), "no cache: GTK reads the folders");
+    assert!(!theme.join("icon-theme.cache").exists(), "and none is made");
+    // A cache from before our icons, the theme folder untouched since, as the report describes.
+    let cache = theme.join("icon-theme.cache");
+    std::fs::write(&cache, b"a cache that lists another app's icon only").unwrap();
+    let cached_at = std::fs::metadata(&cache).unwrap().modified().unwrap();
+    let long_ago = cached_at - std::time::Duration::from_secs(3600);
+    #[cfg(unix)]
+    std::fs::File::open(&theme).unwrap().set_modified(long_ago).unwrap();
+    assert!(outdate_icon_cache(&theme), "there is a cache to outdate");
+    // Where a folder's time can be set (Linux, the BSDs: where AppImages run), it is now no
+    // older than the cache, so GTK stops trusting the cache.
+    #[cfg(unix)]
+    assert!(std::fs::metadata(&theme).unwrap().modified().unwrap() >= cached_at, "the theme folder is newer than the stale cache");
+    let _ = long_ago;
+    // The commands do it as part of their refresh, and removing does too.
+    let mut s = Session::default();
+    let (a, d) = (appimage.display().to_string(), data.display().to_string());
+    uninstall(&data).unwrap();
+    #[cfg(unix)]
+    std::fs::File::open(&theme).unwrap().set_modified(long_ago).unwrap();
+    s.execute("desktop.integrate", &json!({"appimage": a, "data_home": d})).unwrap();
+    #[cfg(unix)]
+    assert!(std::fs::metadata(&theme).unwrap().modified().unwrap() > long_ago + std::time::Duration::from_secs(1800));
+    s.execute("desktop.remove", &json!({"data_home": d})).unwrap();
+    let _ = std::fs::remove_dir_all(root);
+}

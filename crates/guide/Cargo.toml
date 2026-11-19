@@ -8,8 +8,12 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
+craft-html.workspace = true
 # CommonMark with GFM tables (MIT; ADR 0069). Default features off: no command-line binary.
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

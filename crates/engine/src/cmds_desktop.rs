@@ -12,7 +12,8 @@
 //! * `icons/hicolor/<size>/apps/ai.storyteller.anicraft.{png,svg}`: the packaged icons.
 //!
 //! Then it refreshes the user's MIME and desktop databases (`update-mime-database`,
-//! `update-desktop-database`) where those tools are installed. It never writes outside the data
+//! `update-desktop-database`) where those tools are installed, and makes sure an icon cache
+//! already in the icon folder doesn't hide the new icons (#348). It never writes outside the data
 //! folder it is given, refuses system folders, and is idempotent: writing again changes only
 //! what differs. `desktop.remove` deletes exactly these files, and only when the entry is ours.
 //! The paths are parameters, so tests, the CLI and MCP name them; the desktop app passes its
@@ -29,7 +30,7 @@ pub fn specs() -> Vec<CommandSpec> {
         c(
             "desktop.integrate",
             "Add to Applications Menu",
-            "{appimage: absolute path to the .AppImage, data_home: absolute path (the user's $XDG_DATA_HOME, e.g. ~/.local/share), refresh? (default true: run update-mime-database and update-desktop-database)} writes the launcher, icons and file types there; again only rewrites what changed",
+            "{appimage: absolute path to the .AppImage, data_home: absolute path (the user's $XDG_DATA_HOME, e.g. ~/.local/share), refresh? (default true: run update-mime-database and update-desktop-database, and bring an existing icon cache up to date)} writes the launcher, icons and file types there; again only rewrites what changed",
             integrate as crate::RunFn,
         ),
         c("desktop.remove", "Remove from Applications Menu", "{data_home, refresh? (default true)} deletes the launcher, icons and file types desktop.integrate wrote; nothing when the entry there isn't AniCraft's", remove),
@@ -289,8 +290,33 @@ fn run_quietly(program: &str, args: &[&std::ffi::OsStr]) {
     let _ = child.wait();
 }
 
-/// Refreshes the user's MIME and desktop databases under `data_home` (best effort).
+/// The name of GTK's icon cache in a theme folder.
+const ICON_CACHE: &str = "icon-theme.cache";
+
+/// Makes an icon cache in `theme` (a `hicolor` folder) stop hiding icons added since it was
+/// made (#348), and says whether there was one. GTK trusts a cache that is no older than the
+/// theme folder, and adding files to the size folders below doesn't change the folder's time:
+/// after another installer made a cache, our icons were never found and the menu and dock
+/// showed a generic one. Bringing the folder's time forward makes GTK read the folders again.
+/// Where there is no cache nothing is done: GTK reads the folders anyway.
+pub(crate) fn outdate_icon_cache(theme: &Path) -> bool {
+    if !theme.join(ICON_CACHE).is_file() {
+        return false;
+    }
+    // Best effort: a folder opens as a file on Linux and the BSDs, which is where this runs.
+    let _ = std::fs::File::open(theme).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+    true
+}
+
+/// Refreshes the user's MIME and desktop databases under `data_home`, and its icon cache if it
+/// has one (best effort).
 fn refresh(data_home: &Path) {
+    // The icon cache is rebuilt only where there is one already: making one where there was
+    // none would hide the icons every later installer adds without rebuilding it.
+    let theme = data_home.join("icons").join("hicolor");
+    if outdate_icon_cache(&theme) {
+        run_quietly("gtk-update-icon-cache", &[std::ffi::OsStr::new("-q"), std::ffi::OsStr::new("-t"), std::ffi::OsStr::new("-f"), theme.as_os_str()]);
+    }
     let mime = data_home.join("mime");
     if mime.join("packages").is_dir() {
         run_quietly("update-mime-database", &[mime.as_os_str()]);

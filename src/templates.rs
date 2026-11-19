@@ -240,7 +240,7 @@ pub fn save_window(app: &mut App, ctx: &egui::Context) {
         d.picture = Some(picture_png(doc).and_then(|png| texture(ctx, "save-preview", &png)));
     }
     let (mut submit, mut cancel) = (false, false);
-    egui::Window::new(tr!("Save as Template")).id(egui::Id::new("save_template")).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, -60.0]).show(ctx, |ui| {
+    crate::windows::new(ctx, tr!("Save as Template")).id(egui::Id::new("save_template")).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, -60.0]).show(ctx, |ui| {
         ui.set_min_width(420.0);
         if let Some(Some(tex)) = &d.picture {
             let s = tex.size_vec2();
@@ -351,12 +351,12 @@ mod tests {
         assert!(app.start.is_none(), "the start screen goes once the document is there");
         assert_eq!((app.s.doc.stage.width, app.s.doc.stage.height), (300, 250));
         assert!(app.status.as_ref().is_some_and(|s| !s.error && s.text.contains("Rectangle banner")), "{:?}", app.status.as_ref().map(|s| &s.text));
-        // Over unsaved work it asks first.
+        // Over unsaved work it opens in a tab of its own (ADR 0112).
         app.run("draw.rect", json!({"x": 0, "y": 0, "w": 10, "h": 10}));
         app.request("file.new_from_template", json!({"template": "storyboard"}));
-        assert!(app.confirm.is_some());
+        assert!(app.confirm.is_none());
+        assert_eq!(app.tabs.len(), 2);
         // The section draws every built-in template with its picture.
-        app.confirm = None;
         crate::start::open(&mut app);
         sample_user(&mut app);
         let screen = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1600.0, 940.0))), ..Default::default() };

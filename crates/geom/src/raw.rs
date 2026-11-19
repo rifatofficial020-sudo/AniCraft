@@ -31,8 +31,8 @@ pub fn transform(c: &Cubic, m: &Affine) -> Cubic {
     c.map(|p| m.apply(p))
 }
 
-/// `c` with its point at `t` moved by `d` and its ends kept: the smallest moves of the two
-/// control points that carry that point exactly, as [`Path::bend_segment`] does.
+/// `c` with its point at `t` moved by `d` and its ends kept: both control points move alike
+/// and carry that point, as [`Path::bend_segment`] does.
 pub fn bend(c: &Cubic, t: f32, d: Vec2) -> Option<Cubic> {
     let mut p = Path::new();
     p.move_to(c[0]).cubic_to(c[1], c[2], c[3]);

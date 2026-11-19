@@ -73,7 +73,7 @@ fn a_blur_tweens_by_commands_with_eases_and_retiming() {
     let v = run(&mut s, "motion.remove_key", json!({"property": "filter.0.blur_y", "frame": 12}));
     assert_eq!(v["removed"], json!(["filter.0.blur_y"]));
     // What can't be keyed says why.
-    for (p, want) in [(json!({"property": "filter.1.blur_x", "value": 3}), "no filter 1"), (json!({"property": "filter.0.angle", "value": 3}), "has no Angle"), (json!({"property": "filter.0.blur_x", "value": 900}), "between"), (json!({"property": "filter.0.sparkle", "value": 1}), "unknown property")] {
+    for (p, want) in [(json!({"property": "filter.1.blur_x", "value": 3}), "no filter 1"), (json!({"property": "filter.0.angle", "value": 3}), "has no angle"), (json!({"property": "filter.0.blur_x", "value": 900}), "between"), (json!({"property": "filter.0.sparkle", "value": 1}), "unknown property")] {
         let e = s.execute("motion.set_key", &p).expect_err("refused").to_string();
         assert!(e.contains(want), "{p}: {e}");
     }

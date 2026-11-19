@@ -10,7 +10,7 @@
 use egui::{Color32, CornerRadius, Shadow, Stroke, Visuals};
 use std::sync::atomic::{AtomicU8, Ordering};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tokens {
     /// Menu bar, status bar: the frame around the work.
     pub chrome: Color32,
@@ -28,6 +28,10 @@ pub struct Tokens {
     pub icon: Color32,
     /// Icons under the pointer.
     pub icon_hot: Color32,
+    /// The tint inside an icon's closed shapes, under its outline (ADR 0117): two-tone icons for
+    /// themes that want colour in them. Fully transparent, as in the built-in palettes: outlines
+    /// only. Drawn only under icons in the icon roles (`icon`, `icon_hot`, `on_active`).
+    pub icon_accent: Color32,
     /// Inset surfaces: text and number fields.
     pub field: Color32,
     /// Lines between layout regions and around popups.
@@ -42,6 +46,10 @@ pub struct Tokens {
     /// Selection, focus, active tool.
     pub accent: Color32,
     pub accent_dim: Color32,
+    /// Where an accent bar ends (ADR 0117): the bars that mark structure (a section band's edge,
+    /// the active tab's line, a picked row's edge) run from `accent` to this along their length.
+    /// The same as `accent` in the built-in palettes: a flat bar.
+    pub accent_end: Color32,
     /// Accent-coloured text (the current frame, links, prompts): the accent lightened until it
     /// reads at 4.5:1 on the panels.
     pub accent_text: Color32,
@@ -136,6 +144,7 @@ pub const GRAPHITE: Tokens = Tokens {
     on_active: Color32::WHITE,
     icon: Color32::from_rgb(0xb4, 0xb4, 0xbc),
     icon_hot: Color32::WHITE,
+    icon_accent: Color32::TRANSPARENT,
     field: Color32::from_rgb(0x0e, 0x0e, 0x11),
     border: Color32::from_rgb(0x36, 0x36, 0x3e),
     control_edge: Color32::from_rgb(0x78, 0x78, 0x82),
@@ -145,6 +154,7 @@ pub const GRAPHITE: Tokens = Tokens {
     // ≥ 4.5:1 on every surface up to `header`, so even hints stay readable.
     text_faint: Color32::from_rgb(0x98, 0x98, 0xa2),
     accent: Color32::from_rgb(0x2e, 0x66, 0xf0),
+    accent_end: Color32::from_rgb(0x2e, 0x66, 0xf0),
     accent_dim: Color32::from_rgb(0x1f, 0x35, 0x70),
     accent_text: Color32::from_rgb(0x6f, 0x97, 0xff),
     on_fill: Color32::WHITE,
@@ -200,6 +210,7 @@ pub const HIGH_CONTRAST: Tokens = Tokens {
     on_active: Color32::from_rgb(0x00, 0x00, 0x00),
     icon: Color32::from_rgb(0xff, 0xff, 0xff),
     icon_hot: Color32::from_rgb(0xff, 0xd8, 0x1a),
+    icon_accent: Color32::TRANSPARENT,
     field: Color32::from_rgb(0x00, 0x00, 0x00),
     border: Color32::from_rgb(0x9a, 0x9a, 0x9a),
     control_edge: Color32::from_rgb(0xd6, 0xd6, 0xd6),
@@ -208,6 +219,7 @@ pub const HIGH_CONTRAST: Tokens = Tokens {
     text_dim: Color32::from_rgb(0xe8, 0xe8, 0xe8),
     text_faint: Color32::from_rgb(0xc8, 0xc8, 0xc8),
     accent: Color32::from_rgb(0xff, 0xd8, 0x1a),
+    accent_end: Color32::from_rgb(0xff, 0xd8, 0x1a),
     accent_dim: Color32::from_rgb(0x4d, 0x3d, 0x00),
     accent_text: Color32::from_rgb(0xff, 0xd8, 0x1a),
     on_fill: Color32::from_rgb(0x00, 0x00, 0x00),
@@ -270,6 +282,7 @@ pub const LIGHT: Tokens = Tokens {
     on_active: rgb(0x0b1f5c),
     icon: rgb(0x4c4c56),
     icon_hot: rgb(0x101014),
+    icon_accent: Color32::TRANSPARENT,
     field: rgb(0xffffff),
     border: rgb(0xc9c9d1),
     control_edge: rgb(0x7a7a85),
@@ -278,6 +291,7 @@ pub const LIGHT: Tokens = Tokens {
     text_dim: rgb(0x44444d),
     text_faint: rgb(0x5c5c66),
     accent: rgb(0x2457e0),
+    accent_end: rgb(0x2457e0),
     accent_dim: rgb(0xd3dffb),
     accent_text: rgb(0x1d4ccc),
     on_fill: rgb(0xffffff),
@@ -356,6 +370,7 @@ impl Palette {
 }
 
 /// The palette in use. Process-wide view state, like the interface scale: one window, one look.
+/// With [`USER_LOOK`] set, a theme of the user's is drawn over that palette (ADR 0117).
 #[cfg(not(test))]
 static ACTIVE: AtomicU8 = AtomicU8::new(0);
 
@@ -364,7 +379,11 @@ static ACTIVE: AtomicU8 = AtomicU8::new(0);
 #[cfg(test)]
 thread_local! {
     static ACTIVE: AtomicU8 = const { AtomicU8::new(0) };
+    static USER: std::cell::Cell<Option<&'static Tokens>> = const { std::cell::Cell::new(None) };
 }
+
+/// Set in [`ACTIVE`] while a theme of the user's is drawn; the low bits stay its base palette.
+const USER_LOOK: u8 = 0x80;
 
 fn active() -> u8 {
     #[cfg(not(test))]
@@ -380,12 +399,79 @@ fn set_active(i: u8) {
     ACTIVE.with(|a| a.store(i, Ordering::Relaxed));
 }
 
+/// The user's theme in use (ADR 0117). Tokens are read tens of thousands of times a frame, from
+/// any thread, as plain references: each set of tokens ever applied is kept for the life of the
+/// program (a few hundred bytes; the same tokens are kept once), the one in use sits behind a
+/// lock, and each thread remembers it until the count says it changed, so reading takes no lock.
+#[cfg(not(test))]
+mod user_look {
+    use super::Tokens;
+    use std::cell::Cell;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static KEPT: Mutex<Vec<&'static Tokens>> = Mutex::new(Vec::new());
+    static NOW: Mutex<Option<&'static Tokens>> = Mutex::new(None);
+    static CHANGES: AtomicU32 = AtomicU32::new(0);
+    thread_local! {
+        static SEEN: Cell<(u32, Option<&'static Tokens>)> = const { Cell::new((0, None)) };
+    }
+
+    pub fn get() -> Option<&'static Tokens> {
+        let changes = CHANGES.load(Ordering::Acquire);
+        SEEN.with(|seen| {
+            let (at, tokens) = seen.get();
+            if at == changes {
+                return tokens;
+            }
+            let tokens = NOW.lock().map_or(None, |now| *now);
+            seen.set((changes, tokens));
+            tokens
+        })
+    }
+
+    pub fn set(tokens: Tokens) {
+        let kept: Option<&'static Tokens> = KEPT.lock().ok().map(|mut all| match all.iter().find(|t| ***t == tokens) {
+            Some(t) => *t,
+            None => {
+                let t: &'static Tokens = Box::leak(Box::new(tokens));
+                all.push(t);
+                t
+            }
+        });
+        if let Ok(mut now) = NOW.lock() {
+            *now = kept;
+            // Counted under the lock: a thread that sees the new count reads the new tokens.
+            CHANGES.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
+#[cfg(test)]
+mod user_look {
+    use super::Tokens;
+
+    pub fn get() -> Option<&'static Tokens> {
+        super::USER.with(|u| u.get())
+    }
+
+    pub fn set(tokens: Tokens) {
+        super::USER.with(|u| u.set(Some(Box::leak(Box::new(tokens)))));
+    }
+}
+
+/// The built-in palette in use, or the one the user's theme in use is based on.
 pub fn palette() -> Palette {
-    match active() {
+    match active() & !USER_LOOK {
         1 => Palette::HighContrast,
         2 => Palette::Light,
         _ => Palette::Graphite,
     }
+}
+
+/// Whether a theme of the user's is drawn (ADR 0117), rather than a built-in palette.
+pub fn user_theme_active() -> bool {
+    active() & USER_LOOK != 0
 }
 
 /// The tokens of the palette in use, read as `T.panel` or `T.rc()`. A palette change shows from
@@ -395,6 +481,11 @@ pub struct ActiveTokens;
 impl std::ops::Deref for ActiveTokens {
     type Target = Tokens;
     fn deref(&self) -> &Tokens {
+        if user_theme_active()
+            && let Some(t) = user_look::get()
+        {
+            return t;
+        }
         palette().tokens()
     }
 }
@@ -406,6 +497,246 @@ impl Tokens {
     pub fn rc(&self) -> f32 {
         f32::from(self.radius_control)
     }
+}
+
+/// The colour roles by name, in the order `Tokens` lists them: what a theme file may set (ADR
+/// 0117) and what Export Current Theme writes. One list, so a role can't be read but not written.
+macro_rules! colour_roles {
+    ($($role:ident),* $(,)?) => {
+        /// Every colour role's name.
+        pub const COLOUR_ROLES: &[&str] = &[$(stringify!($role)),*];
+
+        impl Tokens {
+            /// The colour of the role named `role`.
+            pub fn colour(&self, role: &str) -> Option<Color32> {
+                match role {
+                    $(stringify!($role) => Some(self.$role),)*
+                    _ => None,
+                }
+            }
+
+            /// Sets the role named `role`; false when there is no such role.
+            pub fn set_colour(&mut self, role: &str, colour: Color32) -> bool {
+                match role {
+                    $(stringify!($role) => self.$role = colour,)*
+                    _ => return false,
+                }
+                true
+            }
+        }
+    };
+}
+
+colour_roles!(
+    chrome,
+    panel,
+    panel_alt,
+    header,
+    hover,
+    active,
+    on_active,
+    icon,
+    icon_hot,
+    icon_accent,
+    field,
+    border,
+    control_edge,
+    separator,
+    text,
+    text_dim,
+    text_faint,
+    accent,
+    accent_dim,
+    accent_end,
+    accent_text,
+    on_fill,
+    ink,
+    pasteboard,
+    stage_shadow,
+    span,
+    span_empty,
+    row_active,
+    tween,
+    tween_shape,
+    tween_motion,
+    waveform,
+    tween_line,
+    playhead,
+    selection,
+    danger,
+    error,
+    ok,
+    hint_unplaced,
+    hint_start,
+    hint_end,
+    onion_past,
+    onion_future,
+    slice_guide,
+    hit_area,
+    kind_graphic,
+    kind_movie_clip,
+    kind_button,
+    cell_tint,
+    stage_edge,
+);
+
+/// The roles that may be see-through (shadows, tints and the icon fill, laid over what is under
+/// them). Every other role is a surface, a text colour or a mark and must be solid: a contrast
+/// ratio means nothing against a colour you can see through.
+pub const TRANSLUCENT_ROLES: &[&str] = &["icon_accent", "stage_shadow", "cell_tint", "stage_edge"];
+
+/// A colour as a theme file writes it (ADR 0117): red, green, blue and opacity, 0 to 255.
+pub fn role_colour(r: u8, g: u8, b: u8, a: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(r, g, b, a)
+}
+
+/// WCAG 2.x contrast ratio of two solid colours (relative luminance, 1:1 to 21:1).
+pub fn contrast(a: Color32, b: Color32) -> f32 {
+    let lum = |c: Color32| {
+        let ch = |v: u8| {
+            let s = f32::from(v) / 255.0;
+            if s <= 0.040_45 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+    };
+    let (x, y) = (lum(a), lum(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
+}
+
+/// `over` laid on the solid colour `under`, as the painter blends it.
+pub fn laid_over(over: Color32, under: Color32) -> Color32 {
+    let keep = 255 - u16::from(over.a());
+    let mix = |o: u8, u: u8| (u16::from(o) + (u16::from(u) * keep + 127) / 255).min(255) as u8;
+    Color32::from_rgb(mix(over.r(), under.r()), mix(over.g(), under.g()), mix(over.b(), under.b()))
+}
+
+/// Which bar a palette is held to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standard {
+    /// The built-in palettes: WCAG AA and the stricter house rules (body text at 7:1).
+    House,
+    /// A theme of the user's (ADR 0117): WCAG AA, text 4.5:1 and what identifies a control 3:1.
+    Aa,
+}
+
+/// A pair of roles drawn together that doesn't reach the contrast it needs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Shortfall {
+    /// The roles, by name: `text_dim on panel`.
+    pub pair: String,
+    pub ratio: f32,
+    pub needs: f32,
+    /// Text, icons and the focus ring: without them the interface can't be read or used, so a
+    /// user's theme that falls short here is refused. The rest (blocks against the grid, control
+    /// edges) is reported, not refused.
+    pub required: bool,
+}
+
+/// Every pair of roles a palette draws together, with the ratio it must reach: text 4.5:1 (WCAG
+/// 1.4.3 AA; the timeline's small numbers are small text too), UI components and focus 3:1
+/// (1.4.11). The built-in palettes also meet stricter house rules. Returns the pairs that fall
+/// short of `standard`; computed from the colours, never assumed from a palette's name.
+pub fn shortfalls(t: &Tokens, standard: Standard) -> Vec<Shortfall> {
+    let mut out = Vec::new();
+    // `house`: what the built-ins meet. `aa`: the WCAG AA minimum for that kind of pair.
+    let mut need = |pair: String, fg: Color32, bg: Color32, house: f32, aa: f32, required: bool| {
+        let needs = if standard == Standard::House { house } else { aa };
+        let ratio = contrast(fg, bg);
+        if ratio < needs {
+            out.push(Shortfall { pair, ratio, needs, required });
+        }
+    };
+    let surfaces = [("panel", t.panel), ("panel_alt", t.panel_alt), ("chrome", t.chrome), ("header", t.header), ("field", t.field)];
+    for (s, bg) in surfaces {
+        need(format!("text on {s}"), t.text, bg, 7.0, 4.5, true);
+        need(format!("text_dim on {s}"), t.text_dim, bg, 4.5, 4.5, true);
+        need(format!("text_faint on {s}"), t.text_faint, bg, 4.5, 4.5, true);
+        need(format!("accent_text on {s}"), t.accent_text, bg, 4.5, 4.5, true);
+        need(format!("error on {s}"), t.error, bg, 4.5, 4.5, true);
+        need(format!("ok on {s}"), t.ok, bg, 4.5, 4.5, true);
+    }
+    need("text on hover".into(), t.text, t.hover, 4.5, 4.5, true);
+    // A selected row.
+    need("text on accent_dim".into(), t.text, t.accent_dim, 4.5, 4.5, true);
+    // Text, and the marks drawn across the timeline grid while dragging frames (the drop outline,
+    // a span's new end), on the active row.
+    need("text on row_active".into(), t.text, t.row_active, 4.5, 4.5, true);
+    // Icons at rest and under the pointer, and on the active tool's block.
+    need("icon on panel".into(), t.icon, t.panel, 4.5, 3.0, true);
+    need("icon_hot on header".into(), t.icon_hot, t.header, 4.5, 3.0, true);
+    need("icon_hot on hover".into(), t.icon_hot, t.hover, 4.5, 3.0, true);
+    need("on_active on active".into(), t.on_active, t.active, 7.0, 3.0, true);
+    if t.icon_accent.a() > 0 {
+        // Two-tone icons (ADR 0117): the outline still reads on the tint inside it.
+        need("icon on icon_accent (over panel)".into(), t.icon, laid_over(t.icon_accent, t.panel), 3.0, 3.0, true);
+        need("icon_hot on icon_accent (over hover)".into(), t.icon_hot, laid_over(t.icon_accent, t.hover), 3.0, 3.0, true);
+        need("on_active on icon_accent (over active)".into(), t.on_active, laid_over(t.icon_accent, t.active), 3.0, 3.0, true);
+    }
+    // Text on filled buttons (Save, Restore, destructive actions).
+    need("on_fill on accent".into(), t.on_fill, t.accent, 4.5, 4.5, true);
+    need("on_fill on danger".into(), t.on_fill, t.danger, 4.5, 4.5, true);
+    // Marks on timeline blocks and the playhead's number; the blocks against the grid.
+    for (b, bg) in [("span", t.span), ("tween", t.tween), ("tween_shape", t.tween_shape), ("tween_motion", t.tween_motion), ("playhead", t.playhead)] {
+        need(format!("ink on {b}"), t.ink, bg, 4.5, 4.5, true);
+        need(format!("{b} on panel"), bg, t.panel, 3.0, 3.0, false);
+    }
+    // Shape hint letters (ink) on every marker colour.
+    for (h, bg) in [("hint_unplaced", t.hint_unplaced), ("hint_start", t.hint_start), ("hint_end", t.hint_end)] {
+        need(format!("ink on {h}"), t.ink, bg, 4.5, 4.5, true);
+    }
+    need("text on span_empty".into(), t.text, t.span_empty, 4.5, 4.5, true);
+    // Sound layers: waveforms on empty spans and on the active row.
+    need("waveform on span_empty".into(), t.waveform, t.span_empty, 4.5, 3.0, false);
+    need("waveform on row_active".into(), t.waveform, t.row_active, 4.5, 3.0, false);
+    // Focus rings, selection, the active tool and checkbox edges (WCAG 1.4.11). An accent bar's
+    // far end is as much a mark as its near one.
+    for (s, bg) in [("panel", t.panel), ("panel_alt", t.panel_alt), ("chrome", t.chrome)] {
+        need(format!("accent on {s}"), t.accent, bg, 3.0, 3.0, true);
+        need(format!("accent_end on {s}"), t.accent_end, bg, 3.0, 3.0, false);
+        need(format!("control_edge on {s}"), t.control_edge, bg, 3.0, 3.0, false);
+    }
+    need("active on panel".into(), t.active, t.panel, if t.control_outline { 3.0 } else { 1.0 }, 1.0, false);
+    // Stage selection is drawn over artwork, usually on a white stage.
+    need("selection on a white stage".into(), t.selection, Color32::WHITE, 3.0, 3.0, false);
+    if !t.dark {
+        // Light: the white stage stands off the pasteboard by its edge line, and the pasteboard
+        // is a step darker than the panels so the work area reads as one region.
+        need("text on pasteboard".into(), t.text, t.pasteboard, 7.0, 4.5, true);
+        need("pasteboard on a white stage".into(), t.pasteboard, Color32::WHITE, 1.4, 1.0, false);
+        need("selection on panel".into(), t.selection, t.panel, 3.0, 3.0, false);
+    }
+    if t.control_outline {
+        // High contrast: every region border and control outline is a visible line.
+        need("border on panel".into(), t.border, t.panel, 3.0, 3.0, false);
+        need("control_edge on field".into(), t.control_edge, t.field, 3.0, 3.0, false);
+        need("control_edge on header".into(), t.control_edge, t.header, 3.0, 3.0, false);
+    }
+    out
+}
+
+/// Whether the colours read light on dark: text lighter than the panels it sits on.
+pub fn reads_as_dark(t: &Tokens) -> bool {
+    contrast(t.text, Color32::BLACK) > contrast(t.panel, Color32::BLACK)
+}
+
+/// An accent bar (ADR 0117): the thin square bar that marks structure in the accent colour (a
+/// section band's edge, the active tab's line, a picked row's edge). Flat in `accent` unless the
+/// palette gives the bar another end (`accent_end`): then it runs from one to the other along its
+/// length. The one place a gradient is drawn, so no widget invents its own.
+pub fn accent_bar(p: &egui::Painter, rect: egui::Rect) {
+    let (from, to) = (T.accent, T.accent_end);
+    if from == to {
+        p.rect_filled(rect, SQUARE, from);
+        return;
+    }
+    let mut mesh = egui::Mesh::default();
+    let along_y = rect.height() >= rect.width();
+    for (corner, far) in [(rect.left_top(), false), (rect.right_top(), !along_y), (rect.right_bottom(), true), (rect.left_bottom(), along_y)] {
+        mesh.colored_vertex(corner, if far { to } else { from });
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    p.add(egui::Shape::mesh(mesh));
 }
 
 /// Smallest click target (WCAG 2.5.8 asks for 24 × 24; we use 28).
@@ -431,7 +762,19 @@ pub fn apply(ctx: &egui::Context) {
 /// Switches the palette and restyles every widget with it (Preferences › Theme), live.
 pub fn apply_palette(ctx: &egui::Context, palette: Palette) {
     set_active(palette.index());
-    let t = *palette.tokens();
+    restyle(ctx, *palette.tokens());
+}
+
+/// Switches to a theme of the user's (ADR 0117): `tokens` as its file gave them, over `base`
+/// (which the egui look and the title bar go by). The caller has checked them (`theme_file`);
+/// nothing here is applied in part.
+pub fn apply_user_theme(ctx: &egui::Context, base: Palette, tokens: Tokens) {
+    user_look::set(tokens);
+    set_active(base.index() | USER_LOOK);
+    restyle(ctx, tokens);
+}
+
+fn restyle(ctx: &egui::Context, t: Tokens) {
     let mut v = if t.dark { Visuals::dark() } else { Visuals::light() };
     v.panel_fill = t.panel;
     v.window_fill = t.panel_alt;
@@ -512,9 +855,46 @@ pub fn stage_text_font(size: f32) -> egui::FontId {
     egui::FontId::proportional(size.clamp(12.0, 64.0))
 }
 
+/// The editor's face for a run of stage text at `size` screen pixels (within what the editor
+/// can show legibly).
+pub fn stage_text_run_font(size: f32) -> egui::FontId {
+    egui::FontId::proportional(if size.is_finite() { size.clamp(6.0, 96.0) } else { 14.0 })
+}
+
+/// A run's own colour (document data) as the editor shows it, at least faintly visible.
+pub fn stage_text_colour(c: anicraft_engine::doc::Rgba) -> Color32 {
+    let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    Color32::from_rgba_unmultiplied(b(c.r), b(c.g), b(c.b), b(c.a.max(0.25)))
+}
+
 /// The typefaces embedded at build time (Inter, JetBrains Mono), for text on the stage.
 pub fn embedded_fonts() -> Vec<std::sync::Arc<[u8]>> {
     [craft_fonts::UI_FONT, craft_fonts::MONO_FONT].into_iter().flatten().map(std::sync::Arc::from).collect()
+}
+
+/// Noto Sans Georgian (craft-fonts `Geor`) when this build embedded a face that parses and covers
+/// the Georgian letters. The
+/// interface offers Georgian only then (`i18n::ready_codes`), and `install_fonts` loads the same
+/// face: epaint panics on bytes it cannot parse, so a damaged file must never reach it.
+pub fn georgian_font() -> Option<&'static [u8]> {
+    static FACE: std::sync::OnceLock<Option<&'static [u8]>> = std::sync::OnceLock::new();
+    *FACE.get_or_init(|| craft_fonts::GEORGIAN_FONT.filter(|b| parses_as_font(b)))
+}
+
+/// Whether `bytes` is a font file that draws every Georgian letter (U+10D0..U+10FA).
+fn parses_as_font(bytes: &[u8]) -> bool {
+    let letters: String = ('\u{10D0}'..='\u{10FA}').collect();
+    let fonts = anicraft_engine::text::Fonts::from_faces([bytes.to_vec()]);
+    fonts.layout(&letters, &anicraft_engine::text::Style::default()).is_ok_and(|laid| laid.missing == 0)
+}
+
+#[cfg(test)]
+mod georgian_face_tests {
+    #[test]
+    fn garbage_bytes_are_not_a_font() {
+        assert!(!super::parses_as_font(b"not a font file at all"));
+        assert!(!super::parses_as_font(&[]));
+    }
 }
 
 /// Which typefaces are active (for About and diagnostics), in the interface language.
@@ -532,7 +912,8 @@ pub type UserFont = (String, Vec<u8>, u32);
 
 /// Installs the UI typefaces (ADR 0005). Order in each family: the user's system font (from
 /// Preferences), then the craft-fonts pair (when embedded at build time), then egui's bundled
-/// fonts, which stay as fallbacks for glyph coverage.
+/// fonts, which stay as fallbacks for glyph coverage, then Noto Sans Georgian (when embedded)
+/// for the letters none of them has.
 pub fn install_fonts(ctx: &egui::Context, ui_font: Option<&UserFont>, data_font: Option<&UserFont>) {
     use egui::{FontData, FontDefinitions, FontFamily};
     use std::sync::Arc;
@@ -541,6 +922,12 @@ pub fn install_fonts(ctx: &egui::Context, ui_font: Option<&UserFont>, data_font:
         if let Some(b) = bytes {
             defs.font_data.insert(name.to_owned(), Arc::new(FontData::from_static(b)));
             defs.families.entry(family).or_default().insert(0, name.to_owned());
+        }
+    }
+    if let Some(b) = georgian_font() {
+        defs.font_data.insert("craft-noto-sans-georgian".to_owned(), Arc::new(FontData::from_static(b)));
+        for family in [FontFamily::Proportional, FontFamily::Monospace] {
+            defs.families.entry(family).or_default().push("craft-noto-sans-georgian".to_owned());
         }
     }
     for (user, family) in [(ui_font, FontFamily::Proportional), (data_font, FontFamily::Monospace)] {
@@ -763,7 +1150,7 @@ pub fn section_with_header<R>(ui: &mut egui::Ui, id: &str, style: Section, title
             p.rect_filled(rect, SQUARE, if hot { T.header } else { T.panel_alt });
             p.line_segment([rect.left_top(), rect.right_top()], Stroke::new(1.0, T.border));
             p.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, T.border));
-            p.rect_filled(egui::Rect::from_min_size(rect.left_top() + vec2(0.0, 1.0), vec2(3.0, rect.height() - 1.0)), SQUARE, T.accent);
+            accent_bar(p, egui::Rect::from_min_size(rect.left_top() + vec2(0.0, 1.0), vec2(3.0, rect.height() - 1.0)));
         }
         Section::Rule => {
             if hot {
@@ -840,6 +1227,24 @@ pub fn heat(w: f32) -> Color32 {
     let (a, b) = (HEAT.get(i).copied().unwrap_or(Color32::BLACK), HEAT.get(i + 1).copied().unwrap_or(Color32::BLACK));
     let mix = |p: u8, q: u8| (f32::from(p) + (f32::from(q) - f32::from(p)) * t).round().clamp(0.0, 255.0) as u8;
     Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
+}
+
+/// Gives a text field the keyboard with all of `text` selected, so typing replaces what a
+/// dialog offers (a name to change, a default name) and the arrow keys still edit it
+/// (#196, #322).
+pub fn focus_selected(ui: &egui::Ui, field: &egui::Response, text: &str) {
+    field.request_focus();
+    if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), field.id) {
+        let all = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(text.chars().count()));
+        state.cursor.set_char_range(Some(all));
+        state.store(ui.ctx(), field.id);
+    }
+}
+
+/// Construct an RGB colour derived from artwork rather than a UI theme token.
+/// UI control colours must still come from T.
+pub(crate) fn artwork_rgb(r: u8, g: u8, b: u8) -> Color32 {
+    Color32::from_rgb(r, g, b)
 }
 
 pub fn to_color32(c: anicraft_engine::doc::Rgba) -> Color32 {

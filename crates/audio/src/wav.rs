@@ -1,65 +1,6 @@
 //! WAV (RIFF WAVE) writing via `craft-audio`.
 
-/// Sample formats written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Bits {
-    Int16,
-    Int24,
-    Float32,
-}
-
-impl Bits {
-    fn bytes(self) -> u16 {
-        match self {
-            Bits::Int16 => 2,
-            Bits::Int24 => 3,
-            Bits::Float32 => 4,
-        }
-    }
-}
-
-const PCM: u16 = 1;
-const FLOAT: u16 = 3;
-
-/// A WAV header for `frames` frames of `channels` channels.
-pub fn header(rate: u32, channels: u16, bits: Bits, frames: u64) -> Option<Vec<u8>> {
-    let b = bits.bytes();
-    let data = u32::try_from(frames.checked_mul(u64::from(b) * u64::from(channels))?).ok()?;
-    let riff = data.checked_add(36)?;
-    let block = channels.checked_mul(b)?;
-    let tag = if bits == Bits::Float32 { FLOAT } else { PCM };
-    let mut h = Vec::with_capacity(44);
-    h.extend_from_slice(b"RIFF");
-    h.extend_from_slice(&riff.to_le_bytes());
-    h.extend_from_slice(b"WAVEfmt ");
-    h.extend_from_slice(&16u32.to_le_bytes());
-    h.extend_from_slice(&tag.to_le_bytes());
-    h.extend_from_slice(&channels.to_le_bytes());
-    h.extend_from_slice(&rate.to_le_bytes());
-    h.extend_from_slice(&(rate.saturating_mul(u32::from(block))).to_le_bytes());
-    h.extend_from_slice(&block.to_le_bytes());
-    h.extend_from_slice(&(b * 8).to_le_bytes());
-    h.extend_from_slice(b"data");
-    h.extend_from_slice(&data.to_le_bytes());
-    Some(h)
-}
-
-/// Appends samples in `bits` format. Integers are rounded and clipped to range; `x · 32768`
-/// for 16-bit, so 16-bit sources read by [`decode`] come back bit-identical.
-pub fn append(out: &mut Vec<u8>, samples: &[f32], bits: Bits) {
-    out.reserve(samples.len() * usize::from(bits.bytes()));
-    for &s in samples {
-        let s = if s.is_finite() { s } else { 0.0 };
-        match bits {
-            Bits::Int16 => out.extend_from_slice(&((s * 32_768.0).round().clamp(-32_768.0, 32_767.0) as i16).to_le_bytes()),
-            Bits::Int24 => {
-                let v = (f64::from(s) * 8_388_608.0).round().clamp(-8_388_608.0, 8_388_607.0) as i32;
-                out.extend_from_slice(v.to_le_bytes().get(..3).unwrap_or(&[0, 0, 0]));
-            }
-            Bits::Float32 => out.extend_from_slice(&s.to_le_bytes()),
-        }
-    }
-}
+pub use craft_audio::wav_stream::{Bits, append, header};
 
 /// A whole WAV file in memory (empty when it would not fit a WAV's 4 GB limit).
 pub fn encode(rate: u32, channels: u16, samples: &[f32], bits: Bits) -> Vec<u8> {
@@ -79,7 +20,22 @@ mod tests {
     use super::*;
     use crate::{AudioError, decode};
 
+    const PCM: u16 = 1;
     const EXTENSIBLE: u16 = 0xFFFE;
+
+    #[test]
+    fn streaming_blocks_round_trip_all_formats() {
+        let samples = [0.25, -0.5, 0.0, 0.75, -1.0, 0.5];
+        for bits in [Bits::Int16, Bits::Int24, Bits::Float32] {
+            let mut bytes = header(48_000, 2, bits, 3).unwrap();
+            for block in samples.chunks(2) {
+                append(&mut bytes, block, bits);
+            }
+            let decoded = decode(&bytes).unwrap();
+            assert_eq!((decoded.rate, decoded.channels, decoded.frames()), (48_000, 2, 3));
+            assert_eq!(decoded.samples, samples);
+        }
+    }
 
     #[test]
     fn sixteen_bit_round_trips_bit_exactly() {

@@ -20,7 +20,7 @@
 //! The timeline is the one being edited, so all of this works inside a symbol open in place
 //! (ADR 0045) on the symbol's own keyframes.
 
-use crate::cmds_modify::{ClipLayer, Clipboard, collect_symbols, import_symbols};
+use crate::cmds_modify::{ClipLayer, Clipboard};
 use crate::onion::{FrameItem, multi_editable};
 use crate::params::*;
 use crate::{CommandSpec, EngineError, Result, Session};
@@ -382,9 +382,9 @@ fn copy_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     let all: Vec<Element> = layers.iter().flat_map(|c| c.elements.iter().cloned()).collect();
-    let symbols = collect_symbols(s, &all);
+    let carried = crate::transfer::carry(s, &all, []);
     let (n, keyframes) = (all.len(), layers.len());
-    s.clipboard = Clipboard { layers, symbols };
+    s.clipboard = Clipboard { layers, carried };
     Ok(json!({"copied": n, "keyframes": keyframes}))
 }
 
@@ -446,11 +446,11 @@ fn paste_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         let why = if tl.layer(active).is_some_and(|_| shown_keyframes(tl, active, first, last).is_empty()) { "the layer has no keyframe Edit Multiple Frames can paste onto between the markers (it must be visible, unlocked and hold artwork)" } else { "none of the copied keyframes is between the markers" };
         return Err(EngineError::State(why.into()));
     }
-    import_symbols(s, &clip.symbols);
+    let map = crate::transfer::bring(s, &clip.carried);
     let mut items = Vec::new();
     let mut keyframes: HashSet<(LayerId, u32)> = HashSet::new();
     for (layer, start, c) in plan {
-        let (fresh, _) = at_keyframe(s, layer, start, |s| crate::cmds_modify::paste_layer(s, &c.elements, Vec2::ZERO))?;
+        let (fresh, _) = at_keyframe(s, layer, start, |s| crate::cmds_modify::paste_layer(s, &c.elements, Vec2::ZERO, false, &map))?;
         keyframes.insert((layer, start));
         items.extend(fresh.into_iter().map(|element| FrameItem { layer, frame: start, element }));
     }

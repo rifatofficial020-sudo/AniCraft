@@ -444,7 +444,9 @@ fn text_fields_become_blocks_with_this_computers_fonts() {
         .iter()
         .filter_map(|e| if let ElementKind::Text(t) = &e.kind { Some((e.name.clone(), t.text.clone(), t.size, t.bold)) } else { None })
         .collect();
-    let want = [("", "Corpus", 28.0, true), ("", "self-authored, line two", 12.0, false), ("", "A fixed-width field wraps its words onto lines.", 11.0, false), ("score", "Score 0042", 18.0, false), ("answer", "type here", 14.0, false)];
+    // One block per field, its runs kept (ADR 0085): the title's style is the block's first.
+    let want = [("", "Corpus
+self-authored, line two", 28.0, true), ("", "A fixed-width field wraps its words onto lines.", 11.0, false), ("score", "Score 0042", 18.0, false), ("answer", "type here", 14.0, false)];
     assert_eq!(blocks.iter().map(|(n, t, s, b)| (n.as_str(), t.as_str(), *s, *b)).collect::<Vec<_>>(), want);
     assert_eq!(report.runs.get("dynamic text fields"), Some(&1), "fields run in Test Movie (ADR 0066)");
     assert!(!report.skipped.contains_key("text fields (no fonts on this computer)"));
@@ -457,6 +459,39 @@ fn text_fields_become_blocks_with_this_computers_fonts() {
         .collect();
     use anicraft_doc::TextKind::{Dynamic, Input};
     assert_eq!(fields, [("score_txt".into(), Dynamic, 200.0, 28.0), ("name_txt".into(), Input, 200.0, 24.0), ("notes_txt".into(), Input, 140.0, 64.0), ("pw_txt".into(), Input, 120.0, 24.0)]);
+}
+
+/// ADR 0099: a text field's `<filters>` (the records an instance holds) come in on the text, in
+/// order, switched-off ones switched off; nothing about them is reported as skipped.
+#[test]
+fn filters_on_text_fields_come_in_on_the_text() {
+    let mut package = files("textfields");
+    let xml = String::from_utf8(package["DOMDocument.xml"].clone()).unwrap();
+    let field = "<DOMDynamicText name=\"score_txt\" fontRenderingMode=\"standard\" width=\"200\" height=\"28\" border=\"true\" isSelectable=\"false\">";
+    assert!(xml.contains(field), "the fixture's dynamic field");
+    let filters = "<filters><DropShadowFilter blurX=\"4\" blurY=\"4\" distance=\"6\" angle=\"45\" color=\"#112233\" strength=\"0.6\"/><GlowFilter blurX=\"10\" blurY=\"10\" color=\"#E63946\" enabled=\"false\"/><SparkleFilter/></filters>";
+    package.insert("DOMDocument.xml".into(), xml.replace(field, &format!("{field}{filters}")).into_bytes());
+    // Without fonts no text comes in; the import still reads the package, and says only that.
+    let (_, report) = import_files(&package, &Fonts::from_faces(Vec::new())).unwrap();
+    assert!(!report.skipped.contains_key("filters on text"), "{:?}", report.skipped);
+    assert_eq!(report.skipped.get("unknown filters"), Some(&1), "a filter AniCraft doesn't know is reported: {:?}", report.skipped);
+    let fonts = Fonts::get();
+    if fonts.resolve("").is_none() {
+        return; // A computer without fonts: nothing to hold the filters.
+    }
+    let (doc, report) = import_files(&package, fonts).unwrap();
+    assert!(!report.skipped.contains_key("filters on text"), "{:?}", report.skipped);
+    let texts: Vec<(String, Vec<anicraft_doc::FilterEntry>)> = doc.timeline(0).layers[1].keyframes[0].elements.iter().filter_map(|e| if let ElementKind::Text(t) = &e.kind { Some((e.name.clone(), t.filters.clone())) } else { None }).collect();
+    let (name, list) = &texts[0];
+    assert_eq!(name, "score_txt");
+    assert_eq!(list.len(), 2, "{list:?}");
+    assert!(matches!(list[0], anicraft_doc::FilterEntry { filter: anicraft_doc::Filter::DropShadow { blur_x, distance, strength, color, .. }, enabled: true } if blur_x == 4.0 && distance == 6.0 && (strength - 0.6).abs() < 1e-6 && color == anicraft_doc::Rgba::hex(0x112233)), "{:?}", list[0]);
+    assert!(matches!(list[1], anicraft_doc::FilterEntry { filter: anicraft_doc::Filter::Glow { .. }, .. }), "{:?}", list[1]);
+    assert!(texts.iter().skip(1).all(|(_, f)| f.is_empty()), "the other fields have none");
+    // And the text draws through them: one filtered group, the field's items in it.
+    let dl = anicraft_doc::evaluate(&doc, 0);
+    let g = dl.groups.iter().position(|g| !g.filters.is_empty()).expect("a filtered group") as u32;
+    assert!(dl.items.iter().filter(|i| i.group == Some(g)).count() >= 2);
 }
 
 /// A small deterministic generator (xorshift), so a failing variant can be found again.

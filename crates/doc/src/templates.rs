@@ -233,7 +233,7 @@ fn lip_sync() -> Document {
         name: "mouth".into(),
         transform: Affine::translate(cx, cy + 130.0),
         color: ColorEffect::default(),
-        kind: ElementKind::Symbol { symbol: sym_id, loop_mode: LoopMode::SingleFrame, first_frame: 0, blend: crate::BlendMode::Normal, filters: Vec::new(), events: Vec::new() },
+        kind: ElementKind::Symbol { symbol: sym_id, loop_mode: LoopMode::SingleFrame, first_frame: 0, blend: crate::BlendMode::Normal, filters: Vec::new(), events: Vec::new(), pivot: None },
     });
     let layers = vec![
         layer(&mut d, "Face guide", LayerKind::Guide, GUIDE, FRAMES, guides),

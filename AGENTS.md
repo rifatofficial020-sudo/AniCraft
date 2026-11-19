@@ -77,7 +77,9 @@ a new crate needs a row here and in its `LAYERS` table.
 ## Licensing and legal compliance (read `docs/legal/compliance.md`)
 
 * AniCraft is **MIT OR Apache-2.0**, like PhotoCraft (`LICENSE-MIT`, `LICENSE-APACHE`, `NOTICE`).
-* **Dependencies**: permissive only, from crates.io only. `deny.toml` is the policy, and
+* **Dependencies**: permissive only, from crates.io or the explicitly allowlisted
+  `storytold/craft-libs` Git source, pinned to a reviewed `rev` in `Cargo.toml`.
+  `deny.toml` is the policy; unknown registries and Git sources remain denied, and
   `cargo deny check licenses bans sources` must pass. Adding a crate with a new licence needs
   a deliberate `deny.toml` change and a note in `compliance.md`. No copyleft, "non-commercial"
   or source-available terms.
@@ -143,3 +145,13 @@ cargo run -- --screenshot shots/now.png
 ```
 
 Update `docs/roadmap.md` › Honest status when you move a capability.
+
+## Shared Craft libraries
+
+Before adding or changing reusable file-format, codec, protocol or UI code, check [craft-libs](https://github.com/storytold/craft-libs) and existing contributor work; reuse its public APIs or extend the appropriate shared library instead of adding an app-local duplicate, keeping app-specific policy and model mapping local and preserving compatibility, security limits and regression coverage.
+
+ADR 0040 Decision 2 remains a deliberate, scoped exception for the existing app-local
+craft-i18n catalog parser until a separately reviewed parity-preserving cutover updates
+that ADR and its implementation together. Its historical crates.io-only rationale does
+not override the reviewed/pinned craft-libs source exception above. This guidance alone
+does not migrate that parser or supersede its runtime behavior.

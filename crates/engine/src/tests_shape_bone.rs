@@ -225,10 +225,10 @@ fn shape_bones_refuse_what_cant_be_done() {
         let e = s.execute(id, &p).unwrap_err().to_string();
         assert!(e.contains("armature"), "{id}: {e}");
     }
-    // Bones of symbol instances bind nothing; instances don't join a shape's armature.
+    // Bones of symbol instances bind nothing, and no bone goes inside an instance.
     let (mut inst, ib1, _) = crate::tests_bone::rigged();
     assert!(inst.execute("bone.bind", &json!({"bone": ib1})).unwrap_err().to_string().contains("instances"));
-    assert!(inst.execute("bone.add_in_shape", &json!({"parent": ib1, "tail": [0, 0]})).unwrap_err().to_string().contains("instances"));
+    assert!(inst.execute("bone.add_in_shape", &json!({"parent": ib1, "tail": [0, 0]})).unwrap_err().to_string().contains("instance"));
     let e = inst.execute("bone.add_in_shape", &json!({"shape": crate::tests_bone::ROOT, "head": [150, 100], "tail": [190, 100]})).unwrap_err().to_string();
     assert!(e.contains("shape"), "{e}");
 }
@@ -252,7 +252,7 @@ fn removing_shape_bones_rebinds_and_the_last_frees_the_shape_as_it_looks() {
     let tl = s.doc.timeline(0);
     assert_eq!(tl.layers.len(), 2, "no layer for freed instances: a shape's bones move none");
     let arm = tl.layers[0].armature.as_ref().unwrap();
-    assert!(arm.skin.as_ref().unwrap().points.iter().all(|p| p.bones == vec![anicraft_doc::skin::Influence(anicraft_doc::BoneId(b1), 1.0)]), "every point follows the bone that's left");
+    assert!(arm.skins.first().unwrap().points.iter().all(|p| p.bones == vec![anicraft_doc::skin::Influence(anicraft_doc::BoneId(b1), 1.0)]), "every point follows the bone that's left");
     let shown = points(&s, 0);
     run(&mut s, "bone.remove", json!({"bone": b1}));
     let tl = s.doc.timeline(0);
@@ -276,7 +276,7 @@ fn shape_armatures_survive_a_file_round_trip_and_render_the_same() {
         assert_eq!(render_frame(&back, f, 1.0).unwrap().data, render_frame(&s.doc, f, 1.0).unwrap().data, "frame {f}");
     }
     // The file stores the outline as drawn, so a keyframe's bent outline never drifts.
-    let skin = back.timeline(0).layers[0].armature.as_ref().unwrap().skin.clone().unwrap();
+    let skin = back.timeline(0).layers[0].armature.as_ref().unwrap().skins.first().cloned().unwrap();
     assert_eq!(skin.rest.cmds.first(), Some(&PathCmd::MoveTo(Vec2::new(0.0, -10.0))));
     // New ids never collide with the bones' joint nodes.
     let mut back = Session::new(back);

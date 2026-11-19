@@ -75,6 +75,26 @@ is unchanged (the onion tests compare items and pixels). The settings are part o
 key, so the frame cache keeps working: looking at the same frame again is 40 hits in 0.02 ms,
 and other settings are other pictures.
 
+**Strokes as one outline (2026-11-17, ADR 0110).** The stroker used to hand the rasterizers a
+quad per segment and a disc or fan per bend, whose overlaps made edge pixels too dark. It now
+builds one outline per run of segments and unites them (`anicraft_geom::polygons::union`, about
+60 ns an edge on an outline that is already nearly clean; uniting the old pieces would have
+cost 1.6 ms for one wide curve). The stroker itself is about three times slower (a wide curve:
+20 → 60 µs) and the rasterizers get 3 to 4 times fewer edges. CPU oracle, median of 80
+renders, 32 threads, before → after:
+
+| Scene | Edges | Before | After |
+|---|---|---|---|
+| 2,000 outlined ovals, stars and rounded rectangles, 1920 × 1080 | 703,000 → 254,000 | 9.3 ms | 9.0 ms |
+| The demo scene, 1280 × 720 | 1,345 → 767 | 2.5 ms | 2.6 ms |
+| Seven tangled lines (waves, dashes, a knot, a hairpin), 400 × 300 | 4,995 → 1,347 | 0.51 ms | 0.63 ms |
+| The same at 300 % | 12,341 → 2,284 | 2.5 ms | 2.65 ms |
+| 300 self-crossing scribbles, 1280 × 720 | 499,000 → 126,000 | 5.9 ms | 6.4 ms |
+
+Convex closed outlines (rectangles, ovals, rounded rectangles) and straight lines skip the
+union: their outline can't overlap. Output changes only at stroke edges (14 corpus goldens
+regenerated; ADR 0110 lists what changed).
+
 **Outlines as hairlines (2026-11-10, ADR 0048).** Outline mode drew half-pixel strokes (four
 edges per segment and a disc at every bend); it now draws hairlines, one edge per segment,
 covered by distance. Same test, same machine:

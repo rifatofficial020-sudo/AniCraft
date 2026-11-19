@@ -8,6 +8,7 @@ pub use anicraft_audio as audio;
 pub use anicraft_actions as actions;
 
 pub mod aids;
+pub mod parenting;
 pub mod armature;
 pub mod spring;
 pub mod skin;
@@ -29,12 +30,13 @@ pub mod width;
 pub mod stroke_style;
 pub mod player;
 pub mod publish;
+pub mod rich_text;
 pub mod sample;
 pub mod templates;
 pub mod sound;
 pub mod swatch;
 
-pub use filter::{FILTER_PARAMS, Filter, FilterEntry, FilterParam, FilterProp, FilterSide, MAX_FILTER_SLOTS, active as active_filters, any_active as any_active_filter, pairs_up as filters_pair_up, MAX_BLUR, MAX_QUALITY, MAX_RAMP_STOPS, REST_SNAP, default_bevel_ramp, default_glow_ramp, pinned_stop, ramp_at};
+pub use filter::{Channel, FILTER_PARAMS, Filter, FilterColor, FilterEntry, FilterParam, FilterProp, FilterSide, MAX_FILTER_SLOTS, pairing as filter_pairing, active as active_filters, any_active as any_active_filter, pairs_up as filters_pair_up, MAX_BLUR, MAX_QUALITY, MAX_RAMP_STOPS, REST_SNAP, default_bevel_ramp, default_glow_ramp, pinned_stop, ramp_at};
 pub use bitmap::{Bitmap, BitmapId, ImageError, MAX_BITMAP_EDGE, Pixels, base64_decode, base64_encode, decode_png, image_to_png};
 pub use easing::{CustomEase, EaseDir, EaseFamily, EasePoint, Easing, Handle, MAX_EASE_NAME, MAX_EASE_POINTS, MAX_EASE_SAMPLES, MAX_EASE_Y, MAX_SAVED_EASES, SampledEase, SavedEase, ease_name};
 pub use color_effect::{ADVANCED_ADD, ADVANCED_MUL, ColorEffect, ColorStyle, ColorTransform};
@@ -46,8 +48,10 @@ pub use width::{MAX_WIDTH_FACTOR, MAX_WIDTH_POINTS, ProfilePreset, WidthPoint, W
 pub use stroke_style::{Cap, Dash, DashKind, Join, StrokeStyle};
 pub use camera::{Camera, DepthKey};
 pub use swatch::{MAX_SWATCHES, Swatch, SwatchPaint};
+pub use parenting::{MAX_RIG_DEPTH, RigError};
 pub use aids::{Aids, GUIDE_REACH, Grid, Guide, GuideAxis, MAX_GUIDES};
 pub use nine_slice::symbol_box;
+pub use rich_text::{BaselineShift, CharStyle, MAX_TEXT_RUNS, MAX_URL, ParagraphStyle, StyleSummary, TextFill, TextRun, safe_url};
 pub use armature::{Armature, Bone, BoneId, JointAngle, Limits, Pose};
 pub use eval::{DisplayItem, DisplayList, Group, MAX_SYMBOL_DEPTH, evaluate, evaluate_guided, evaluate_layer_elements, evaluate_shown, evaluate_player, evaluate_scene, evaluate_scene_camera, evaluate_timeline, evaluate_timeline_at, guide_walk, instance_start};
 pub use actions::{Action, ButtonEvent, EventHandler, FrameScript, Language, PluginScript, SourceScript};
@@ -96,7 +100,8 @@ impl Rgba {
     }
     /// Parses `#rrggbb`, `rrggbb` or `#rrggbbaa`.
     pub fn parse_hex(s: &str) -> Option<Rgba> {
-        let h = s.trim().trim_start_matches('#');
+        let s = s.trim();
+        let h = s.strip_prefix('#').unwrap_or(s);
         if !h.is_ascii() || (h.len() != 6 && h.len() != 8) {
             return None;
         }
@@ -572,6 +577,12 @@ pub enum ElementKind {
         /// ADR 0024), one handler per event.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         events: Vec<EventHandler>,
+        /// The transformation point (ADR 0111), in the instance's own space: what Free
+        /// Transform, the Properties fields and tweens turn, scale and skew it about. `None`
+        /// until the artist moves it: tools then use the centre of its box, and tweens its
+        /// registration point (as files from before it did). Read through [`Element::pivot`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pivot: Option<Vec2>,
     },
     /// A block of text (ADR 0012).
     Text(Arc<TextBlock>),
@@ -589,6 +600,25 @@ pub enum ElementKind {
 }
 
 impl ElementKind {
+    /// The filter list of what takes filters: a symbol instance (movie clips and buttons draw
+    /// them) or a block of text (ADR 0099). `None` for everything else.
+    pub fn filters(&self) -> Option<&[FilterEntry]> {
+        match self {
+            ElementKind::Symbol { filters, .. } => Some(filters),
+            ElementKind::Text(t) => Some(&t.filters),
+            _ => None,
+        }
+    }
+
+    /// The same list, to change (a text block shared with another element is copied first).
+    pub fn filters_mut(&mut self) -> Option<&mut Vec<FilterEntry>> {
+        match self {
+            ElementKind::Symbol { filters, .. } => Some(filters),
+            ElementKind::Text(t) => Some(&mut Arc::make_mut(t).filters),
+            _ => None,
+        }
+    }
+
     /// A group of `elements` (ADR 0073), on one layer with id `layer`.
     pub fn group(layer: LayerId, elements: Vec<Arc<Element>>) -> ElementKind {
         let mut l = Layer::new(layer, "Layer 1");
@@ -777,6 +807,73 @@ pub struct TextBlock {
     /// `outline` holds the glyphs set along it. Static text only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_path: Option<TextPath>,
+    /// Filters, applied in order to the text as it is drawn (its box and border included), as
+    /// on a movie clip (ADR 0099); each may be switched off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filters: Vec<FilterEntry>,
+    /// The first run's baseline shift, underline and link (ADR 0085).
+    #[serde(default, skip_serializing_if = "rich_text_is_normal")]
+    pub shift: BaselineShift,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub underline: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    /// The first paragraph's indent and margins (ADR 0085).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub indent: f32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub left_margin: f32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub right_margin: f32,
+    /// Styled runs covering the text, when its characters differ in style (ADR 0085; empty:
+    /// all in the style above). Set with [`TextBlock::set_styles`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<TextRun>,
+    /// One style per paragraph, when they differ (empty: all as above).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paragraphs: Vec<ParagraphStyle>,
+    /// The outline cut into pieces by colour and link, in order (empty: all in `color`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fills: Vec<TextFill>,
+    #[serde(skip)]
+    pub fill_cache: rich_text::FillCache,
+}
+
+fn rich_text_is_normal(s: &BaselineShift) -> bool {
+    *s == BaselineShift::Normal
+}
+
+impl Default for TextBlock {
+    fn default() -> Self {
+        TextBlock {
+            text: String::new(),
+            font: String::new(),
+            size: 32.0,
+            bold: false,
+            italic: false,
+            color: Rgba::BLACK,
+            align: TextAlign::Left,
+            letter_spacing: 0.0,
+            line_spacing: 0.0,
+            width: None,
+            outline: Arc::new(Path::new()),
+            box_width: 0.0,
+            box_height: 0.0,
+            field: None,
+            on_path: None,
+            filters: Vec::new(),
+            shift: BaselineShift::Normal,
+            underline: false,
+            url: String::new(),
+            indent: 0.0,
+            left_margin: 0.0,
+            right_margin: 0.0,
+            runs: Vec::new(),
+            paragraphs: Vec::new(),
+            fills: Vec::new(),
+            fill_cache: rich_text::FillCache::default(),
+        }
+    }
 }
 
 /// The path a text block follows (ADR 0070), and where along it the text sits.
@@ -950,6 +1047,34 @@ pub struct Element {
 }
 
 impl Element {
+    /// The transformation point the artist set (ADR 0111), in the element's own space: only a
+    /// symbol instance keeps one. `None` when it was never moved, or isn't finite.
+    pub fn pivot(&self) -> Option<Vec2> {
+        match &self.kind {
+            ElementKind::Symbol { pivot, .. } => pivot.filter(|p| p.is_finite() && p.x.abs() <= MAX_PIVOT && p.y.abs() <= MAX_PIVOT),
+            _ => None,
+        }
+    }
+    /// Sets or clears the transformation point (own space). Answers whether the element keeps
+    /// one (a symbol instance does).
+    pub fn set_pivot(&mut self, at: Option<Vec2>) -> bool {
+        match &mut self.kind {
+            ElementKind::Symbol { pivot, .. } => {
+                *pivot = at.filter(|p| p.is_finite() && p.x.abs() <= MAX_PIVOT && p.y.abs() <= MAX_PIVOT);
+                true
+            }
+            _ => false,
+        }
+    }
+    /// `transform` moved so that the transformation point (when one is set) stays where
+    /// `self.transform` has it in the parent's space: how a new scale, rotation or skew is
+    /// applied about the point. Without a point, `transform` as given.
+    pub fn about_pivot(&self, transform: Affine) -> Affine {
+        let Some(p) = self.pivot() else { return transform };
+        let d = self.transform.apply(p) - transform.apply(p);
+        let m = Affine::translate(d.x, d.y).mul(&transform);
+        if m.is_finite() { m } else { transform }
+    }
     /// Local-space bounds (control-point bounds for shapes, `None` for symbols).
     pub fn local_bounds(&self, doc: &Document) -> Rect {
         element_bounds(doc, self, &Affine::IDENTITY, 0)
@@ -1065,6 +1190,10 @@ pub struct Tween {
     /// properties.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<(EaseGroup, Easing)>,
+    /// Keep area (ADR 0115): the two scale axes move geometrically instead of in straight
+    /// lines, so squash and stretch between keys of one area keeps that area on every frame.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub keep_area: bool,
 }
 
 impl Tween {
@@ -1240,6 +1369,17 @@ pub struct Layer {
     /// masks), or its opacity or brightness (soft masks). Ignored on other kinds of layer.
     #[serde(default, skip_serializing_if = "MaskMode::is_coverage")]
     pub mask_mode: MaskMode,
+    /// The layer's opacity, `0..=1` (ADR 0111): its artwork is drawn together, then shown this
+    /// strongly, in the movie and every export. A folder's fades the layers in it. Read
+    /// through [`Layer::shown_opacity`].
+    #[serde(default = "full", skip_serializing_if = "is_full")]
+    pub opacity: f32,
+    /// The parent layer (ADR 0113, layer parenting): this layer's artwork is placed in the
+    /// space of the first object on that layer at every frame, so it follows it. Not the
+    /// folder or mask the layer sits in (that is [`Layer::parent`]). Kept sound by
+    /// [`Timeline::repair_rig`]; read through [`Timeline::rig_spaces`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rig_parent: Option<LayerId>,
 }
 
 /// How a mask layer's artwork reveals the layers it masks (ADR 0070).
@@ -1308,6 +1448,10 @@ fn is_one(v: &u8) -> bool {
     *v == 1
 }
 
+/// Farthest a transformation point may be from its instance's registration point, in the
+/// instance's own units (ADR 0111).
+pub const MAX_PIVOT: f32 = 1.0e6;
+
 /// Tallest a layer's timeline row gets, in normal rows (300 %).
 pub const MAX_LAYER_HEIGHT: u8 = 3;
 
@@ -1329,6 +1473,8 @@ impl PartialEq for Layer {
             && self.volume.to_bits() == o.volume.to_bits()
             && self.muted == o.muted
             && self.mask_mode == o.mask_mode
+            && self.opacity.to_bits() == o.opacity.to_bits()
+            && self.rig_parent == o.rig_parent
             && match (&self.armature, &o.armature) {
                 (Some(a), Some(b)) => arc_eq(a, b),
                 (a, b) => a.is_none() && b.is_none(),
@@ -1365,7 +1511,13 @@ impl Layer {
             muted: false,
             armature: None,
             mask_mode: MaskMode::Coverage,
+            opacity: 1.0,
+            rig_parent: None,
         }
+    }
+    /// The layer's own opacity, `0..=1` whatever a file says (not a number: opaque).
+    pub fn shown_opacity(&self) -> f32 {
+        if self.opacity.is_finite() { self.opacity.clamp(0.0, 1.0) } else { 1.0 }
     }
     /// The row height in normal rows, `1..=MAX_LAYER_HEIGHT` whatever a file says.
     pub fn height(&self) -> u8 {
@@ -1540,6 +1692,13 @@ impl Timeline {
         self.folders_of(index).any(|f| !f.visible)
     }
 
+    /// How strongly the layer at `index` shows (ADR 0111): its own opacity times that of every
+    /// folder it is in.
+    pub fn layer_opacity(&self, index: usize) -> f32 {
+        let own = self.layers.get(index).map_or(1.0, |l| l.shown_opacity());
+        self.folders_of(index).fold(own, |a, f| a * f.shown_opacity())
+    }
+
     /// Whether a folder containing layer `id` is locked (so the layer is too).
     pub fn locked_by_folder(&self, id: LayerId) -> bool {
         self.index_of(id).is_some_and(|i| self.folders_of(i).any(|f| f.locked))
@@ -1571,6 +1730,8 @@ impl Timeline {
     pub fn repair_masks(&mut self) {
         // The camera layer sits on top, outside any folder (ADR 0027).
         self.repair_camera();
+        // Parent-layer links that can't hold are dropped (ADR 0113).
+        self.repair_rig();
         for i in 0..self.layers.len() {
             let Some(l) = self.layers.get(i) else { continue };
             let Some(p) = l.parent else { continue };
@@ -1932,6 +2093,12 @@ impl Document {
         }
         all.into_iter()
     }
+    /// Whether any armature of the document is mixed (ADR 0098): instances and shapes in one
+    /// armature, or several shapes with bones. Such a document is written as format version 4,
+    /// which earlier builds refuse by its number; every other document is written as before.
+    pub fn has_mixed_armatures(&self) -> bool {
+        self.timelines().flat_map(|tl| &tl.layers).any(|l| l.kind == LayerKind::Armature && l.armature.as_ref().is_some_and(|a| a.is_mixed()))
+    }
     /// Repairs a loaded document: ids, sizes and keyframe order.
     pub fn sanitize(&mut self) {
         let s = &mut self.stage;
@@ -2226,6 +2393,10 @@ mod gradient_tests;
 mod camera_tests;
 
 #[cfg(test)]
+#[path = "parenting_tests.rs"]
+mod parenting_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2266,6 +2437,8 @@ mod tests {
         assert_eq!(c.to_hex(), "#ff8000");
         assert!(Rgba::parse_hex("zz").is_none());
         assert!(Rgba::parse_hex("ééé").is_none());
+        assert!(Rgba::parse_hex("##ff0000").is_none());
+        assert!(Rgba::parse_hex("ff0000").is_some());
     }
 
     #[test]

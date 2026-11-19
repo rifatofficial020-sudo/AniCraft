@@ -16,12 +16,16 @@
 //! the stage, and removing one unpins it.
 //!
 //! Below the colour effect, each filter of the object (ADR 0092) lists its numbers under the
-//! filter's name (Blur X, Blur Y, Strength…), curves and keys like the other properties.
+//! filter's name (Blur X, Blur Y, Strength…), curves and keys like the other properties. Its
+//! colours follow (ADR 0099): one row a colour, with a swatch that keys the whole colour at the
+//! playhead and a diamond for all four channels; click the row to list its red, green, blue and
+//! alpha, each a curve of its own. Last come quality and the switches, which hold their keys:
+//! their curves are steps and they take no ease.
 
 use crate::a11y::{self, Named};
 use crate::app::App;
 use crate::theme::{SQUARE, T, TARGET, Type, color, font, text, with_type};
-use anicraft_engine::doc::{ColorStyle, Easing, Element, ElementKind, MotionTween, Pin, Property, Props, Track, filter_properties, own_value};
+use anicraft_engine::doc::{Channel, ColorStyle, Easing, Element, FilterColor, FilterParam, FilterProp, MotionTween, Pin, Property, Props, Rgba, Track, filter_properties, own_value};
 use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, WidgetType, pos2, vec2};
 use serde_json::json;
 
@@ -73,26 +77,88 @@ fn current(app: &App) -> Option<(u32, u32, MotionTween, Props, Vec<ColorStyle>, 
     Some((k.start, k.duration, m, Props::of(target), styles, (**target).clone()))
 }
 
-/// A row of the property list: a property, or the name of a filter above its numbers.
+/// A row of the property list: a property, the name of a filter above its values, or one of a
+/// filter's colours above its channels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Row {
     Prop(Property),
     /// A filter's place, name and whether it is on.
     Filter(u8, &'static str, bool),
+    /// A filter's colour (ADR 0099), by the filter's place: a swatch for the whole colour;
+    /// its four channels are listed under it when it is open.
+    Colour(u8, FilterColor),
 }
 
-/// The rows: [`listed`]'s properties, then each filter of the object with its numbers.
-fn rows_for(used: &[ColorStyle], added: &[ColorStyle], target: &Element) -> Vec<Row> {
+/// The four channels of the colour `c` of the filter at `slot`: red, green, blue, alpha.
+fn channels(slot: u8, c: FilterColor) -> [Property; 4] {
+    Channel::ALL.map(|ch| Property::Filter(FilterProp { slot, param: FilterParam::Color(c, ch) }))
+}
+
+/// The rows: [`listed`]'s properties, then each filter of the object: its numbers, its
+/// colours (with their channels where `open` lists them), then quality and its switches.
+fn rows_for(used: &[ColorStyle], added: &[ColorStyle], target: &Element, open: &[(u8, FilterColor)]) -> Vec<Row> {
     let mut out: Vec<Row> = listed(used, added).into_iter().map(Row::Prop).collect();
-    let ElementKind::Symbol { filters, .. } = &target.kind else { return out };
+    let Some(filters) = target.kind.filters() else { return out };
     let mut props = filter_properties(target).into_iter().peekable();
     for (slot, e) in filters.iter().enumerate() {
         out.push(Row::Filter(slot as u8, e.filter.label(), e.enabled));
         while let Some(p) = props.next_if(|p| p.filter().is_some_and(|f| usize::from(f.slot) == slot)) {
-            out.push(Row::Prop(p));
+            match p.filter().and_then(|f| f.param.color()) {
+                // A colour's row comes with its first channel; the channels only when open.
+                Some((c, ch)) => {
+                    if ch == Channel::Red {
+                        out.push(Row::Colour(slot as u8, c));
+                    }
+                    if open.contains(&(slot as u8, c)) {
+                        out.push(Row::Prop(p));
+                    }
+                }
+                None => out.push(Row::Prop(p)),
+            }
         }
     }
     out
+}
+
+/// The name of a filter's colour: "Colour", "Shadow", "Highlight", "Stop 2".
+fn colour_name(c: FilterColor) -> String {
+    match c {
+        FilterColor::Stop(n) => tr!("Stop {n}", n = u32::from(n) + 1),
+        c => crate::i18n::t(c.label()).to_string(),
+    }
+}
+
+/// A property's name on its own row: its label, and for a colour's channel just the channel.
+/// With `full`, as screen readers and the graph say it: "Glow: Colour · Red", "Blur: Blur X".
+fn prop_name(target: &Element, p: Property, full: bool) -> String {
+    let label = crate::i18n::t(p.label());
+    let Some(f) = p.filter().filter(|_| full) else { return label.to_string() };
+    let filter = crate::i18n::t(filter_name(target, f.slot));
+    match f.param.color() {
+        Some((c, _)) => tr!("{filter}: {colour} · {channel}", filter = filter, colour = colour_name(c), channel = label),
+        None => tr!("{filter}: {property}", filter = filter, property = label),
+    }
+}
+
+/// A stepped value in words: a switch is On or Off, quality Low, Medium or High.
+fn stepped_text(p: Property, v: f32) -> Option<String> {
+    let f = p.filter().filter(|f| f.param.is_stepped())?;
+    let word: &str = match f.param {
+        FilterParam::Quality => [tr!("Low"), tr!("Medium"), tr!("High")].get((v.round() as usize).clamp(1, 3) - 1).copied().unwrap_or_default(),
+        _ if v >= 0.5 => tr!("On"),
+        _ => tr!("Off"),
+    };
+    Some(word.to_string())
+}
+
+/// The colour `c` of the object's filter at `slot`, as the object `at` (it at a frame) has it.
+fn colour_of(at: &Element, slot: u8, c: FilterColor) -> Option<Rgba> {
+    at.kind.filters()?.get(usize::from(slot))?.filter.color(c).map(Rgba::sanitized)
+}
+
+/// A colour as commands take it, alpha included.
+fn hex8(c: Rgba) -> String {
+    format!("{}{:02x}", c.to_hex(), (c.sanitized().a * 255.0).round() as u8)
 }
 
 /// The properties the list shows: position and transform, and the colour effect styles the
@@ -113,6 +179,9 @@ fn nice_step(span: f32) -> f32 {
 }
 
 fn fmt(p: Property, v: f32) -> String {
+    if let Some(s) = stepped_text(p, v) {
+        return s;
+    }
     match p {
         Property::X | Property::Y => format!("{v:.1} {}", p.unit()),
         _ => format!("{v:.1}{}", p.unit()),
@@ -146,6 +215,8 @@ fn value_range(track: Option<&Track>, base: f32, frames: u32, p: Property) -> (f
     }
     let min_span = match p {
         Property::X | Property::Y => 20.0,
+        // A switch's two values, or quality's three, fill the view.
+        p if p.is_stepped() => 1.0,
         _ => 10.0,
     };
     if hi - lo < min_span {
@@ -174,6 +245,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let here = (app.s.layer.0, start);
     if app.me_sel_at != here {
         app.me_sel.clear();
+        app.me_open.clear();
         app.me_sel_at = here;
     }
     app.me_sel.retain(|(p, f)| m.track(*p).is_some_and(|t| t.key_at(*f).is_some()));
@@ -199,7 +271,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let rows_top = list.top() + RULER_H;
     // Rows that don't fit scroll with the wheel over the list.
     let fit = (((list.bottom() - rows_top) / ROW_H).floor() as usize).max(1);
-    let list_rows = rows_for(&used, &app.me_styles, &target);
+    let list_rows = rows_for(&used, &app.me_styles, &target, &app.me_open);
     let rows: Vec<Property> = list_rows.iter().filter_map(|r| if let Row::Prop(p) = r { Some(*p) } else { None }).collect();
     if !rows.contains(&app.me_prop) {
         app.me_prop = Property::X;
@@ -228,11 +300,17 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 last_group = "Filters"; // i18n-exempt: a group key (Property::group), not shown
                 continue;
             }
+            Row::Colour(slot, c) => {
+                colour_row(app, ui, &painter, row, r, &m, &target, &at, offset, slot, c);
+                continue;
+            }
         };
         let selected = app.me_prop == p;
         painter.rect_filled(row, 0.0, if selected { T.accent_dim } else if r % 2 == 0 { T.panel } else { T.panel_alt });
         let track = m.track(p);
-        let label = crate::i18n::t(p.label());
+        let label = prop_name(&target, p, false);
+        // A colour's channels sit under its row, set in.
+        let indent = if p.filter().is_some_and(|f| f.param.color().is_some()) { 16.0 } else { 0.0 };
         // Groups (Position, Transform, Colour effect) are set apart by a rule.
         if p.group() != last_group {
             if !last_group.is_empty() {
@@ -240,16 +318,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             }
             last_group = p.group();
         }
-        painter.text(pos2(row.left() + 12.0, row.center().y), Align2::LEFT_CENTER, label, font(Type::Body), if track.is_some() { T.text } else { T.text_dim });
+        painter.text(pos2(row.left() + 12.0 + indent, row.center().y), Align2::LEFT_CENTER, label, font(Type::Body), if track.is_some() { T.text } else { T.text_dim });
         if track.is_some() {
             painter.text(pos2(row.left() + 84.0, row.center().y), Align2::LEFT_CENTER, tr!("keyed"), font(Type::Caption), T.tween_motion);
         }
         let rr = ui.interact(row, ui.id().with(("me_row", p.key())), Sense::click());
-        let label = match p.filter() {
-            // Named with its filter for screen readers and tips ("Blur: Blur X").
-            Some(f) => tr!("{filter}: {property}", filter = crate::i18n::t(filter_name(&target, f.slot)), property = label),
-            None => label.to_string(),
-        };
+        // Named with its filter for screen readers and tips ("Blur: Blur X").
+        let label = prop_name(&target, p, true);
         let label = label.as_str();
         a11y::control(ui, &rr, WidgetType::SelectableLabel, &if track.is_some() { tr!("{property} · keyed", property = label) } else { label.to_string() }, Some(selected));
         if rr.clicked() {
@@ -264,13 +339,36 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         let suffix = if p.unit() == "px" { " px" } else { p.unit() };
         // In a child placed on the row, so the field never grows the dock.
         let mut cell = ui.new_child(egui::UiBuilder::new().max_rect(field).layout(egui::Layout::left_to_right(egui::Align::Center)));
-        let r = with_type(&mut cell, Type::Data, |ui| ui.add_sized(vec2(field.width(), field.height()), egui::DragValue::new(&mut v).speed(speed).range(range).max_decimals(1).suffix(suffix)).named(label));
-        if r.changed() {
+        let r = match p.filter().map(|f| f.param).filter(|q| q.is_stepped()) {
+            // A switch: a tick box. Changing it keys it at the playhead, like any value.
+            Some(FilterParam::Inner | FilterParam::Knockout | FilterParam::HideObject) => {
+                let mut on = v >= 0.5;
+                let r = crate::theme::checkbox(&mut cell, &mut on, "").named(label);
+                v = if on { 1.0 } else { 0.0 };
+                r
+            }
+            // Quality: Low, Medium, High (drag, or type the word or 1 to 3).
+            Some(_) => with_type(&mut cell, Type::Body, |ui| {
+                let words: [&'static str; 3] = [tr!("Low"), tr!("Medium"), tr!("High")];
+                let dv = egui::DragValue::new(&mut v)
+                    .speed(0.03)
+                    .range(range)
+                    .custom_formatter(move |n, _| words.get((n.round() as usize).clamp(1, 3) - 1).copied().unwrap_or_default().to_string())
+                    .custom_parser(move |s| words.iter().position(|w| w.eq_ignore_ascii_case(s.trim())).map(|i| (i + 1) as f64).or_else(|| s.trim().parse::<f64>().ok()));
+                ui.add_sized(vec2(field.width(), field.height()), dv).named(label)
+            }),
+            None => with_type(&mut cell, Type::Data, |ui| ui.add_sized(vec2(field.width(), field.height()), egui::DragValue::new(&mut v).speed(speed).range(range).max_decimals(1).suffix(suffix)).named(label)),
+        };
+        if p.is_stepped() {
+            v = v.round();
+        }
+        if r.changed() && (!p.is_stepped() || (v - now_of(p)).abs() > 0.5) {
             app.me_prop = p;
             app.s.begin_gesture(tr_noop!("Property keyframe"));
             app.run("motion.set_key", json!({"property": p.key(), "frame": app.s.frame, "value": v}));
         }
-        if r.drag_stopped() {
+        // A switch is one click: its undo step ends with it.
+        if r.drag_stopped() || (r.changed() && p.is_stepped() && !r.dragged()) {
             app.s.end_gesture();
         }
         // Key toggle: a filled diamond where this property has a key at the playhead.
@@ -302,13 +400,25 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     // ---- graph -----------------------------------------------------------------------------
     let p = app.me_prop;
     let track = m.track(p);
-    let label = match p.filter() {
-        Some(f) => tr!("{filter}: {property}", filter = crate::i18n::t(filter_name(&target, f.slot)), property = crate::i18n::t(p.label())),
-        None => crate::i18n::t(p.label()).to_string(),
-    };
+    let label = prop_name(&target, p, true);
     let (lo, hi) = match app.me_drag {
         Some(MeDrag::Key { lo, hi, lane: false, .. } | MeDrag::Handle { lo, hi, .. }) => (lo, hi),
         _ => value_range(track, own(p), frames, p),
+    };
+    // Keep area (ADR 0115): a scale curve shows as the tween plays it, geometric between its
+    // keys, or derived from the other axis when it has no keys of its own.
+    let kept = m.keep_area && matches!(p, Property::ScaleX | Property::ScaleY);
+    let shown = |f: f32| if kept { m.shown_value(&base, p, f) } else { track.and_then(|t| t.value_at(f)).unwrap_or(own(p)) };
+    let (lo, hi) = if kept && app.me_drag.is_none() {
+        let (mut a, mut b) = (lo, hi);
+        for f in 0..frames.max(1) {
+            let v = shown(f as f32);
+            (a, b) = (a.min(v), b.max(v));
+        }
+        let pad = if a < lo || b > hi { (b - a).max(1.0) * 0.08 } else { 0.0 };
+        (if a < lo { a - pad } else { lo }, if b > hi { b + pad } else { hi })
+    } else {
+        (lo, hi)
     };
     let last = frames.saturating_sub(1).max(1) as f32;
     // Wider on the left: the value labels sit there, clear of the first key.
@@ -357,21 +467,49 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let mut x = inner.left();
     while x <= inner.right() + 0.5 {
         let f = f_of(x);
-        let v = track.and_then(|t| t.value_at(f)).unwrap_or(own(p));
-        pts.push(pos2(x, y_of(v)));
+        pts.push(pos2(x, y_of(shown(f))));
         x += 2.0;
     }
-    gp.add(egui::Shape::line(pts, Stroke::new(2.0, if track.is_some() { T.tween_motion } else { T.text_faint })));
+    let derived = m.is_derived(p);
+    gp.add(egui::Shape::line(pts, Stroke::new(2.0, if track.is_some() || derived { T.tween_motion } else { T.text_faint })));
     gp.text(pos2(graph.right() - 8.0, graph.top() + 6.0), Align2::RIGHT_TOP, format!("{label} · {}", fmt(p, now_of(p))), font(Type::Data), color(Type::Data));
-    if track.is_none() {
+    if kept {
+        // Say why the curve isn't the straight line between its keys.
+        let note = match (derived, p) {
+            (true, Property::ScaleX) => tr!("Keep area: follows Scale Y"),
+            (true, _) => tr!("Keep area: follows Scale X"),
+            (false, _) => tr!("Keep area"),
+        };
+        gp.text(pos2(graph.right() - 8.0, graph.top() + 24.0), Align2::RIGHT_TOP, note, font(Type::Caption), color(Type::Caption));
+    }
+    if derived {
+        // No keys of its own, but it moves: say what moves it and how to take it over.
+        gp.text(pos2(graph.center().x, graph.top() + 44.0), Align2::CENTER_CENTER, tr!("{property} has no keyframes: Keep area moves it against the other scale axis. Click ◇ or drag its value to key it yourself.", property = label), font(Type::Caption), color(Type::Caption));
+    } else if track.is_none() {
         gp.text(graph.center(), Align2::CENTER_CENTER, tr!("{property} has no keyframes: it stays {value}. Click ◇ or drag its value to key it here.", property = label, value = fmt(p, own(p))), font(Type::Caption), color(Type::Caption));
+    }
+    // A colour's channel: the whole colour over the span, along the bottom of the graph, so
+    // the four curves read as the colour they make (ADR 0099).
+    if let Some((f, (c, _))) = p.filter().and_then(|f| Some((f, f.param.color()?))) {
+        let strip = Rect::from_min_max(pos2(inner.left(), graph.bottom() - 10.0), pos2(inner.right(), graph.bottom() - 3.0));
+        let step = (strip.width() / 160.0).max(3.0);
+        let mut x = strip.left();
+        while x < strip.right() {
+            let x1 = (x + step).min(strip.right());
+            if let Some(rgba) = colour_of(&m.apply(&target, f_of((x + x1) * 0.5)), f.slot, c) {
+                gp.rect_filled(Rect::from_min_max(pos2(x, strip.top()), pos2(x1, strip.bottom())), 0.0, crate::theme::to_color32(rgba));
+            }
+            x = x1;
+        }
+        gp.rect_stroke(strip, 0.0, Stroke::new(1.0, T.border), egui::StrokeKind::Outside);
     }
 
     // Keys and the selected segment's handles.
     let keys: Vec<(u32, f32, Easing)> = track.map(|t| t.keys.iter().filter(|k| k.frame < frames).map(|k| (k.frame, k.value, k.ease.clone())).collect()).unwrap_or_default();
     // The selected key: the one picked, else the one starting the segment at the playhead.
     let sel_key = app.me_key.filter(|f| keys.iter().any(|k| k.0 == *f)).or_else(|| keys.iter().rev().find(|k| k.0 <= offset).map(|k| k.0));
-    let handles: Option<[Pos2; 4]> = sel_key.and_then(|f| {
+    // A stepped property holds its keys: no ease, so no handles (ADR 0099).
+    let handles: Option<[Pos2; 4]> = sel_key.filter(|_| !p.is_stepped()).and_then(|f| {
         let i = keys.iter().position(|k| k.0 == f)?;
         let (a, b) = (keys.get(i)?, track?.keys.get(i + 1)?);
         // Eases one curve can't draw (Bounce, Elastic, custom curves) are shaped in the
@@ -596,7 +734,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     {
         // A key on the curve where it is now (the motion doesn't change until it is dragged).
         let f = to_frame(pt.x);
-        let v = track.and_then(|t| t.value_at((f - start) as f32)).unwrap_or(own(p));
+        let v = shown((f - start) as f32);
         if app.run("motion.set_key", json!({"property": p.key(), "frame": f, "value": v})).is_some() {
             app.me_key = Some(f - start);
         }
@@ -609,15 +747,79 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         };
     }
 
-    footer(app, ui, body, track, sel_key, start, &rows, &label);
+    footer(app, ui, body, track, sel_key, start, &rows, &label, m.keep_area);
 }
 
 /// The name of the object's filter at `slot` (Animate's, for the list and screen readers).
 fn filter_name(target: &Element, slot: u8) -> &'static str {
-    match &target.kind {
-        ElementKind::Symbol { filters, .. } => filters.get(usize::from(slot)).map_or("Filter", |e| e.filter.label()), // i18n-exempt: translated where drawn (i18n::t)
-        _ => "Filter", // i18n-exempt: translated where drawn (i18n::t)
+    match target.kind.filters() {
+        Some(filters) => filters.get(usize::from(slot)).map_or("Filter", |e| e.filter.label()), // i18n-exempt: translated where drawn (i18n::t)
+        None => "Filter", // i18n-exempt: translated where drawn (i18n::t)
     }
+}
+
+/// A filter colour's row (ADR 0099): its name with a mark that opens its channels, a swatch
+/// showing the colour at the playhead (picking one keys all four channels there, one undo step
+/// a pick) and a diamond that adds or removes the four keys.
+#[allow(clippy::too_many_arguments)]
+fn colour_row(app: &mut App, ui: &mut egui::Ui, painter: &egui::Painter, row: Rect, r: usize, m: &MotionTween, target: &Element, at: &Element, offset: u32, slot: u8, c: FilterColor) {
+    let four = channels(slot, c);
+    let open = app.me_open.contains(&(slot, c));
+    let any_track = four.iter().any(|p| m.track(*p).is_some());
+    painter.rect_filled(row, 0.0, if r.is_multiple_of(2) { T.panel } else { T.panel_alt });
+    // The mark: pointing right when closed, down when its channels show.
+    let tip = pos2(row.left() + 16.0, row.center().y);
+    let tri = if open { vec![tip + vec2(-4.0, -2.5), tip + vec2(4.0, -2.5), tip + vec2(0.0, 3.5)] } else { vec![tip + vec2(-2.5, -4.0), tip + vec2(3.5, 0.0), tip + vec2(-2.5, 4.0)] };
+    painter.add(egui::Shape::convex_polygon(tri, T.text_dim, Stroke::NONE));
+    let name = colour_name(c);
+    painter.text(pos2(row.left() + 26.0, row.center().y), Align2::LEFT_CENTER, &name, font(Type::Body), if any_track { T.text } else { T.text_dim });
+    if any_track {
+        painter.text(pos2(row.left() + 84.0, row.center().y), Align2::LEFT_CENTER, tr!("keyed"), font(Type::Caption), T.tween_motion);
+    }
+    let key = format!("filter.{slot}.{}", c.key());
+    let full = tr!("{filter}: {colour}", filter = crate::i18n::t(filter_name(target, slot)), colour = name);
+    let rr = ui.interact(row, ui.id().with(("me_colour", slot, c)), Sense::click());
+    a11y::control(ui, &rr, WidgetType::CollapsingHeader, &if any_track { tr!("{property} · keyed", property = full.as_str()) } else { full.clone() }, Some(open));
+    if rr.clicked() {
+        if open {
+            app.me_open.retain(|o| *o != (slot, c));
+        } else {
+            app.me_open.push((slot, c));
+            // Its first channel's curve shows, with the colour along the graph's foot.
+            if let Some(red) = four.first() {
+                app.me_prop = *red;
+                app.me_key = None;
+            }
+        }
+    }
+    // The colour at the playhead: pick one to key it there.
+    let field = Rect::from_min_size(pos2(row.right() - 128.0, row.top() + 3.0), vec2(88.0, ROW_H - 6.0));
+    let now = colour_of(at, slot, c).unwrap_or(Rgba::BLACK);
+    let mut picked = now;
+    let mut cell = ui.new_child(egui::UiBuilder::new().max_rect(field).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    if crate::panels::alpha_swatch(&mut cell, &mut picked, &full) {
+        app.s.begin_gesture(tr_noop!("Filter colour keyframe"));
+        app.run("motion.set_key", json!({"property": key, "frame": app.s.frame, "color": hex8(picked)}));
+        app.s.end_gesture();
+    }
+    // The diamond: filled where all four channels have a key at the playhead.
+    let keyed = four.iter().all(|p| m.track(*p).is_some_and(|t| t.key_at(offset).is_some()));
+    let toggle = Rect::from_center_size(pos2(row.right() - 20.0, row.center().y), vec2(24.0, 24.0));
+    let tr = ui.interact(toggle, ui.id().with(("me_colour_key", slot, c)), Sense::click());
+    if tr.hovered() {
+        painter.rect_filled(toggle, T.rc(), T.hover);
+    }
+    diamond(painter, toggle.center(), 5.0, if keyed { T.text } else { Color32::TRANSPARENT }, Stroke::new(1.5, if keyed { T.text } else { T.text_faint }));
+    let tip = if keyed { tr!("Remove the {property} keyframe at frame {frame}", property = full.as_str(), frame = app.s.frame + 1) } else { tr!("Add a {property} keyframe at frame {frame}", property = full.as_str(), frame = app.s.frame + 1) };
+    a11y::control(ui, &tr, WidgetType::Checkbox, &tr!("{property} keyframe at frame {frame}", property = full.as_str(), frame = app.s.frame + 1), Some(keyed));
+    if tr.on_hover_text(tip).clicked() {
+        if keyed {
+            app.run("motion.remove_key", json!({"property": key, "frame": app.s.frame}));
+        } else {
+            app.run("motion.set_key", json!({"property": key, "frame": app.s.frame, "color": hex8(now)}));
+        }
+    }
+    painter.line_segment([row.left_bottom(), row.right_bottom()], Stroke::new(1.0, T.separator));
 }
 
 /// Picks `keys` (every property's keys on one frame): instead of the pick, or added to it.
@@ -711,7 +913,7 @@ fn diamond(p: &egui::Painter, c: Pos2, r: f32, fill: Color32, stroke: Stroke) {
 
 /// The ease of the selected segment, and the tween's own actions.
 #[allow(clippy::too_many_arguments)]
-fn footer(app: &mut App, ui: &mut egui::Ui, body: Rect, track: Option<&Track>, sel_key: Option<u32>, start: u32, rows: &[Property], label: &str) {
+fn footer(app: &mut App, ui: &mut egui::Ui, body: Rect, track: Option<&Track>, sel_key: Option<u32>, start: u32, rows: &[Property], label: &str, keep_area: bool) {
     let bar = Rect::from_min_max(pos2(body.left(), body.bottom() - FOOTER_H), body.right_bottom());
     ui.painter().rect_filled(bar, SQUARE, T.panel_alt);
     ui.painter().line_segment([bar.left_top(), bar.right_top()], Stroke::new(1.0, T.border));
@@ -721,6 +923,10 @@ fn footer(app: &mut App, ui: &mut egui::Ui, body: Rect, track: Option<&Track>, s
     let seg = sel_key.zip(track).and_then(|(f, t)| t.key_at(f).filter(|i| *i + 1 < t.keys.len()).and_then(|i| t.keys.get(i)).map(|k| (f, k.ease.clone())));
     ui.label(text(Type::Label, tr!("{property} ease", property = label)));
     match seg {
+        // Quality and the switches hold their keys (ADR 0099).
+        _ if p.is_stepped() => {
+            ui.label(text(Type::Caption, tr!("Holds each key until the next one (no ease)")));
+        }
         Some((f, ease)) => {
             // The presets and the saved eases (ADR 0081); Edit Ease… shapes the segment's curve.
             match crate::ease_editor::picker(app, ui, "me_ease", &ease, 160.0, tr!("Ease")) {
@@ -757,6 +963,10 @@ fn footer(app: &mut App, ui: &mut egui::Ui, body: Rect, track: Option<&Track>, s
         .response
         .on_hover_text(tr!("List a colour effect style's properties here; keying one adds it to the tween"));
     }
+    let mut keep = keep_area;
+    if crate::theme::checkbox(ui, &mut keep, tr!("Keep area")).on_hover_text(tr!("Squash and stretch without growing: scale goes geometrically between keys, and a scale axis without keys follows the other so the area stays")).named(tr!("Keep area")).changed() {
+        app.run("timeline.set_keep_area", json!({"keep_area": keep, "frame": start}));
+    }
     if ui.button(tr!("Remove Tween")).on_hover_text(tr!("The object stays as it is on the span's first frame ({undo} to undo)", undo = app.undo_key())).clicked() {
         app.run("timeline.remove_tween", json!({}));
     }
@@ -792,16 +1002,35 @@ mod tests {
     /// colour effect.
     #[test]
     fn filters_list_their_numbers_under_their_names() {
-        use anicraft_engine::doc::{ColorEffect, ElementId, Filter, FilterEntry, SymbolId};
+        use anicraft_engine::doc::{ColorEffect, ElementId, ElementKind, Filter, FilterEntry, SymbolId};
         use anicraft_engine::geom::Affine;
         let filters = vec![FilterEntry::from(Filter::new("blur").unwrap()), FilterEntry { filter: Filter::new("adjust_color").unwrap(), enabled: false }];
-        let clip = Element { id: ElementId(1), name: String::new(), transform: Affine::IDENTITY, color: ColorEffect::default(), kind: ElementKind::Symbol { symbol: SymbolId(1), loop_mode: Default::default(), first_frame: 0, blend: Default::default(), filters, events: Vec::new() } };
-        let rows = rows_for(&[], &[], &clip);
-        let names: Vec<String> = rows.iter().skip_while(|r| matches!(r, Row::Prop(p) if !p.is_filter())).map(|r| match r {
-            Row::Filter(slot, name, on) => format!("[{slot} {name} {on}]"),
-            Row::Prop(p) => p.key().into_owned(),
-        }).collect();
-        assert_eq!(names, ["[0 Blur true]", "filter.0.blur_x", "filter.0.blur_y", "[1 Adjust Color false]", "filter.1.brightness", "filter.1.contrast", "filter.1.saturation", "filter.1.hue"]);
+        let clip = Element { id: ElementId(1), name: String::new(), transform: Affine::IDENTITY, color: ColorEffect::default(), kind: ElementKind::Symbol { symbol: SymbolId(1), loop_mode: Default::default(), first_frame: 0, blend: Default::default(), filters, events: Vec::new(), pivot: None } };
+        let names = |rows: Vec<Row>| -> Vec<String> {
+            rows.iter()
+                .skip_while(|r| matches!(r, Row::Prop(p) if !p.is_filter()))
+                .map(|r| match r {
+                    Row::Filter(slot, name, on) => format!("[{slot} {name} {on}]"),
+                    Row::Colour(slot, c) => format!("({slot} {})", c.key()),
+                    Row::Prop(p) => p.key().into_owned(),
+                })
+                .collect()
+        };
+        assert_eq!(names(rows_for(&[], &[], &clip, &[])), ["[0 Blur true]", "filter.0.blur_x", "filter.0.blur_y", "filter.0.quality", "[1 Adjust Color false]", "filter.1.brightness", "filter.1.contrast", "filter.1.saturation", "filter.1.hue"]);
+        // ADR 0099: a colour is one row; its channels are listed when it is open; quality and
+        // the switches come last.
+        let glow = Element { kind: ElementKind::Symbol { symbol: SymbolId(1), loop_mode: Default::default(), first_frame: 0, blend: Default::default(), filters: vec![Filter::new("glow").unwrap().into()], events: Vec::new(), pivot: None }, ..clip.clone() };
+        assert_eq!(names(rows_for(&[], &[], &glow, &[])), ["[0 Glow true]", "filter.0.blur_x", "filter.0.blur_y", "filter.0.strength", "(0 color)", "filter.0.quality", "filter.0.inner", "filter.0.knockout"]);
+        let open = names(rows_for(&[], &[], &glow, &[(0, FilterColor::Color)]));
+        assert_eq!(open[4..9], ["(0 color)", "filter.0.color_red", "filter.0.color_green", "filter.0.color_blue", "filter.0.color_alpha"]);
+        assert_eq!(prop_name(&glow, Property::from_key("filter.0.color_red").unwrap(), true), "Glow: Colour · Red");
+        assert_eq!(prop_name(&glow, Property::from_key("filter.0.color_red").unwrap(), false), "Red");
+        assert_eq!(colour_name(FilterColor::Stop(1)), "Stop 2");
+        assert_eq!(stepped_text(Property::from_key("filter.0.knockout").unwrap(), 1.0).as_deref(), Some("On"));
+        assert_eq!(stepped_text(Property::from_key("filter.0.quality").unwrap(), 2.0).as_deref(), Some("Medium"));
+        assert_eq!(stepped_text(Property::X, 2.0), None);
+        // A colour goes to commands with its alpha.
+        assert_eq!(hex8(Rgba::hex(0xff8000).with_alpha(0.5)), "#ff800080");
         assert_eq!(filter_name(&clip, 1), "Adjust Color");
         assert_eq!(filter_name(&clip, 7), "Filter");
     }

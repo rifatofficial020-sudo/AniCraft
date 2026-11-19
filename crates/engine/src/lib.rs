@@ -11,6 +11,7 @@ mod cmds_bone;
 mod cmds_warp;
 pub mod cmds_brush;
 mod cmds_camera;
+mod parenting;
 mod cmds_draw;
 pub mod cmds_filter;
 pub mod cmds_ease;
@@ -21,11 +22,16 @@ mod cmds_file;
 mod cmds_frames;
 mod cmds_group;
 mod cmds_modify;
+#[cfg(test)]
+mod origin_tests;
+#[cfg(test)]
+mod pivot_tests;
 mod cmds_motion;
 mod cmds_retime;
 mod cmds_hints;
 mod cmds_layer;
 pub mod cmds_library;
+pub mod cmds_macro;
 pub mod cmds_paint;
 mod cmds_path;
 pub mod cmds_raw;
@@ -41,11 +47,13 @@ mod cmds_script;
 pub mod cmds_plugin;
 mod cmds_scene;
 pub mod cmds_sound;
+pub mod cmds_audio_keys;
 pub mod cmds_text;
 mod cmds_timeline;
 mod cmds_view;
 mod cmds_width;
 mod cmds_stroke;
+pub mod cmds_shape;
 pub mod cmds_swatch;
 pub mod confirm;
 pub mod editing;
@@ -60,13 +68,16 @@ pub mod recovery;
 pub mod render_service;
 pub mod selection;
 pub mod snap;
+pub mod transfer;
 pub mod params;
 pub mod plugin_export;
 pub mod player;
 pub mod publish;
 pub mod vfs;
 
-use anicraft_doc::{DisplayList, Document, Element, ElementId, ElementKind, Keyframe, Layer, LayerId, LayerKind, evaluate_layer_elements, evaluate_scene};
+use anicraft_doc::{DisplayList, Document, Element, ElementId, ElementKind, Keyframe, Layer, LayerId, LayerKind, evaluate_scene};
+#[cfg(test)]
+use anicraft_doc::evaluate_layer_elements;
 use anicraft_geom::{Affine, Rect, Vec2};
 use serde_json::{Value, json};
 use history::History;
@@ -79,9 +90,11 @@ pub use anicraft_plugins as plugins;
 pub use anicraft_text as text;
 pub use anicraft_geom as geom;
 pub use anicraft_render as render;
+pub use anicraft_svg as svg;
 /// Whether a path is an Animate document (`.fla`, `.xfl`, or an XFL folder) that `file.open`
 /// imports.
 pub use cmds_file::is_animate;
+pub use cmds_modify::{Item as SelectedItem, transform_origins};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -145,6 +158,7 @@ pub fn commands() -> Vec<CommandSpec> {
     v.extend(cmds_timeline::specs());
     v.extend(cmds_layer::specs());
     v.extend(cmds_camera::specs());
+    v.extend(parenting::specs());
     v.extend(cmds_bone::specs());
     v.extend(cmds_warp::specs());
     v.extend(cmds_motion::specs());
@@ -176,10 +190,13 @@ pub fn commands() -> Vec<CommandSpec> {
     v.extend(cmds_text::specs());
     v.extend(cmds_width::specs());
     v.extend(cmds_stroke::specs());
+    v.extend(cmds_shape::specs());
     v.extend(cmds_plugin::specs());
     v.extend(cmds_sound::specs());
+    v.extend(cmds_audio_keys::specs());
     v.extend(cmds_actions::specs());
     v.extend(cmds_script::specs());
+    v.extend(cmds_macro::specs());
     v
 }
 
@@ -195,10 +212,23 @@ pub const SHORTCUT_ALIASES: &[(&str, &str)] = &[
 ];
 
 pub fn find_command(id: &str) -> Option<CommandSpec> {
-    commands().into_iter().find(|c| c.id == id)
+    // Built once: every command run looks itself up, and a saved command checks each of its
+    // steps (ADR 0097), so this must not rebuild the registry per call.
+    static INDEX: std::sync::OnceLock<std::collections::HashMap<&'static str, CommandSpec>> = std::sync::OnceLock::new();
+    INDEX
+        .get_or_init(|| {
+            let mut m = std::collections::HashMap::new();
+            for c in commands() {
+                // The first of a repeated id wins, as a search in registry order finds it.
+                m.entry(c.id).or_insert(c);
+            }
+            m
+        })
+        .get(id)
+        .copied()
 }
 
-pub use history::{Snapshot, StateId};
+pub use history::{Recorded, Snapshot, StateId};
 pub use selection::Selection;
 pub use snap::{Accuracy, SnapTo, ViewAids};
 pub use cmds_layer::LAYER_COLORS;
@@ -206,7 +236,7 @@ pub use cmds_layer::LAYER_COLORS;
 /// The command namespaces that change a timeline's layers and frames, refused while a group is
 /// open for editing (ADR 0073): a group is one layer and one frame. A name ending in `.` is a
 /// namespace, any other one command.
-const GROUP_REFUSES: &[&str] = &["timeline.", "layer.", "camera.", "bone.", "motion.", "tween.", "frames.", "sound.place", "script.set", "script.clear"];
+const GROUP_REFUSES: &[&str] = &["timeline.", "layer.", "camera.", "bone.", "motion.", "tween.", "frames.", "sound.place", "sound.to_keyframes", "sound.lip_sync", "script.set", "script.clear"];
 
 /// Last addressable frame (0-based); about 70 minutes at 24 fps.
 pub const MAX_FRAME: u32 = 100_000;
@@ -260,11 +290,52 @@ pub struct ToolStyle {
     /// Snap to Objects (Animate's magnet, ADR 0042): dragged points and selections snap to
     /// points, lines and fill edges nearby. On by default; off, the `snap` params do nothing.
     pub snap_objects: bool,
+    /// What several selected objects turn, scale and skew about with Free Transform and
+    /// Modify › Transform (ADR 0109). The whole selection's point by default, as in Animate.
+    pub transform_origin: TransformOrigin,
+}
+
+/// What several selected objects are transformed about (ADR 0109, issue #296).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TransformOrigin {
+    /// One point for the whole selection: the objects turn and scale as one arrangement.
+    #[default]
+    Selection,
+    /// Each object about its own point: a symbol instance's or a group's registration point,
+    /// and the centre of anything else (a shape, a drawing, a bitmap, text).
+    Registration,
+    /// Each object about the centre of its own box, wherever its registration point is.
+    Center,
+}
+
+impl TransformOrigin {
+    pub const ALL: [TransformOrigin; 3] = [TransformOrigin::Selection, TransformOrigin::Registration, TransformOrigin::Center];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            TransformOrigin::Selection => "selection",
+            TransformOrigin::Registration => "registration",
+            TransformOrigin::Center => "center",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<TransformOrigin> {
+        TransformOrigin::ALL.into_iter().find(|m| m.key() == key)
+    }
+
+    /// The mode after this one (the cycling shortcut).
+    pub fn next(self) -> TransformOrigin {
+        match self {
+            TransformOrigin::Selection => TransformOrigin::Registration,
+            TransformOrigin::Registration => TransformOrigin::Center,
+            TransformOrigin::Center => TransformOrigin::Selection,
+        }
+    }
 }
 
 impl Default for ToolStyle {
     fn default() -> Self {
-        ToolStyle { fill: anicraft_doc::Rgba::hex(0x3d8bfd), fill_paint: None, lock_fill: false, stroke: anicraft_doc::Rgba::hex(0x1b2a4a), stroke_width: 2.0, use_fill: true, use_stroke: true, stroke_profile: anicraft_doc::ProfilePreset::Uniform, custom_profile: None, line: anicraft_doc::StrokeStyle::default(), object_drawing: true, snap_objects: true }
+        ToolStyle { fill: anicraft_doc::Rgba::hex(0x3d8bfd), fill_paint: None, lock_fill: false, stroke: anicraft_doc::Rgba::hex(0x1b2a4a), stroke_width: 2.0, use_fill: true, use_stroke: true, stroke_profile: anicraft_doc::ProfilePreset::Uniform, custom_profile: None, line: anicraft_doc::StrokeStyle::default(), object_drawing: true, snap_objects: true, transform_origin: TransformOrigin::Selection }
     }
 }
 
@@ -343,6 +414,11 @@ pub struct Session {
     pub ease_clipboard: Option<anicraft_doc::Easing>,
     /// A command is editing a motion tween's target (auto-key, ADR 0016).
     motion_edit: Option<cmds_motion::MotionEdit>,
+    /// Layer parenting (ADR 0113): the layer spaces the running command started with, the
+    /// keyframes it was handed in stage space, and the layers whose parent it set itself.
+    rig_cmd: Option<parenting::RigCmd>,
+    rig_edits: Vec<parenting::RigEdit>,
+    pub(crate) rig_handled: Vec<LayerId>,
     /// Installed WebAssembly plug-ins (ADR 0017). They belong to the session, not the
     /// document: they survive New and Open.
     pub plugins: anicraft_plugins::Registry,
@@ -351,6 +427,10 @@ pub struct Session {
     pub(crate) step_label: Option<String>,
     /// A marquee's cut that nothing has used yet (ADR 0041).
     provisional: Option<Provisional>,
+    /// Fills and strokes turned off in this session, for turning them on again (#292, #393).
+    pub(crate) paint_memory: PaintMemory,
+    /// Raw shapes a paste left floating (`edit.paste {float: true}`, as the editor pastes).
+    pub(crate) floating: Option<Floating>,
     /// Set by `raw.select_rect` when it cut: each piece and the shape it was cut from, and the
     /// pieces inside the marquee.
     pub(crate) pending_cut: Option<(CutOrigin, Vec<ElementId>)>,
@@ -380,10 +460,57 @@ pub struct Session {
     pub filter_clipboard: Option<Vec<anicraft_doc::FilterEntry>>,
     /// The open envelope (ADR 0080): view state over the shapes it bends, like a gesture.
     pub(crate) envelope: Option<cmds_envelope::Envelope>,
+    /// The commands run since the last undo step was recorded, which the next step keeps so it
+    /// can be saved as a command (ADR 0097).
+    rec: history::Recording,
+    /// How many commands were recorded when the open gesture began (a revert goes back there).
+    gesture_rec: usize,
+    /// What the running command records instead of itself (`macro.run` records its steps).
+    pub(crate) record_as: Option<Vec<Recorded>>,
+    /// Which open document this is (ADR 0112): a number no other document in this process has,
+    /// new with every New and Open. A copy remembers it, so a paste knows whether the artwork
+    /// came from this document or another.
+    pub origin: u64,
+    /// Symbols pastes brought in from other documents, so the same one isn't brought twice.
+    pub(crate) brought: Vec<transfer::Brought>,
 }
 
 /// Each piece of a marquee's cut, with the shape it was cut from.
 pub(crate) type CutOrigin = Vec<(ElementId, ElementId)>;
+
+/// The fill and the stroke each shape had when it was turned off (the Fill and Stroke
+/// checkboxes in Properties), so turning it on again brings back that colour, gradient or line
+/// rather than a default (#292). A convenience of the session: it is not saved or undone.
+#[derive(Default)]
+pub(crate) struct PaintMemory {
+    pub(crate) fills: std::collections::HashMap<ElementId, anicraft_doc::Paint>,
+    pub(crate) strokes: std::collections::HashMap<ElementId, anicraft_doc::Stroke>,
+}
+
+impl PaintMemory {
+    /// Bounded: past this many shapes it starts over.
+    const MAX: usize = 10_000;
+    pub(crate) fn remember_fill(&mut self, id: ElementId, fill: anicraft_doc::Paint) {
+        if self.fills.len() >= Self::MAX {
+            self.fills.clear();
+        }
+        self.fills.insert(id, fill);
+    }
+    pub(crate) fn remember_stroke(&mut self, id: ElementId, stroke: anicraft_doc::Stroke) {
+        if self.strokes.len() >= Self::MAX {
+            self.strokes.clear();
+        }
+        self.strokes.insert(id, stroke);
+    }
+}
+
+/// Raw shapes a paste put on top of the drawing without merging them (#391): each with its
+/// layer, and the frame they were pasted on. They merge when none of them is selected any more.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Floating {
+    pub(crate) items: Vec<(LayerId, ElementId)>,
+    pub(crate) frame: u32,
+}
 
 /// A marquee's cut that nothing has used yet (ADR 0041). In Animate a marquee only selects: the
 /// drawing is cut where it crosses once the selection is moved or changed. Here the cut happens
@@ -441,9 +568,14 @@ impl Session {
             frame_clipboard: cmds_frames::FrameClipboard::default(),
             ease_clipboard: None,
             motion_edit: None,
+            rig_cmd: None,
+            rig_edits: Vec::new(),
+            rig_handled: Vec::new(),
             plugins: anicraft_plugins::Registry::default(),
             step_label: None,
             provisional: None,
+            paint_memory: PaintMemory::default(),
+            floating: None,
             pending_cut: None,
             gesture_cut: None,
             hit_area: None,
@@ -455,6 +587,11 @@ impl Session {
             filter_presets: filter_library::FilterLibrary::default(),
             filter_clipboard: None,
             envelope: None,
+            rec: history::Recording::default(),
+            gesture_rec: 0,
+            record_as: None,
+            origin: transfer::fresh_origin(),
+            brought: Vec::new(),
         }
     }
 
@@ -497,6 +634,7 @@ impl Session {
         }
         // On a marquee's cut, the step (if the gesture makes one) starts from before the cut.
         let cut = self.live_cut().map(|p| (history::Snapshot { label: label.to_string(), ..p.before.clone() }, p.cut.clone()));
+        self.gesture_rec = self.rec.cmds.len();
         match cut {
             Some((before, doc)) => {
                 self.gesture_cut = Some(doc);
@@ -520,8 +658,17 @@ impl Session {
             }
             self.provisional = None;
         }
+        self.record(before);
+    }
+
+    /// Records `before` as the undo step to the current document, with the commands run since
+    /// the last step; an unchanged document records nothing and forgets them.
+    fn record(&mut self, mut before: Snapshot) {
         if self.doc != before.doc {
+            before.commands = self.rec.take();
             self.history.record(before, &self.doc);
+        } else {
+            self.rec.clear();
         }
     }
 
@@ -555,6 +702,36 @@ impl Session {
         self.history.budget_bytes = budget;
     }
 
+    /// Drops what the session keeps only to draw faster (its display list and the picture of an
+    /// open symbol in place): a document put aside while another is shown keeps none (ADR 0112).
+    pub fn drop_caches(&self) {
+        self.dl_cache.replace(None);
+        self.picture_cache.replace(None);
+    }
+
+    /// Takes over from `from` what belongs to the editor rather than to one document (ADR
+    /// 0112): the clipboards, the tool style, the plug-ins, recent files, brushes and filter
+    /// presets, and how the rulers, grid and guides show. An editor with several documents open
+    /// calls it when it turns to another one, so a copy made in one pastes into the next and the
+    /// tools stay as they were. The documents, their undo histories, selections and playheads
+    /// stay where they are; `from` is left with this session's (usually empty) share.
+    pub fn take_shared(&mut self, from: &mut Session) {
+        use std::mem::swap;
+        swap(&mut self.style, &mut from.style);
+        swap(&mut self.aids, &mut from.aids);
+        swap(&mut self.text_style, &mut from.text_style);
+        swap(&mut self.clipboard, &mut from.clipboard);
+        swap(&mut self.frame_clipboard, &mut from.frame_clipboard);
+        swap(&mut self.ease_clipboard, &mut from.ease_clipboard);
+        swap(&mut self.filter_clipboard, &mut from.filter_clipboard);
+        swap(&mut self.plugins, &mut from.plugins);
+        swap(&mut self.recent, &mut from.recent);
+        swap(&mut self.brushes, &mut from.brushes);
+        swap(&mut self.filter_presets, &mut from.filter_presets);
+        self.hit_area = from.hit_area;
+        self.history.budget_bytes = from.history.budget_bytes;
+    }
+
     /// Runs a command by id. Mutating commands are atomic: on error the document is restored.
     pub fn execute(&mut self, id: &str, params: &Value) -> Result<Value> {
         let spec = find_command(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
@@ -565,15 +742,13 @@ impl Session {
         {
             return Err(EngineError::NeedsConfirmation(format!("{} {} (pass \"confirm\": true to proceed)", c.title, c.message)));
         }
-        // A group open for editing is one layer and one frame (ADR 0073).
-        if spec.mutates && self.editing_group() && GROUP_REFUSES.iter().any(|ns| if ns.ends_with('.') { id.starts_with(ns) } else { id == *ns }) {
-            return Err(EngineError::State("a group has one layer and one frame: close it (Edit › Edit Document) to change the timeline, or convert it to a symbol (F8) to animate inside it".into()));
-        }
+        self.group_allows(&spec)?;
         self.settle_cut(id, params);
         if !spec.mutates {
             let r = (spec.run)(self, params);
             self.settle_cut(id, params);
             self.hold_group_frame();
+            self.settle_floating();
             return r;
         }
         // An edit on a marquee's cut records its step from before the cut (ADR 0041).
@@ -588,13 +763,19 @@ impl Session {
         self.pending_cut = None;
         self.motion_edit = None;
         self.step_label = None;
+        self.record_as = None;
+        // Layers that follow a parent layer are edited in stage space (ADR 0113).
+        let rig = self.rig_begin();
         let result = (spec.run)(self, params);
+        let record_as = self.record_as.take();
+        self.settle_rig();
         // Edits to a motion tween's target become property keys (auto-key).
         if let Some(edit) = self.motion_edit.take()
             && result.is_ok()
         {
             cmds_motion::finish_edit(self, edit);
         }
+        self.rig_end(rig);
         self.dl_cache.replace(None);
         if let Some(label) = self.step_label.take() {
             before.label = label;
@@ -610,6 +791,10 @@ impl Session {
                 if changed {
                     self.state = history::fresh_state();
                     self.revision += 1;
+                    match record_as {
+                        Some(steps) => steps.into_iter().for_each(|r| self.rec.push(r)),
+                        None => self.rec.push(Recorded::new(id, params)),
+                    }
                     match pending.filter(|_| self.gesture.is_none()) {
                         // A marquee's cut: provisional, no step (yet).
                         Some((origin, inside)) => self.begin_cut(before, cut.is_some(), origin, inside),
@@ -617,14 +802,15 @@ impl Session {
                             if cut.is_some() {
                                 self.provisional = None;
                             }
-                            if self.gesture.is_none() && self.doc != before.doc {
-                                self.history.record(before, &self.doc);
+                            if self.gesture.is_none() {
+                                self.record(before);
                             }
                         }
                     }
                 }
                 self.fix_selection();
                 self.hold_group_frame();
+                self.settle_floating();
                 Ok(v)
             }
             Err(e) => {
@@ -633,6 +819,55 @@ impl Session {
                 Err(e)
             }
         }
+    }
+
+    /// Merges floating pasted shapes into the drawing once the selection has let go of them
+    /// (#391; in Animate pasted raw artwork stays apart until it is deselected). The merge is
+    /// part of the step around it: undoing the paste brings back the drawing from before it,
+    /// and undoing a command that deselected them brings them back floating and selected.
+    fn settle_floating(&mut self) {
+        let Some(f) = self.floating.as_ref() else { return };
+        if self.gesture.is_some() || f.items.iter().any(|&(layer, id)| self.selection.contains(layer, id)) {
+            return;
+        }
+        let Some(f) = self.floating.take() else { return };
+        let (doc, frame, layer, selection) = (self.doc.clone(), self.frame, self.layer, self.selection.clone());
+        self.frame = f.frame;
+        let mut layers: Vec<LayerId> = Vec::new();
+        for &(l, _) in &f.items {
+            if !layers.contains(&l) && self.timeline().layer(l).is_some() {
+                layers.push(l);
+            }
+        }
+        let mut ok = true;
+        for l in layers {
+            let ids: Vec<ElementId> = f.items.iter().filter(|i| i.0 == l).map(|i| i.1).collect();
+            ok &= self.with_layer(l, |s| merge::settle(s, &ids)).is_ok();
+        }
+        self.frame = frame;
+        if self.timeline().layer(layer).is_some() {
+            self.layer = layer;
+        }
+        self.selection = selection;
+        if !ok {
+            // They stay as they are, on top: a move merges them where they land.
+            self.doc = doc;
+        } else if self.doc != doc {
+            self.state = history::fresh_state();
+            self.revision += 1;
+        }
+        self.dl_cache.replace(None);
+        self.fix_selection();
+    }
+
+    /// A group open for editing is one layer and one frame (ADR 0073): commands that change
+    /// the timeline are refused inside it.
+    fn group_allows(&self, spec: &CommandSpec) -> Result<()> {
+        let id = spec.id;
+        if spec.mutates && self.editing_group() && GROUP_REFUSES.iter().any(|ns| if ns.ends_with('.') { id.starts_with(ns) } else { id == *ns }) {
+            return Err(EngineError::State("a group has one layer and one frame: close it (Edit › Edit Document) to change the timeline, or convert it to a symbol (F8) to animate inside it".into()));
+        }
+        Ok(())
     }
 
     /// Inside a group (ADR 0073) the playhead stays on its only frame.
@@ -699,6 +934,8 @@ impl Session {
         if self.saved_state == Some(p.state) {
             self.saved_state = Some(p.before.state);
         }
+        // The cut's commands went with it.
+        self.rec.clear();
         self.doc = p.before.doc;
         self.state = p.before.state;
         self.selection = sel;
@@ -720,9 +957,25 @@ impl Session {
         if !spec.mutates {
             return (spec.run)(self, params);
         }
+        self.group_allows(&spec)?;
         let before = self.snapshot("");
         self.dl_cache.replace(None);
+        // Each command's edits to a motion tween's target become its keys, as when it runs on
+        // its own (the next one may work at another frame).
+        let outer = self.motion_edit.take();
+        // What the outer command edited in stage space settles first: this one sees the
+        // document as it is (ADR 0113).
+        self.settle_rig();
+        let rig = self.rig_begin();
         let result = (spec.run)(self, params);
+        self.settle_rig();
+        if let Some(edit) = self.motion_edit.take()
+            && result.is_ok()
+        {
+            cmds_motion::finish_edit(self, edit);
+        }
+        self.rig_end(rig);
+        self.motion_edit = outer;
         self.dl_cache.replace(None);
         self.pending_cut = None;
         match result {
@@ -752,14 +1005,15 @@ impl Session {
         if g.doc == self.doc && g.selection == self.selection {
             return;
         }
-        let back = Snapshot { label: String::new(), doc: g.doc.clone(), state: g.state, scene: g.scene, editing: g.editing.clone(), frame: g.frame, layer: g.layer, selection: g.selection.clone(), bytes: 0 };
+        let back = Snapshot { label: String::new(), doc: g.doc.clone(), state: g.state, scene: g.scene, editing: g.editing.clone(), frame: g.frame, layer: g.layer, selection: g.selection.clone(), floating: self.floating.clone(), bytes: 0, commands: None };
+        self.rec.truncate(self.gesture_rec);
         self.restore(back);
         self.revision += 1;
         self.fix_selection();
     }
 
     fn snapshot(&self, label: &str) -> Snapshot {
-        Snapshot { label: label.to_string(), doc: self.doc.clone(), state: self.state, scene: self.scene, editing: self.editing.clone(), frame: self.frame, layer: self.layer, selection: self.selection.clone(), bytes: 0 }
+        Snapshot { label: label.to_string(), doc: self.doc.clone(), state: self.state, scene: self.scene, editing: self.editing.clone(), frame: self.frame, layer: self.layer, selection: self.selection.clone(), floating: self.floating.clone(), bytes: 0, commands: None }
     }
 
     fn restore(&mut self, s: Snapshot) {
@@ -771,6 +1025,7 @@ impl Session {
         self.frame = s.frame;
         self.layer = s.layer;
         self.selection = s.selection;
+        self.floating = s.floating;
         self.dl_cache.replace(None);
     }
 
@@ -790,6 +1045,7 @@ impl Session {
     pub fn undo(&mut self) -> Result<Value> {
         self.end_gesture();
         self.heal_cut();
+        self.rec.clear();
         let cur = self.snapshot("");
         let s = self.history.undo(cur).ok_or_else(|| EngineError::State("nothing to undo".into()))?;
         let label = s.label.clone();
@@ -802,6 +1058,7 @@ impl Session {
     pub fn redo(&mut self) -> Result<Value> {
         self.end_gesture();
         self.heal_cut();
+        self.rec.clear();
         let cur = self.snapshot("");
         let s = self.history.redo(cur).ok_or_else(|| EngineError::State("nothing to redo".into()))?;
         let label = s.label.clone();
@@ -859,7 +1116,7 @@ impl Session {
     /// Elements on the active layer at the playhead (tweens applied). Shares the document's
     /// element `Arc`s on non-tweened frames.
     pub fn visible_elements(&self) -> Vec<Arc<Element>> {
-        self.active_layer().and_then(|l| evaluate_layer_elements(l, self.frame)).map(|(_, e)| e.into_owned()).unwrap_or_default()
+        self.elements_on(self.layer)
     }
 
     /// Topmost element under `p` (stage space) on a visible, unlocked layer. A bounding-box
@@ -931,6 +1188,11 @@ impl Session {
     /// refused there.
     pub(crate) fn editable_keyframe_in(&mut self, what: KeyEdit) -> Result<&mut Keyframe> {
         let frame = self.frame;
+        // A layer that follows a parent layer is edited as the stage shows it (ADR 0113).
+        if let Some(e) = self.rig_blocked(self.layer) {
+            return Err(e);
+        }
+        let space = self.layer_space(self.layer);
         let tl = self.timeline();
         if let Some(l) = tl.layer(self.layer) {
             if l.kind == LayerKind::Folder {
@@ -972,6 +1234,7 @@ impl Session {
         {
             self.motion_edit = Some(edit);
         }
+        Session::rig_conjugate(&mut self.rig_edits, lid, frame, space, kf);
         Ok(kf)
     }
 
@@ -1017,7 +1280,7 @@ impl Session {
             .map(|l| {
                 json!({
                     "id": l.id.0, "name": l.name, "visible": l.visible, "locked": l.locked, "volume": l.volume, "muted": l.muted,
-                    "keyframes": l.keyframes.iter().map(|k| json!({"start": k.start, "duration": k.duration, "elements": k.elements.len(), "tween": k.tween.as_ref().map(|t| t.easing.label()), "motion": k.motion.as_ref().map(|m| m.tracks.iter().map(|t| t.property.key()).collect::<Vec<_>>()), "sound": k.sound.as_ref().map(|f| json!({"sound": f.sound.0, "sync": f.sync.key(), "repeat": f.repeat, "loop": f.looping, "effect": f.effect.key()})), "script": k.script.as_ref().map(anicraft_doc::FrameScript::describe)})).collect::<Vec<_>>()
+                    "keyframes": l.keyframes.iter().map(|k| json!({"start": k.start, "duration": k.duration, "elements": k.elements.len(), "tween": k.tween.as_ref().map(|t| t.easing.label()), "motion": k.motion.as_ref().map(|m| m.tracks.iter().map(|t| t.property.key()).collect::<Vec<_>>()), "keep_area": k.motion.as_ref().map_or(k.tween.as_ref().is_some_and(|t| t.keep_area), |m| m.keep_area), "sound": k.sound.as_ref().map(|f| json!({"sound": f.sound.0, "sync": f.sync.key(), "repeat": f.repeat, "loop": f.looping, "effect": f.effect.key()})), "script": k.script.as_ref().map(anicraft_doc::FrameScript::describe)})).collect::<Vec<_>>()
                 })
             })
             .collect();
@@ -1114,6 +1377,11 @@ pub fn element_label(doc: &Document, e: &Element) -> String {
 mod tests;
 
 #[cfg(test)]
+mod parenting_tests;
+
+#[cfg(test)]
+mod keep_area_tests;
+#[cfg(test)]
 mod motion_tests;
 #[cfg(test)]
 mod retime_tests;
@@ -1128,9 +1396,13 @@ mod motion_pin_tests;
 #[cfg(test)]
 mod plugin_tests;
 #[cfg(test)]
+mod macro_tests;
+#[cfg(test)]
 mod plugin_kinds_tests;
 #[cfg(test)]
 mod tests_sound;
+#[cfg(test)]
+mod tests_audio_keys;
 #[cfg(test)]
 mod hint_tests;
 #[cfg(test)]
@@ -1153,6 +1425,8 @@ mod tests_warp;
 mod tests_filter;
 #[cfg(test)]
 mod tests_filter_tracks;
+#[cfg(test)]
+mod tests_filter_colour;
 #[cfg(test)]
 mod desktop_tests;
 #[cfg(test)]
@@ -1192,9 +1466,15 @@ mod timeline_key_tests;
 #[cfg(test)]
 mod tests_bone_chain;
 #[cfg(test)]
+mod tests_mixed_bone;
+#[cfg(test)]
 mod view_tests;
 #[cfg(test)]
+mod layer_order_tests;
+#[cfg(test)]
 mod path_text_tests;
+#[cfg(test)]
+mod rich_text_tests;
 #[cfg(test)]
 mod group_tests;
 #[cfg(test)]

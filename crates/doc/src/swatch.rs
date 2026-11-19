@@ -157,51 +157,25 @@ pub fn is_default_set(v: &[Swatch]) -> bool {
 }
 
 /// Largest palette file read, in bytes.
-pub const MAX_PALETTE_BYTES: usize = 1 << 20;
+pub const MAX_PALETTE_BYTES: usize = craft_palette::MAX_BYTES;
 
 /// Reads a GIMP palette (`.gpl`): a `GIMP Palette` line, optional `Name:` and `Columns:`
 /// lines and `#` comments, then one colour per line, `R G B` (0 to 255) and an optional name.
 /// Lines that aren't colours are skipped; at most [`MAX_SWATCHES`] colours are read. The
 /// palette's own name comes back with the colours.
 pub fn parse_gpl(text: &str) -> Result<(String, Vec<Swatch>), String> {
-    if text.len() > MAX_PALETTE_BYTES {
-        return Err("the palette file is too large".into());
-    }
-    let mut lines = text.lines();
-    let first = lines.next().unwrap_or("").trim_start_matches('\u{feff}').trim();
-    if first != "GIMP Palette" {
-        return Err("this isn't a GIMP palette (its first line must be \"GIMP Palette\")".into());
-    }
-    let mut name = String::new();
-    let mut out = Vec::new();
-    for line in lines {
-        let l = line.trim();
-        if l.is_empty() || l.starts_with('#') {
-            continue;
-        }
-        if let Some(n) = l.strip_prefix("Name:") {
-            name = clean_name(n);
-            continue;
-        }
-        if l.starts_with("Columns:") || l.starts_with("Channels:") {
-            continue;
-        }
-        let mut parts = l.split_whitespace();
-        let channel = |s: Option<&str>| s.and_then(|v| v.parse::<u16>().ok()).filter(|v| *v <= 255).map(|v| f32::from(v) / 255.0);
-        let (Some(r), Some(g), Some(b)) = (channel(parts.next()), channel(parts.next()), channel(parts.next())) else { continue };
-        let rest: Vec<&str> = parts.collect();
-        let label = rest.join(" ");
-        // GIMP names unnamed colours "Untitled"; the hex says more.
-        let label = if label == "Untitled" { String::new() } else { label };
-        out.push(Swatch::new(&label, SwatchPaint::Solid { color: Rgba::new(r, g, b, 1.0) }));
-        if out.len() >= MAX_SWATCHES {
-            break;
-        }
-    }
-    if out.is_empty() {
-        return Err("the palette has no colours in it".into());
-    }
-    Ok((name, out))
+    let palette = craft_palette::parse_gpl(text)?;
+    let colors = palette
+        .colors
+        .into_iter()
+        .map(|entry| {
+            let [r, g, b] = entry.rgb.map(|v| f32::from(v) / 255.0);
+            // GIMP's placeholder is an application display policy, not a format rule.
+            let label = if entry.name == "Untitled" { "" } else { &entry.name };
+            Swatch::new(label, SwatchPaint::Solid { color: Rgba::new(r, g, b, 1.0) })
+        })
+        .collect();
+    Ok((clean_name(&palette.name), colors))
 }
 
 #[cfg(test)]
@@ -242,6 +216,18 @@ mod tests {
         assert_eq!(s.kind(), "linear");
         assert_eq!(s.primary_color(), Rgba::hex(0xff0000));
         assert!(SwatchPaint::from_paint(&Paint::Bitmap { bitmap: crate::BitmapId(1), repeat: true, matrix: crate::Affine::IDENTITY }).is_none());
+    }
+
+    #[test]
+    fn gpl_adapter_preserves_name_limit_and_display_policy() {
+        assert_eq!(MAX_SWATCHES, craft_palette::MAX_COLORS);
+        let title = format!(" {}", "é".repeat(MAX_SWATCH_NAME + 1));
+        let text = format!("GIMP Palette\nName:{title}\n1 2 3 Untitled\n4 5 6   Named   colour\n");
+        let (name, swatches) = parse_gpl(&text).unwrap();
+        assert_eq!(name, clean_name(&title));
+        assert_eq!(name.chars().count(), MAX_SWATCH_NAME - 1);
+        assert!(swatches[0].name.is_empty());
+        assert_eq!(swatches[1].name, "Named colour");
     }
 
     #[test]

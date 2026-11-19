@@ -11,8 +11,10 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use anicraft_geom::{Path, PathCmd, Vec2};
-use skrifa::MetadataProvider as _;
 use std::sync::{Arc, OnceLock};
+
+mod rich;
+pub use rich::{MAX_FACES, MAX_RUNS, ParaStyle, RichText, Run, RunStyle, Shift, sanitize_para, sanitize_run};
 
 /// Families tried, in order, when none is asked for or the one asked for isn't installed.
 pub const DEFAULT_FAMILIES: &[&str] = &["Inter", "Arial", "Helvetica", "Helvetica Neue", "Segoe UI", "DejaVu Sans", "Liberation Sans", "Noto Sans", "Roboto", "Ubuntu"];
@@ -83,6 +85,11 @@ pub struct Layout {
     /// Each glyph on its own, in drawing order: only from [`Fonts::layout_glyphs`] (empty
     /// otherwise).
     pub glyphs: Vec<PlacedGlyph>,
+    /// The outline cut by the runs' paints ([`RunStyle::paint`]), in the order paints first
+    /// appear: `outline` is these pieces one after another (ADR 0085).
+    pub pieces: Vec<(u32, Path)>,
+    /// The family each run was laid out in (the one asked for, or the fallback).
+    pub families: Vec<String>,
 }
 
 /// One laid-out glyph on its own.
@@ -98,6 +105,8 @@ pub struct PlacedGlyph {
     pub advance: f32,
     /// The character it starts at (`char`s of the whole text, line breaks included).
     pub index: u32,
+    /// Its run's paint ([`RunStyle::paint`]).
+    pub paint: u32,
 }
 
 /// How text follows a path (ADR 0070).
@@ -114,8 +123,10 @@ pub struct PathPlacement {
 /// Glyphs set along a path.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PathText {
-    /// Every glyph shown, in the path's space.
+    /// Every glyph shown, in the path's space: `pieces` one after another.
     pub outline: Path,
+    /// The glyphs by paint, in the order paints first appear.
+    pub pieces: Vec<(u32, Path)>,
     /// The path's length.
     pub length: f32,
     /// Each shown glyph's character, the point on the path under its middle and its angle
@@ -144,7 +155,7 @@ pub fn on_path(glyphs: &[PlacedGlyph], path: &Path, how: PathPlacement) -> Optio
             Align::Center => width * 0.5,
             Align::Right => width,
         };
-    let mut out = PathText { outline: Path::new(), length, placed: Vec::with_capacity(glyphs.len()), hidden: 0 };
+    let mut out = PathText { outline: Path::new(), pieces: Vec::new(), length, placed: Vec::with_capacity(glyphs.len()), hidden: 0 };
     for g in glyphs {
         let mid = start + g.x + g.advance * 0.5;
         if !mid.is_finite() {
@@ -162,8 +173,20 @@ pub fn on_path(glyphs: &[PlacedGlyph], path: &Path, how: PathPlacement) -> Optio
         let (p, t) = if how.flip { (walk.at(length - s), walk.tangent(length - s) * -1.0) } else { (walk.at(s), walk.tangent(s)) };
         let angle = t.y.atan2(t.x);
         let m = anicraft_geom::Affine::translate(p.x, p.y).mul(&anicraft_geom::Affine::rotate(angle)).mul(&anicraft_geom::Affine::translate(-g.advance * 0.5, 0.0));
-        out.outline.cmds.extend(g.outline.transformed(&m).cmds);
+        let k = match out.pieces.iter().position(|(paint, _)| *paint == g.paint) {
+            Some(k) => k,
+            None => {
+                out.pieces.push((g.paint, Path::new()));
+                out.pieces.len() - 1
+            }
+        };
+        if let Some((_, piece)) = out.pieces.get_mut(k) {
+            piece.cmds.extend(g.outline.transformed(&m).cmds);
+        }
         out.placed.push((g.index, p, angle));
+    }
+    for (_, piece) in &out.pieces {
+        out.outline.cmds.extend_from_slice(&piece.cmds);
     }
     Some(out)
 }
@@ -173,6 +196,8 @@ pub fn on_path(glyphs: &[PlacedGlyph], path: &Path, how: PathPlacement) -> Optio
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoxedPathText {
     pub outline: Path,
+    /// The glyphs by paint (see [`PathText::pieces`]).
+    pub pieces: Vec<(u32, Path)>,
     pub path: Path,
     pub width: f32,
     pub height: f32,
@@ -188,7 +213,8 @@ pub fn on_path_boxed(glyphs: &[PlacedGlyph], path: &Path, how: PathPlacement) ->
     let shift = if b.min.x.is_finite() && b.min.y.is_finite() { b.min } else { Vec2::ZERO };
     let back = anicraft_geom::Affine::translate(-shift.x, -shift.y);
     let size = |v: f32| if v.is_finite() { v.max(0.0) } else { 0.0 };
-    Some(BoxedPathText { outline: set.outline.transformed(&back), path: path.transformed(&back), width: size(b.width()), height: size(b.height()), shift, hidden: set.hidden })
+    let pieces = set.pieces.iter().map(|(k, p)| (*k, p.transformed(&back))).collect();
+    Some(BoxedPathText { outline: set.outline.transformed(&back), pieces, path: path.transformed(&back), width: size(b.width()), height: size(b.height()), shift, hidden: set.hidden })
 }
 
 /// Whether a path's first subpath ends with a close.
@@ -213,6 +239,11 @@ pub struct CaretLine {
     pub end: u32,
     /// `(index, x)` of the boundaries glyphs start at and of the line's end, ascending.
     pub stops: Vec<(u32, f32)>,
+    /// The line's top and height (to the next line's top, its line spacing included) and its
+    /// baseline, from the box's top (pixels).
+    pub top: f32,
+    pub height: f32,
+    pub baseline: f32,
 }
 
 impl CaretLine {
@@ -395,19 +426,10 @@ impl Fonts {
     }
 
     fn lay_out_with(&self, text: &str, style: &Style, glyphs: bool) -> Result<Layout, TextError> {
-        if text.chars().count() > MAX_CHARS {
-            return Err(TextError::TooLong);
-        }
-        let family = self.resolve(&style.family).ok_or(TextError::NoFonts)?;
-        let q = fontdb::Query {
-            families: &[fontdb::Family::Name(&family)],
-            weight: if style.bold { fontdb::Weight::BOLD } else { fontdb::Weight::NORMAL },
-            stretch: fontdb::Stretch::Normal,
-            style: if style.italic { fontdb::Style::Italic } else { fontdb::Style::Normal },
-        };
-        let id = self.db.query(&q).ok_or(TextError::NoFonts)?;
-        let laid = self.db.with_face_data(id, |data, index| lay_out(data, index, text, style, glyphs)).flatten().ok_or(TextError::NoFonts)?;
-        Ok(Layout { family, ..laid })
+        let style = sanitize(style);
+        let run = Run { chars: usize::MAX, style: RunStyle { family: style.family.clone(), size: style.size, bold: style.bold, italic: style.italic, letter_spacing: style.letter_spacing, ..RunStyle::default() } };
+        let para = ParaStyle { align: style.align, line_spacing: style.line_spacing, ..ParaStyle::default() };
+        self.layout_rich(&RichText { text, runs: &[run], paragraphs: &[para], width: style.width }, glyphs)
     }
 }
 
@@ -449,192 +471,8 @@ pub fn sanitize(style: &Style) -> Style {
     }
 }
 
-/// One shaped glyph: id, where its pen position starts, its offsets and advance (pixels).
-struct Glyph {
-    id: skrifa::GlyphId,
-    cluster: usize,
-    x_offset: f32,
-    y_offset: f32,
-    advance: f32,
-}
-
-fn lay_out(data: &[u8], index: u32, text: &str, style: &Style, want_glyphs: bool) -> Option<Layout> {
-    let style = sanitize(style);
-    let font = skrifa::FontRef::from_index(data, index).ok()?;
-    let size = skrifa::instance::Size::new(style.size);
-    let metrics = font.metrics(size, skrifa::instance::LocationRef::default());
-    let upem = f32::from(metrics.units_per_em.max(1));
-    let scale = style.size / upem;
-    let ascent = metrics.ascent;
-    let line_height = (metrics.ascent - metrics.descent + metrics.leading).max(style.size * 0.5) + style.line_spacing;
-    let shaper_data = harfrust::ShaperData::new(&font);
-    let shaper = shaper_data.shaper(&font).build();
-    let glyphs = font.outline_glyphs();
-    let charmap = font.charmap();
-    let missing = text.chars().filter(|c| !c.is_control() && !c.is_whitespace() && charmap.map(*c).is_none()).count();
-
-    // Lines: paragraphs at line breaks, each wrapped at spaces to the width if there is one.
-    let mut lines: Vec<(f32, Vec<(Glyph, f32)>)> = Vec::new();
-    // Per line: the character index its paragraph starts at, the paragraph's length in
-    // characters, and the byte → character map of the paragraph (shared by its lines).
-    let mut spans: Vec<(u32, u32, Arc<Vec<u32>>)> = Vec::new();
-    let mut para_start = 0u32;
-    for raw in text.split('\n') {
-        let para = raw.strip_suffix('\r').unwrap_or(raw);
-        let mut to_char = vec![0u32; para.len() + 1];
-        let mut n = 0u32;
-        for (b, _) in para.char_indices() {
-            if let Some(slot) = to_char.get_mut(b) {
-                *slot = n;
-            }
-            n += 1;
-        }
-        if let Some(last) = to_char.last_mut() {
-            *last = n;
-        }
-        let to_char = Arc::new(to_char);
-        let lines_before = lines.len();
-        let mut buffer = harfrust::UnicodeBuffer::new();
-        buffer.push_str(para);
-        buffer.guess_segment_properties();
-        let shaped = shaper.shape(buffer, harfrust::ShapeOptions::new());
-        let run: Vec<Glyph> = shaped
-            .glyph_infos()
-            .iter()
-            .zip(shaped.glyph_positions())
-            .map(|(info, pos)| Glyph {
-                id: skrifa::GlyphId::new(info.glyph_id),
-                cluster: info.cluster as usize,
-                x_offset: pos.x_offset as f32 * scale,
-                y_offset: pos.y_offset as f32 * scale,
-                advance: pos.x_advance as f32 * scale + style.letter_spacing,
-            })
-            .collect();
-        let is_space = |g: &Glyph| para.get(g.cluster..).and_then(|s| s.chars().next()).is_some_and(char::is_whitespace);
-        let mut line: Vec<(Glyph, f32)> = Vec::new();
-        let mut x = 0.0f32;
-        // Where the current line could break: after its last space.
-        let mut break_at: Option<usize> = None;
-        for g in run {
-            let space = is_space(&g);
-            if let Some(w) = style.width
-                && !space
-                && x + g.advance > w
-                && !line.is_empty()
-            {
-                // Wrap: at the last space if there is one (dropping trailing spaces), else here.
-                let rest = match break_at {
-                    Some(b) => line.split_off(b),
-                    None => Vec::new(),
-                };
-                while line.last().is_some_and(|(g, _)| is_space(g)) {
-                    line.pop();
-                }
-                let width = line.last().map_or(0.0, |(g, gx)| gx + g.advance);
-                lines.push((width, std::mem::take(&mut line)));
-                let shift = rest.first().map_or(0.0, |(_, gx)| *gx);
-                line = rest.into_iter().map(|(g, gx)| (g, gx - shift)).collect();
-                x = line.last().map_or(0.0, |(g, gx)| gx + g.advance);
-                break_at = None;
-            }
-            line.push((g, x));
-            x += line.last().map_or(0.0, |(g, _)| g.advance);
-            if space {
-                break_at = Some(line.len());
-            }
-        }
-        while line.last().is_some_and(|(g, _)| is_space(g)) {
-            line.pop();
-        }
-        let width = line.last().map_or(0.0, |(g, gx)| gx + g.advance);
-        lines.push((width, line));
-        for _ in lines_before..lines.len() {
-            spans.push((para_start, n, to_char.clone()));
-        }
-        para_start += raw.chars().count() as u32 + 1;
-    }
-
-    let box_width = style.width.unwrap_or_else(|| lines.iter().map(|(w, _)| *w).fold(0.0, f32::max));
-    let mut outline = Path::new();
-    let mut placed: Vec<PlacedGlyph> = Vec::new();
-    for (row, (width, line)) in lines.iter().enumerate() {
-        let shift = match style.align {
-            Align::Left => 0.0,
-            Align::Center => (box_width - width) * 0.5,
-            Align::Right => box_width - width,
-        };
-        let baseline = ascent + row as f32 * line_height;
-        let span = spans.get(row);
-        for (g, gx) in line {
-            let Some(glyph) = glyphs.get(g.id) else { continue };
-            if want_glyphs {
-                let settings = skrifa::outline::DrawSettings::unhinted(size, skrifa::instance::LocationRef::default());
-                let mut own = Path::new();
-                let mut pen = Pen { cmds: &mut own.cmds, x: g.x_offset, y: -g.y_offset };
-                let _ = glyph.draw(settings, &mut pen);
-                let index = span.map_or(0, |(pstart, plen, to_char)| pstart + to_char.get(g.cluster).copied().unwrap_or(*plen).min(*plen));
-                placed.push(PlacedGlyph { outline: own, x: shift + gx, baseline, advance: g.advance, index });
-            }
-            let settings = skrifa::outline::DrawSettings::unhinted(size, skrifa::instance::LocationRef::default());
-            let mut pen = Pen { cmds: &mut outline.cmds, x: shift + gx + g.x_offset, y: baseline - g.y_offset };
-            let _ = glyph.draw(settings, &mut pen);
-        }
-    }
-    let height = (lines.len().max(1) as f32 - 1.0) * line_height + (metrics.ascent - metrics.descent);
-    let carets = caret_lines(&lines, &spans, box_width, style.align);
-    Some(Layout { outline, width: box_width.max(0.0), height: height.max(0.0), family: String::new(), missing, lines: lines.len().max(1), line_height, ascent, carets, glyphs: placed })
-}
-
-/// The caret positions of laid-out lines (see [`CaretLine`]).
-fn caret_lines(lines: &[(f32, Vec<(Glyph, f32)>)], spans: &[(u32, u32, Arc<Vec<u32>>)], box_width: f32, align: Align) -> Vec<CaretLine> {
-    let mut out: Vec<CaretLine> = Vec::with_capacity(lines.len());
-    for (row, ((width, line), (pstart, plen, to_char))) in lines.iter().zip(spans).enumerate() {
-        let shift = match align {
-            Align::Left => 0.0,
-            Align::Center => (box_width - width) * 0.5,
-            Align::Right => box_width - width,
-        };
-        let ch = |cluster: usize| pstart + to_char.get(cluster).copied().unwrap_or(*plen).min(*plen);
-        // A paragraph's first line starts with it; a wrapped line at its first glyph.
-        let first_of_para = row == 0 || spans.get(row - 1).is_none_or(|p| p.0 != *pstart);
-        let start = if first_of_para { *pstart } else { line.first().map_or(*pstart, |(g, _)| ch(g.cluster)) };
-        let mut stops: Vec<(u32, f32)> = line.iter().map(|(g, gx)| (ch(g.cluster), shift + gx)).collect();
-        stops.sort_by_key(|s| s.0);
-        stops.dedup_by_key(|s| s.0);
-        if first_of_para && stops.first().is_none_or(|s| s.0 > start) {
-            stops.insert(0, (start, shift));
-        }
-        // The boundary after the last glyph (its trailing spaces, if any, follow it).
-        if let Some(&(c, _)) = stops.last() {
-            stops.push((c + 1, shift + width));
-        }
-        out.push(CaretLine { start, end: start, stops });
-        // The previous line of the same paragraph ends where this one starts.
-        if !first_of_para && let Some(prev) = out.len().checked_sub(2).and_then(|i| out.get_mut(i)) {
-            prev.end = start;
-        }
-    }
-    // The last line of each paragraph ends with it.
-    for (row, (pstart, plen, _)) in spans.iter().enumerate() {
-        let last_of_para = spans.get(row + 1).is_none_or(|p| p.0 != *pstart);
-        if last_of_para && let Some(l) = out.get_mut(row) {
-            l.end = pstart + plen;
-        }
-    }
-    for l in &mut out {
-        l.end = l.end.max(l.start);
-        let end = l.end;
-        l.stops.retain(|s| s.0 <= end);
-        if l.stops.last().is_none_or(|s| s.0 < end) {
-            let x = l.stops.last().map_or(0.0, |s| s.1);
-            l.stops.push((end, x));
-        }
-    }
-    out
-}
-
 /// Draws glyph outlines (font space, y up) into a path (pixels, y down) at a pen position.
-struct Pen<'a> {
+pub(crate) struct Pen<'a> {
     cmds: &'a mut Vec<PathCmd>,
     x: f32,
     y: f32,
@@ -808,7 +646,7 @@ mod tests {
 
     /// Synthetic glyphs: a 10 × 20 box standing on the baseline, `n` of them 10 apart.
     fn boxes(n: u32) -> Vec<PlacedGlyph> {
-        (0..n).map(|i| PlacedGlyph { outline: Path::rect(0.0, -20.0, 10.0, 20.0), x: i as f32 * 10.0, baseline: 20.0, advance: 10.0, index: i }).collect()
+        (0..n).map(|i| PlacedGlyph { outline: Path::rect(0.0, -20.0, 10.0, 20.0), x: i as f32 * 10.0, baseline: 20.0, advance: 10.0, index: i, paint: 0 }).collect()
     }
 
     #[test]
@@ -884,7 +722,7 @@ cd", &style(20.0)).unwrap();
         assert_eq!((w.carets[0].start, w.carets[0].end, w.carets[1].start, w.carets[1].end), (0, 4, 4, 7));
         // Empty text has one line with one place for the caret; centred text starts mid-box.
         let e = fonts.layout("", &style(20.0)).unwrap();
-        assert_eq!(e.carets, vec![CaretLine { start: 0, end: 0, stops: vec![(0, 0.0)] }]);
+        assert_eq!((e.carets.len(), e.carets[0].start, e.carets[0].end, e.carets[0].stops.clone()), (1, 0, 0, vec![(0, 0.0)]));
         let c = fonts.layout("", &Style { width: Some(100.0), align: Align::Center, ..style(20.0) }).unwrap();
         assert_eq!(c.carets[0].x_at(0), 50.0);
     }

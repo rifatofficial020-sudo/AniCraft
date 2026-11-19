@@ -24,11 +24,18 @@
 //! angle, forward kinematics moves the joint (and what hangs from it) by it, and the solver
 //! slides joints only where turning them can't reach. **Springs** (per-bone strength and
 //! damping) add secondary motion on top of the keyed pose; see [`crate::spring`].
+//!
+//! An armature may be **mixed** (ADR 0098): its bones move symbol instances and whole shapes
+//! rigidly (their transforms), and bones *inside* a shape ([`Bone::shape`]) bend its outline
+//! through that shape's [`Skin`]. The two kinds join freely: a bone inside a shape may carry an
+//! instance on its end, and an instance's bone may end in a shape that has bones of its own.
+//! One pose, one solver and one tween serve all of it.
 
 use crate::skin::{self, Skin};
 use crate::{Element, ElementId, Keyframe, Layer};
 use anicraft_geom::{Affine, Vec2};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -140,12 +147,25 @@ pub struct Bone {
     /// The bone's spring (ADR 0084); `None`: none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spring: Option<Spring>,
+    /// The shape this bone is inside (ADR 0071, ADR 0098): the bone bends that shape's outline
+    /// through its [`Skin`], its `child` is a **joint node** (an id that is no element), and its
+    /// `parent` is the shape itself or the node of another bone inside it. `None`: the bone
+    /// moves an element (a symbol instance, or a whole shape) rigidly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<ElementId>,
 }
 
 impl Bone {
     /// A bone as drawn: turning freely, not sliding, no spring, not pinned.
     pub fn new(id: BoneId, parent: ElementId, child: ElementId, head: Vec2, tail: Vec2, rest: Affine) -> Bone {
-        Bone { id, name: String::new(), parent, child, head, tail, rest, limits: None, pinned: false, slide_x: None, slide_y: None, spring: None }
+        Bone { id, name: String::new(), parent, child, head, tail, rest, limits: None, pinned: false, slide_x: None, slide_y: None, spring: None, shape: None }
+    }
+
+    /// A bone inside `shape` as drawn (ADR 0071): from `parent` (the shape, or the joint node of
+    /// another bone inside it) to a new joint node `child`, `head` and `tail` in the shape's
+    /// space.
+    pub fn in_shape(id: BoneId, shape: ElementId, parent: ElementId, child: ElementId, head: Vec2, tail: Vec2) -> Bone {
+        Bone { shape: Some(shape), ..Bone::new(id, parent, child, head, tail, Affine::IDENTITY) }
     }
 
     /// Whether the joint may slide at all.
@@ -181,19 +201,75 @@ impl Bone {
 }
 
 /// The bones of an armature layer, each listed after the bone it hangs from.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(from = "ArmatureIn")]
 pub struct Armature {
-    #[serde(default)]
     pub bones: Vec<Bone>,
-    /// A shape armature (ADR 0071): the bones are inside this shape and bend its outline. Its
-    /// bones join joint nodes (ids that are no element) instead of instances; see
-    /// [`crate::skin`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skin: Option<Skin>,
+    /// The shapes with bones inside them (ADR 0071), one [`Skin`] each: the bones marked with
+    /// that shape ([`Bone::shape`]) bend its outline. Empty for an armature of instances only.
+    pub skins: Vec<Skin>,
     /// The armature's springs are turned off (Properties › Bone › Springs, ADR 0084): it plays
     /// its keyed poses exactly, for posing without the swing.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub springs_off: bool,
+}
+
+/// An armature as files hold it. Two forms (ADR 0098):
+///
+/// * the **first form** (format versions up to 3): `bones`, and for a shape armature its one
+///   `skin`; every bone of an armature with a `skin` is inside that shape;
+/// * the **mixed form** (format version 4): `bones` that say which shape they are inside
+///   (`shape`), and `skins`, one per shape with bones.
+///
+/// An armature the first form can say is always written in it, so documents without mixed
+/// armatures are byte for byte what earlier builds wrote, and earlier builds open them.
+#[derive(Deserialize)]
+struct ArmatureIn {
+    #[serde(default)]
+    bones: Vec<Bone>,
+    #[serde(default)]
+    skin: Option<Skin>,
+    #[serde(default)]
+    skins: Vec<Skin>,
+    #[serde(default)]
+    springs_off: bool,
+}
+
+impl From<ArmatureIn> for Armature {
+    fn from(a: ArmatureIn) -> Armature {
+        let (mut bones, mut skins) = (a.bones, a.skins);
+        if let Some(k) = a.skin {
+            // The first form: every bone is inside the one shape.
+            for b in &mut bones {
+                b.shape.get_or_insert(k.shape);
+            }
+            skins.insert(0, k);
+        }
+        Armature { bones, skins, springs_off: a.springs_off }
+    }
+}
+
+#[derive(Serialize)]
+struct ArmatureOut<'a> {
+    bones: Cow<'a, [Bone]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skin: Option<&'a Skin>,
+    #[serde(skip_serializing_if = "<[Skin]>::is_empty")]
+    skins: &'a [Skin],
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    springs_off: bool,
+}
+
+impl Serialize for Armature {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        let out = if self.is_mixed() {
+            ArmatureOut { bones: Cow::Borrowed(&self.bones), skin: None, skins: &self.skins, springs_off: self.springs_off }
+        } else {
+            // The first form doesn't mark its bones: with a skin, all of them are inside it.
+            let bones = if self.skins.is_empty() { Cow::Borrowed(self.bones.as_slice()) } else { Cow::Owned(self.bones.iter().map(|b| Bone { shape: None, ..b.clone() }).collect()) };
+            ArmatureOut { bones, skin: self.skins.first(), skins: &[], springs_off: self.springs_off }
+        };
+        out.serialize(ser)
+    }
 }
 
 impl Armature {
@@ -201,10 +277,36 @@ impl Armature {
         self.bones.is_empty()
     }
 
-    /// The shape a shape armature's bones are inside (ADR 0071); `None` for an armature of
-    /// symbol instances.
-    pub fn skin_shape(&self) -> Option<ElementId> {
-        self.skin.as_ref().map(|s| s.shape)
+    /// Whether the armature needs the mixed file form (ADR 0098): more than one shape with
+    /// bones, or bones inside a shape next to bones that move elements. Otherwise it is an
+    /// armature of instances (ADR 0043) or of one shape (ADR 0071), written as it always was.
+    pub fn is_mixed(&self) -> bool {
+        let only = self.skins.first().map(|k| k.shape);
+        self.skins.len() > 1 || self.bones.iter().any(|b| b.shape != only)
+    }
+
+    /// The skin of `shape`, when the armature has bones inside it.
+    pub fn skin(&self, shape: ElementId) -> Option<&Skin> {
+        self.skins.iter().find(|k| k.shape == shape)
+    }
+
+    pub fn skin_mut(&mut self, shape: ElementId) -> Option<&mut Skin> {
+        self.skins.iter_mut().find(|k| k.shape == shape)
+    }
+
+    /// The skin bone `id` bends: its shape's, when the bone is inside a shape.
+    pub fn skin_of(&self, id: BoneId) -> Option<&Skin> {
+        self.skin(self.bone(id)?.shape?)
+    }
+
+    /// The bones inside `shape`, in armature order.
+    pub fn bones_in(&self, shape: ElementId) -> impl Iterator<Item = &Bone> {
+        self.bones.iter().filter(move |b| b.shape == Some(shape))
+    }
+
+    /// How many points of its shape bone `id` moves (0 for a bone that moves an element).
+    pub fn bound_count(&self, id: BoneId) -> usize {
+        self.skin_of(id).map_or(0, |k| k.points.iter().filter(|b| b.weight(id) > 0.0).count())
     }
 
     pub fn bone(&self, id: BoneId) -> Option<&Bone> {
@@ -230,15 +332,15 @@ impl Armature {
         self.bone_into(b.parent)
     }
 
-    /// Whether instance `el` is part of the armature.
+    /// Whether `el` (an element, or a joint node) is part of the armature.
     pub fn contains(&self, el: ElementId) -> bool {
         self.bones.iter().any(|b| b.parent == el || b.child == el)
     }
 
-    /// Every instance in the armature, roots first.
+    /// Every element in the armature (instances and shapes, never joint nodes), roots first.
     pub fn members(&self) -> Vec<ElementId> {
         let mut out: Vec<ElementId> = self.roots();
-        for b in &self.bones {
+        for b in self.bones.iter().filter(|b| b.shape.is_none()) {
             if !out.contains(&b.child) {
                 out.push(b.child);
             }
@@ -246,12 +348,9 @@ impl Armature {
         out
     }
 
-    /// The instances no bone moves (one for an armature made with the Bone tool; a shape
-    /// armature's shape).
+    /// The elements no bone moves (one for an armature made with the Bone tool: an instance,
+    /// or a shape with bones inside it).
     pub fn roots(&self) -> Vec<ElementId> {
-        if let Some(s) = self.skin_shape() {
-            return vec![s];
-        }
         let mut out = Vec::new();
         for b in &self.bones {
             if self.bone_into(b.parent).is_none() && !out.contains(&b.parent) {
@@ -289,15 +388,22 @@ impl Armature {
     }
 
     /// Repairs a loaded armature: drops bones with non-finite numbers, repeated ids, a second
-    /// bone into one instance and bones in cycles; keeps every bone after its parent; keeps at
-    /// most [`MAX_BONES`]. Returns whether anything changed.
+    /// bone into one element and bones in cycles; keeps every bone after its parent; keeps at
+    /// most [`MAX_BONES`]. A bone inside a shape must hang from that shape or from another bone
+    /// inside it, and the shape needs a skin; a skin needs bones, an outline within the point
+    /// limit and one sane binding per point. Returns whether anything changed.
     pub fn sanitize(&mut self) -> bool {
-        let before = self.bones.clone();
+        let before = self.clone();
+        // One skin per shape, each within the point limit.
+        let mut shapes = HashSet::new();
+        self.skins.retain(|k| skin::anchors(&k.rest).len() <= skin::MAX_SKIN_POINTS && shapes.insert(k.shape));
         let mut seen_id = HashSet::new();
         let mut seen_child = HashSet::new();
         let mut kept: Vec<Bone> = Vec::new();
         for mut b in std::mem::take(&mut self.bones) {
-            if !b.is_sane() || !seen_id.insert(b.id) || !seen_child.insert(b.child) {
+            // A joint node is no element: a bone inside a shape can't end on a shape with bones.
+            let node_ok = b.shape.is_none_or(|s| shapes.contains(&s) && !shapes.contains(&b.child));
+            if !b.is_sane() || !node_ok || !seen_id.insert(b.id) || !seen_child.insert(b.child) {
                 continue;
             }
             b.limits = b.limits.and_then(Limits::sanitized);
@@ -310,30 +416,33 @@ impl Armature {
             }
             kept.push(b);
         }
-        // Order: a bone after the bone moving its parent. What never gets placed is a cycle.
-        // A shape armature's bones all hang from its shape.
+        // Order: a bone after the bone moving its parent. What never gets placed is a cycle, or
+        // a bone inside a shape that hangs from something outside it.
         let children: HashSet<ElementId> = kept.iter().map(|b| b.child).collect();
-        let mut placed: HashSet<ElementId> = match self.skin_shape() {
-            Some(s) => HashSet::from([s]),
-            None => kept.iter().map(|b| b.parent).filter(|p| !children.contains(p)).collect(),
-        };
+        let mut placed: HashSet<ElementId> = kept.iter().map(|b| b.parent).filter(|p| !children.contains(p)).collect();
+        let mut node_in: HashMap<ElementId, ElementId> = HashMap::new();
         let mut ordered = Vec::with_capacity(kept.len());
         let mut rest = kept;
         loop {
-            let (ready, wait): (Vec<Bone>, Vec<Bone>) = rest.into_iter().partition(|b| placed.contains(&b.parent));
+            let (ready, wait): (Vec<Bone>, Vec<Bone>) = rest.into_iter().partition(|b| placed.contains(&b.parent) && b.shape.is_none_or(|s| b.parent == s || node_in.get(&b.parent) == Some(&s)));
             if ready.is_empty() {
                 break;
             }
             for b in ready {
                 placed.insert(b.child);
+                if let Some(s) = b.shape {
+                    node_in.insert(b.child, s);
+                }
                 ordered.push(b);
             }
             rest = wait;
         }
         ordered.truncate(MAX_BONES);
         self.bones = ordered;
-        let skin_changed = skin::sanitize(self);
-        self.bones != before || skin_changed
+        let boned: HashSet<ElementId> = self.bones.iter().filter_map(|b| b.shape).collect();
+        self.skins.retain(|k| boned.contains(&k.shape));
+        skin::sanitize(self);
+        *self != before
     }
 }
 
@@ -467,10 +576,10 @@ pub(crate) fn turn_about(j: Vec2, angle: f32) -> Affine {
 /// the same way from the shape's transform.
 pub fn place(arm: &Armature, elements: &[Arc<Element>], pose: &Pose) -> HashMap<ElementId, Affine> {
     let mut world: HashMap<ElementId, Affine> = elements.iter().map(|e| (e.id, e.transform)).collect();
-    let nodes = arm.skin.is_some();
     for b in &arm.bones {
         let Some(wp) = world.get(&b.parent).copied() else { continue };
-        if !nodes && !world.contains_key(&b.child) {
+        // A joint node is no element: it is placed whether or not anything is on the keyframe.
+        if b.shape.is_none() && !world.contains_key(&b.child) {
             continue;
         }
         let (_, wc) = joint(b, &wp, b.allow(pose.angle(b.id)), b.allow_slide(pose.slide(b.id)));
@@ -512,29 +621,30 @@ pub fn joint(b: &Bone, wp: &Affine, a: f32, s: Vec2) -> (Vec2, Affine) {
     (j, turn_about(j, a).mul(&Affine::translate(d.x, d.y).mul(&base)))
 }
 
-/// Puts the instances of `elements` where `pose` has them, and bends a shape armature's shape
-/// (copy-on-write: only what changes is cloned). Returns whether anything changed.
+/// Puts the elements a bone moves (instances, whole shapes) where `pose` has them, and bends
+/// every shape with bones inside it (copy-on-write: only what changes is cloned). Returns
+/// whether anything changed.
 pub fn apply(arm: &Armature, elements: &mut [Arc<Element>], pose: &Pose) -> bool {
     if arm.is_empty() {
         return false;
     }
-    if arm.skin.is_some() {
-        return skin::apply(arm, elements, pose);
-    }
-    let world = place(arm, elements, pose);
     let mut moved = false;
-    for e in elements.iter_mut() {
-        if arm.bone_into(e.id).is_none() {
-            continue;
-        }
-        if let Some(m) = world.get(&e.id)
-            && *m != e.transform
-        {
-            Arc::make_mut(e).transform = *m;
-            moved = true;
+    // An armature of one shape (ADR 0071) moves no element: only its outline bends.
+    if arm.bones.iter().any(|b| b.shape.is_none()) {
+        let world = place(arm, elements, pose);
+        for e in elements.iter_mut() {
+            if arm.bone_into(e.id).is_none() {
+                continue;
+            }
+            if let Some(m) = world.get(&e.id)
+                && *m != e.transform
+            {
+                Arc::make_mut(e).transform = *m;
+                moved = true;
+            }
         }
     }
-    moved
+    skin::apply(arm, elements, pose) || moved
 }
 
 /// The pose layer `layer` has at `frame`: its covering keyframe's, or, inside a tween, the pose
@@ -569,8 +679,16 @@ pub struct BoneAt {
 /// Every bone's joint and end with the instances in `elements` placed as they show (posed:
 /// what [`crate::evaluate_layer_elements`] gives on an armature layer).
 pub fn bones_at(arm: &Armature, elements: &[Arc<Element>], pose: &Pose) -> Vec<BoneAt> {
-    // A shape armature's joint nodes are no elements: forward kinematics places them.
-    let world: HashMap<ElementId, Affine> = if arm.skin.is_some() { place(arm, elements, pose) } else { elements.iter().map(|e| (e.id, e.transform)).collect() };
+    // The elements are where they show. Joint nodes inside shapes are no elements: forward
+    // kinematics places them from what they hang from.
+    let mut world: HashMap<ElementId, Affine> = elements.iter().map(|e| (e.id, e.transform)).collect();
+    for b in arm.bones.iter().filter(|b| b.shape.is_some()) {
+        let Some(wp) = world.get(&b.parent).copied() else { continue };
+        let (_, wc) = joint(b, &wp, b.allow(pose.angle(b.id)), b.allow_slide(pose.slide(b.id)));
+        if wc.is_finite() {
+            world.insert(b.child, wc);
+        }
+    }
     arm.bones
         .iter()
         .filter_map(|b| {
@@ -741,3 +859,7 @@ fn ccd(arm: &Armature, chain: &[&Bone], effector: &Effector<'_>, mut pose: Pose,
 #[cfg(test)]
 #[path = "armature_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "mixed_tests.rs"]
+mod mixed_tests;

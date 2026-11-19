@@ -76,6 +76,13 @@ are not used for UI text, because they would change metrics per OS.
   under the pointer is `T.icon_hot`; a mark drawn across the timeline is `T.text`, not white,
   because the panels may be light. A new token needs a value in every palette and a line in the
   contrast test. Check UI changes with `--theme light` as well.
+* **Users bring their own palettes** (ADR 0117): a theme file sets colours for these same roles
+  over one of the three, and is refused unless its text, icons and focus ring reach WCAG AA
+  (`theme::shortfalls`, the table the built-ins are tested with). So a pair of roles you draw
+  together must be in that table, and nothing may assume a role's colour. A new colour role goes
+  in `colour_roles!`. Accent bars go through `theme::accent_bar` (the one gradient), icons through
+  `icons::paint` (the one place `icon_accent` is drawn). Check with
+  `--theme <file>.json` as well.
 * No raw colours outside `theme.rs`: add a token.
 
 ## 4. Shapes, borders, spacing and sizes (ADR 0008)

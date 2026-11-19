@@ -12,10 +12,9 @@
 //!   one paste so tweens between pasted keys still pair up, and symbols they need come along
 //!   (also from another document).
 
-use crate::cmds_modify::{collect_symbols, import_symbols};
 use crate::cmds_timeline::{count_param, insert_keyframe_at, remove_frame, shift_after, target, target_layers};
 use crate::{CommandSpec, EngineError, MAX_FRAME, Result, Session};
-use anicraft_doc::{Element, ElementId, Keyframe, Layer, LayerId, Symbol};
+use anicraft_doc::{Element, ElementId, Keyframe, Layer, LayerId};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,9 +40,9 @@ pub struct FrameSlice {
 pub struct FrameClipboard {
     pub layers: Vec<FrameSlice>,
     pub count: u32,
-    pub symbols: Vec<Arc<Symbol>>,
-    /// Sounds the copied keyframes play, so they paste into other documents too.
-    pub sounds: Vec<Arc<anicraft_doc::Sound>>,
+    /// The symbols and bitmaps the copied artwork uses and the sounds the keyframes play, so
+    /// they paste into other documents too (ADR 0112).
+    pub carried: crate::transfer::Carried,
 }
 
 impl FrameClipboard {
@@ -90,20 +89,15 @@ fn copy_frames(s: &mut Session, p: &Value) -> Result<Value> {
         let l = s.timeline().layer(id).ok_or_else(|| EngineError::State(format!("no layer with id {}", id.0)))?;
         layers.push(FrameSlice { name: l.name.clone(), keys: slice(l, frame, count)? });
     }
-    let clip = FrameClipboard { layers, count, symbols: Vec::new(), sounds: Vec::new() };
+    let clip = FrameClipboard { layers, count, carried: Default::default() };
     if clip.is_empty() {
         return Err(EngineError::State("no frames there to copy".into()));
     }
     let elements: Vec<Element> = clip.layers.iter().flat_map(|l| l.keys.iter().flat_map(|k| k.elements.iter().map(|e| (**e).clone()))).collect();
-    let symbols = collect_symbols(s, &elements);
     let n = clip.layers.len();
-    let mut sounds: Vec<Arc<anicraft_doc::Sound>> = Vec::new();
-    for id in clip.layers.iter().flat_map(|l| l.keys.iter().filter_map(|k| k.sound.as_ref().map(|f| f.sound))) {
-        if let Some(x) = s.doc.sounds.iter().find(|x| x.id == id) && !sounds.iter().any(|y| y.id == id) {
-            sounds.push(x.clone());
-        }
-    }
-    s.frame_clipboard = FrameClipboard { symbols, sounds, ..clip };
+    let sounds: Vec<anicraft_doc::SoundId> = clip.layers.iter().flat_map(|l| l.keys.iter().filter_map(|k| k.sound.as_ref().map(|f| f.sound))).collect();
+    let carried = crate::transfer::carry(s, &elements, sounds);
+    s.frame_clipboard = FrameClipboard { carried, ..clip };
     Ok(json!({"copied": count, "layers": n}))
 }
 
@@ -124,13 +118,7 @@ fn paste_frames(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::State("the timeline would grow past its maximum length".into()));
     }
     let mut row = s.timeline().layers.iter().position(|l| l.id == top).ok_or_else(|| EngineError::State(format!("no layer with id {}", top.0)))?;
-    import_symbols(s, &clip.symbols);
-    for x in &clip.sounds {
-        if s.doc.sound(x.id).is_none() {
-            s.doc.next_id = s.doc.next_id.max(x.id.0.saturating_add(1));
-            s.doc.sounds.push(x.clone());
-        }
-    }
+    let map = crate::transfer::bring(s, &clip.carried);
     let mut remap: HashMap<ElementId, ElementId> = HashMap::new();
     let mut pasted = Vec::new();
     for sl in &clip.layers {
@@ -151,6 +139,7 @@ fn paste_frames(s: &mut Session, p: &Value) -> Result<Value> {
         for k in &sl.keys {
             let mut k = (**k).clone();
             k.start += frame;
+            map.keyframe(&mut k);
             for e in &mut k.elements {
                 let old = e.id;
                 let new = *remap.entry(old).or_insert_with(|| ElementId(s.doc.alloc_id()));

@@ -35,6 +35,79 @@ allow = ["OFL-1.1", "Ubuntu-font-1.0"]
 crate = "webpki-root-certs@=1.0.12"
 allow = ["CDLA-Permissive-2.0"]
 
+# Approved by the project lead (2026-11-17) for the shared Craft libraries: `craft-audio` decodes
+# through symphonia (MPL-2.0, file-level copyleft, used unmodified; its source is linked from
+# ATTRIBUTION.md) and `craft-image-codecs` encodes JPEG with jpeg-encoder (IJG, acknowledged in
+# NOTICE). Scoped to these crates; the allowlist above is unchanged. Raised with the shared
+# libraries team: storytold/craft-libs#2100.
+[[licenses.exceptions]]
+crate = "symphonia"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "symphonia-core"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "symphonia-common"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "symphonia-metadata"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "symphonia-bundle-flac"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "symphonia-bundle-mp3"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "symphonia-codec-aac"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "symphonia-codec-adpcm"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "symphonia-codec-alac"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "symphonia-codec-pcm"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "symphonia-codec-vorbis"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "symphonia-format-caf"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "symphonia-format-isomp4"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "symphonia-format-mkv"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "symphonia-format-ogg"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "symphonia-format-riff"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "jpeg-encoder"
+allow = ["IJG"]
+
 [licenses.private]
 # Our own workspace crates are MIT OR Apache-2.0 (checked by `cargo deny` like any other crate).
 ignore = false

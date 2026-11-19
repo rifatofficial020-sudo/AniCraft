@@ -88,7 +88,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     let Some(t) = target(app, &ed) else { return };
     let mut open = true;
     let title = tr!("Edit Envelope — {name}", name = t.sound.name);
-    let shown = egui::Window::new(title.clone())
+    let shown = crate::windows::new(ctx, title.clone())
         .id(egui::Id::new("envelope_editor"))
         .open(&mut open)
         .collapsible(false)

@@ -141,6 +141,8 @@ pub fn menu(app: &mut App, ui: &mut egui::Ui, cmds: &[CommandSpec], item: impl F
     for spec in cmds.iter().filter(|c| c.menu == "Commands") {
         item(app, ui, spec);
     }
+    // Saved commands last, as Animate lists them (ADR 0097).
+    crate::macros_ui::menu_items(app, ui);
 }
 
 fn hex_rgb(s: &str) -> [u8; 3] {
@@ -286,7 +288,7 @@ fn manager(app: &mut App, ctx: &egui::Context) {
     let mut open = app.show_plugins;
     let mut action: Option<(&'static str, String)> = None;
     let title = tr!("Plug-ins");
-    let shown = egui::Window::new(title).id(egui::Id::new("plugins_window")).open(&mut open).collapsible(false).resizable(false).default_width(560.0).show(ctx, |ui| {
+    let shown = crate::windows::new(ctx, title).id(egui::Id::new("plugins_window")).open(&mut open).collapsible(false).resizable(false).default_width(560.0).show(ctx, |ui| {
         let list: Vec<Arc<Plugin>> = app.s.plugins.list().cloned().collect();
         if list.is_empty() {
             ui.label(text(Type::Label, tr!("No plug-ins installed yet. Plug-ins are WebAssembly (.wasm) files that add commands (generators, selection effects), export formats and eases.")));

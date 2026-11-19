@@ -32,6 +32,15 @@ pub fn specs() -> Vec<CommandSpec> {
         c("path.add_point", "Add Anchor Point", "", None, "{id, x, y, slop?}", true, add_point),
         c("path.delete_points", "Delete Anchor Points", "", None, "{id, cmds: [..]}", true, delete_points),
         c("path.convert_point", "Convert Anchor Point", "", None, "{id, cmd, smooth: bool}", true, convert_point),
+        c(
+            "path.extend",
+            "Continue Path",
+            "",
+            None,
+            "{id, d: SVG path data (stage space) of the new piece, drawn away from the end it continues, end?: \"end\" | \"start\" (default end), close?: bool}: continues an open path (one subpath, not closed) from one of its ends, as the Pen does (ADR 0115). The piece joins the path's own end point (its M is where the pen started and isn't kept); with close the path is closed after it",
+            true,
+            extend,
+        ),
     ]
 }
 
@@ -72,7 +81,7 @@ fn draw_path(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::Param("param 'd' is too long".into()));
     }
     // Full SVG path data: relative commands, H/V, S/T shorthands and arcs too.
-    let path = anicraft_geom::svg::parse_path_data(d).map_err(|e| EngineError::Param(format!("param 'd': {e}")))?;
+    let path = anicraft_svg::parse_path_data(d).map_err(|e| EngineError::Param(format!("param 'd': {e}")))?;
     add_path(s, "path", path, p)
 }
 
@@ -259,5 +268,101 @@ fn convert_point(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let changed = if smooth { path.make_smooth(cmd) } else { path.make_corner(cmd) };
         Ok(json!({"changed": changed}))
+    })
+}
+
+/// `cmds` (a move and segments, one open subpath) drawn the other way round.
+fn reversed_open(cmds: &[PathCmd]) -> Vec<PathCmd> {
+    let mut out = Vec::with_capacity(cmds.len());
+    let mut it = cmds.iter().rev().peekable();
+    if let Some(end) = cmds.iter().rev().find_map(|c| match *c {
+        PathCmd::MoveTo(p) | PathCmd::LineTo(p) | PathCmd::QuadTo(_, p) | PathCmd::CubicTo(_, _, p) => Some(p),
+        PathCmd::Close => None,
+    }) {
+        out.push(PathCmd::MoveTo(end));
+    }
+    while let Some(c) = it.next() {
+        // Each segment now ends where it started: the anchor of the command before it.
+        let Some(start) = it.peek().and_then(|prev| match **prev {
+            PathCmd::MoveTo(p) | PathCmd::LineTo(p) | PathCmd::QuadTo(_, p) | PathCmd::CubicTo(_, _, p) => Some(p),
+            PathCmd::Close => None,
+        }) else {
+            break;
+        };
+        match *c {
+            PathCmd::LineTo(_) => out.push(PathCmd::LineTo(start)),
+            PathCmd::QuadTo(q, _) => out.push(PathCmd::QuadTo(q, start)),
+            PathCmd::CubicTo(c1, c2, _) => out.push(PathCmd::CubicTo(c2, c1, start)),
+            PathCmd::MoveTo(_) | PathCmd::Close => {}
+        }
+    }
+    out
+}
+
+/// Continue Path (ADR 0115): the Pen picks up an open path at one of its ends and draws on.
+fn extend(s: &mut Session, p: &Value) -> Result<Value> {
+    let d = str_req(p, "d")?;
+    if d.len() > 4_000_000 {
+        return Err(EngineError::Param("param 'd' is too long".into()));
+    }
+    let piece = anicraft_svg::parse_path_data(d).map_err(|e| EngineError::Param(format!("param 'd': {e}")))?;
+    let at_start = match opt_str(p, "end")?.unwrap_or("end") {
+        "end" => false,
+        "start" => true,
+        other => return Err(EngineError::Param(format!("param 'end' must be \"end\" or \"start\", not '{other}'"))),
+    };
+    let close = opt_bool(p, "close")?.unwrap_or(false);
+    let one_open = |path: &Path| matches!(path.cmds.first(), Some(PathCmd::MoveTo(_))) && !path.cmds.iter().skip(1).any(|c| matches!(c, PathCmd::MoveTo(_) | PathCmd::Close));
+    if !one_open(&piece) || piece.cmds.len() < 2 {
+        return Err(EngineError::Param("param 'd' must be one open piece: a move, then at least one segment".into()));
+    }
+    edit_shape(s, p, |sh, m| {
+        let inv = m.inverse().ok_or_else(|| EngineError::State("the shape is scaled to zero".into()))?;
+        let path = Arc::make_mut(&mut sh.path);
+        if !one_open(path) || path.cmds.len() < 2 {
+            return Err(EngineError::State("only an open path can be continued (this one is closed or has several parts)".into()));
+        }
+        if path.cmds.len() + piece.cmds.len() > MAX_CMDS {
+            return Err(EngineError::Param(format!("path has more than {MAX_CMDS} commands")));
+        }
+        let local = piece.transformed(&inv);
+        if !local.cmds.iter().all(|c| match *c {
+            PathCmd::MoveTo(a) | PathCmd::LineTo(a) => a.is_finite(),
+            PathCmd::QuadTo(a, b) => a.is_finite() && b.is_finite(),
+            PathCmd::CubicTo(a, b, c) => a.is_finite() && b.is_finite() && c.is_finite(),
+            PathCmd::Close => true,
+        }) {
+            return Err(EngineError::Param("the piece is too large".into()));
+        }
+        let before = path.clone();
+        if at_start {
+            // The piece was drawn away from the start: turned round, it arrives there, and
+            // the path goes on from its own first point as it always did.
+            let mut cmds = reversed_open(&local.cmds);
+            let Some(PathCmd::MoveTo(first)) = path.cmds.first().copied() else { return Err(EngineError::State("the path has no start".into())) };
+            if let Some(PathCmd::LineTo(a) | PathCmd::QuadTo(_, a) | PathCmd::CubicTo(_, _, a)) = cmds.last_mut() {
+                *a = first;
+            }
+            cmds.extend(path.cmds.iter().skip(1).copied());
+            path.cmds = cmds;
+        } else {
+            path.cmds.extend(local.cmds.iter().skip(1).copied());
+        }
+        if close {
+            // A piece that ends on the path's other end (the Pen clicked it) meets it exactly.
+            let start = path.cmds.first().and_then(|c| if let PathCmd::MoveTo(a) = *c { Some(a) } else { None });
+            if let (Some(start), Some(PathCmd::LineTo(a) | PathCmd::QuadTo(_, a) | PathCmd::CubicTo(_, _, a))) = (start, path.cmds.last_mut())
+                && m.apply(*a).distance(m.apply(start)) <= 0.01
+            {
+                *a = start;
+            }
+            path.cmds.push(PathCmd::Close);
+            path.close_explicitly();
+        }
+        if let Err(e) = check_path(path) {
+            *path = before;
+            return Err(e);
+        }
+        Ok(json!({"cmds": path.cmds.len(), "closed": close}))
     })
 }

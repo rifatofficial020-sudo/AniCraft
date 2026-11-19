@@ -23,9 +23,12 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod binning;
+mod gate;
 pub mod gpu_binning;
 pub mod images;
 mod layers;
+
+pub use gate::{CLOSE_WAIT, SUBMIT_WAIT, SubmitGate};
 
 use anicraft_doc::DisplayList;
 use anicraft_render::{MAX_PIXELS, NeedsFull, Pixmap, RenderStats, View, paint::premultiply, prepare_scene};
@@ -205,9 +208,19 @@ pub struct GpuRenderer {
     pub adapter: String,
     /// Whether the device is the window's (frames go to textures the window shows).
     pub shared: bool,
+    /// When work may be submitted on the window's device ([`SubmitGate`], ADR 0105).
+    gate: Option<Arc<SubmitGate>>,
     /// First device failure (an error in a render, an uncaptured error or the device's loss).
     /// Once set, the renderer refuses to draw and callers fall back to the CPU.
     broken: Arc<Mutex<Option<String>>>,
+}
+
+/// Whose device a renderer draws on.
+enum Home {
+    /// A headless device of its own.
+    Own,
+    /// The window's, with the gate its work is submitted through, if the window has one.
+    Window(Option<Arc<SubmitGate>>),
 }
 
 /// Checks an adapter and device can run the stage; the device's own limits are what count
@@ -301,6 +314,18 @@ impl GpuRenderer {
     /// window's error handling stays as it was. `Err` means "use a device of our own, or the
     /// CPU".
     pub fn shared(adapter: &wgpu::Adapter, device: wgpu::Device, queue: wgpu::Queue) -> Result<GpuRenderer, GpuError> {
+        Self::on_window(adapter, device, queue, None)
+    }
+
+    /// [`GpuRenderer::shared`] for a window that reconfigures its surface while the renderer
+    /// draws on other threads, which is every window: all its work, the starting self-test
+    /// included, is submitted through `gate`, which the window's thread opens for its frames
+    /// (ADR 0105).
+    pub fn shared_gated(adapter: &wgpu::Adapter, device: wgpu::Device, queue: wgpu::Queue, gate: Arc<SubmitGate>) -> Result<GpuRenderer, GpuError> {
+        Self::on_window(adapter, device, queue, Some(gate))
+    }
+
+    fn on_window(adapter: &wgpu::Adapter, device: wgpu::Device, queue: wgpu::Queue, gate: Option<Arc<SubmitGate>>) -> Result<GpuRenderer, GpuError> {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let info = adapter.get_info();
             let name = format!("{} ({:?})", info.name, info.backend);
@@ -309,7 +334,7 @@ impl GpuRenderer {
             }
             let limits = device.limits();
             check(adapter, &limits, &name)?;
-            Self::build(device, queue, limits, name, info.backend, true, Arc::new(Mutex::new(None)))
+            Self::build(device, queue, limits, name, info.backend, Home::Window(gate), Arc::new(Mutex::new(None)))
         }))
         .unwrap_or_else(|_| Err(GpuError::Unavailable("the GPU driver failed while starting".into())))
     }
@@ -347,10 +372,10 @@ impl GpuRenderer {
                 g.get_or_insert_with(|| format!("device lost: {msg}"));
             });
         }
-        Self::build(device, queue, want, name, info.backend, false, broken)
+        Self::build(device, queue, want, name, info.backend, Home::Own, broken)
     }
 
-    fn build(device: wgpu::Device, queue: wgpu::Queue, limits: wgpu::Limits, name: String, backend: wgpu::Backend, shared: bool, broken: Arc<Mutex<Option<String>>>) -> Result<GpuRenderer, GpuError> {
+    fn build(device: wgpu::Device, queue: wgpu::Queue, limits: wgpu::Limits, name: String, backend: wgpu::Backend, home: Home, broken: Arc<Mutex<Option<String>>>) -> Result<GpuRenderer, GpuError> {
         let scopes = Scopes::push(&device);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("anicraft-fine"), source: wgpu::ShaderSource::Wgsl(include_str!("fine.wgsl").into()) });
         let entry = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::COMPUTE, ty, count: None };
@@ -414,7 +439,11 @@ impl GpuRenderer {
             images: Mutex::new(images::Images::default()),
             limits,
             adapter: name,
-            shared,
+            shared: matches!(home, Home::Window(_)),
+            gate: match home {
+                Home::Window(gate) => gate,
+                Home::Own => None,
+            },
             broken,
         };
         r.self_test()?;
@@ -576,7 +605,7 @@ impl GpuRenderer {
                 let _ = self.pop(scopes);
                 return Err(e);
             }
-            self.queue.submit([enc.finish()]);
+            self.submit(enc.finish());
             self.pop(scopes)?;
             timings.gpu = ms(t);
             Ok(GpuTexture { texture, view: tex_view, width: w, height: h, stats, timings, entries: cost.entries, pieces: cost.pieces, gpu_binned: job.binned.gpu.is_some() })
@@ -596,7 +625,7 @@ impl GpuRenderer {
                 wgpu::TexelCopyBufferInfo { buffer: &read, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(t.height) } },
                 wgpu::Extent3d { width: t.width, height: t.height, depth_or_array_layers: 1 },
             );
-            self.queue.submit([enc.finish()]);
+            self.submit(enc.finish());
             let bytes = self.map(&read, scopes)?;
             let mut out = Vec::with_capacity(t.width as usize * t.height as usize * 4);
             for r in bytes.chunks(row as usize) {
@@ -604,6 +633,15 @@ impl GpuRenderer {
             }
             Ok(out)
         })
+    }
+
+    /// Hands finished commands to the queue: on a window's device only while its gate is open
+    /// (a window can't reconfigure its surface while work is being submitted, ADR 0105).
+    fn submit(&self, commands: wgpu::CommandBuffer) {
+        match &self.gate {
+            Some(gate) => gate.run(|| self.queue.submit([commands])),
+            None => self.queue.submit([commands]),
+        };
     }
 
     /// Blocks until everything submitted so far has run (benchmarks).
@@ -821,7 +859,7 @@ impl GpuRenderer {
             return Err(e);
         }
         enc.copy_buffer_to_buffer(&obuf, 0, &read, 0, out_bytes);
-        self.queue.submit([enc.finish()]);
+        self.submit(enc.finish());
         let bytes = self.map(&read, scopes)?;
         Ok(match output {
             Output::Premul8 => (bytes, None),
@@ -852,7 +890,7 @@ impl GpuRenderer {
         let read = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("readback"), size: isize + gsize, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         enc.copy_buffer_to_buffer(&ibuf, 0, &read, 0, isize);
         enc.copy_buffer_to_buffer(&gbuf, 0, &read, isize, gsize);
-        self.queue.submit([enc.finish()]);
+        self.submit(enc.finish());
         let bytes = self.map(&read, scopes)?;
         let words: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect();
         let n = isize as usize / 4;

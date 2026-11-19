@@ -17,6 +17,11 @@ frames, the keyboard menu bar, the system's contrast setting); the rules for con
   is Stage → Timeline → Properties → Library → Tools. The status bar says where you landed, and
   a screen reader reads the panel's name. Both keys can be changed in the shortcut sheet
   (View › Next Panel, Previous Panel). F6 alone is still Insert Keyframe.
+* **Move between open documents with Ctrl+Tab** and **Ctrl+Shift+Tab** (the Control key on
+  macOS too), or Ctrl+PageDown and Ctrl+PageUp (ADR 0112). The status bar says which document
+  you landed on. To a screen reader the document tabs are a tab list, "Open documents": each
+  tab reads its document's name, whether it is selected, and "unsaved changes" when it has
+  them, and each has a Close button named after its document.
 * **Inside a panel, Tab and Shift+Tab** move between controls in reading order; Enter or Space
   presses the focused button, ticks the focused checkbox or opens the focused menu; the arrow
   keys change a focused slider or number field.

@@ -12,7 +12,7 @@ fn rect(id: u64, x: f32, y: f32, w: f32, h: f32, c: u32) -> Arc<Element> {
 }
 
 fn inst(id: u64, symbol: u64, name: &str, m: Affine, events: Vec<EventHandler>) -> Arc<Element> {
-    Arc::new(Element { id: ElementId(id), name: name.into(), transform: m, color: ColorEffect::default(), kind: ElementKind::Symbol { symbol: SymbolId(symbol), loop_mode: LoopMode::Loop, first_frame: 0, blend: BlendMode::Normal, filters: Vec::new(), events } })
+    Arc::new(Element { id: ElementId(id), name: name.into(), transform: m, color: ColorEffect::default(), kind: ElementKind::Symbol { symbol: SymbolId(symbol), loop_mode: LoopMode::Loop, first_frame: 0, blend: BlendMode::Normal, filters: Vec::new(), events, pivot: None } })
 }
 
 fn kf(start: u32, duration: u32, elements: Vec<Arc<Element>>, actions: Vec<Action>, label: &str) -> Arc<Keyframe> {
@@ -622,7 +622,7 @@ fn sounds_carry_their_envelopes_and_volumes_and_start_in_graphics_and_clips_as_i
         l.volume = volume;
         Arc::new(l)
     };
-    let inst = |id, symbol| Arc::new(Element { id: ElementId(id), name: String::new(), transform: Affine::IDENTITY, color: Default::default(), kind: ElementKind::Symbol { symbol: SymbolId(symbol), loop_mode: Default::default(), first_frame: 0, blend: Default::default(), filters: Vec::new(), events: Vec::new() } });
+    let inst = |id, symbol| Arc::new(Element { id: ElementId(id), name: String::new(), transform: Affine::IDENTITY, color: Default::default(), kind: ElementKind::Symbol { symbol: SymbolId(symbol), loop_mode: Default::default(), first_frame: 0, blend: Default::default(), filters: Vec::new(), events: Vec::new(), pivot: None } });
     // A graphic with a fading sound on its frame 1 (of 2), a clip with a left-channel one on its
     // frame 0 (of 3), both on a layer at half volume; a sound of the main timeline's own.
     doc.library.push(Arc::new(Symbol { linkage: None, scale_grid_kept: None, scale_grid: None, id: SymbolId(20), name: "g".into(), kind: SymbolKind::Graphic, timeline: Timeline { layers: vec![layer(21, vec![key(0, 1, None, vec![]), key(1, 1, snd(SoundSync::Event, SoundEffect::FadeOut), vec![])], 1.0)] } }));
@@ -819,7 +819,8 @@ fn logic() -> Document {
         trace(\"start \" + score + \" \" + label + \" \" + ticks + \" \" + currentFrame + \"/\" + totalFrames + \" \" + currentLabel);\n\
         for (var i:int = 0; i < 5; i++) { if (i % 2 == 0) continue; total += i * 1.5; }\n\
         var k:int = 3; while (k > 0) { k--; } do { k += 2; } while (k < 5);\n\
-        trace(total, k, Math.max(1, 7, 3), Math.min(), Math.round(-2.5), Math.abs(-0.25), int(\"42\") + uint(-1), 7 / 2, \"10\" < \"9\", 1 == \"1\", null == undefined);\n\
+        trace(total, k, Math.max(1, 7, 3), Math.min(), Math.round(-2.5), 1 / Math.round(-0.5), 1 / Math.round(-0.4), Math.abs(-0.25), int(\"42\") + uint(-1), 7 / 2, \"10\" < \"9\", 1 == \"1\", null == undefined);\n\
+        trace(1 / Math.max(Math.round(-0.4), 0), 1 / Math.max(0, Math.round(-0.4)), 1 / Math.min(Math.round(-0.4), 0), 1 / Math.min(0, Math.round(-0.4)));\n\
         trace(Math.floor(Math.random() * 100), Math.random() < 1, knob.x, knob.y, knob.alpha, knob.visible, knob.name, panel.currentFrame, panel.totalFrames);\n\
         addEventListener(Event.ENTER_FRAME, onTick);\n\
         stage.addEventListener(KeyboardEvent.KEY_DOWN, onKey);\n\
@@ -866,7 +867,7 @@ fn the_js_player_runs_small_logic_like_the_rust_player() {
     script.push((vec![Event::Move(at(10.0, 10.0)), Event::Leave], vec![Event::KeyDown(39)]));
     script.extend((0..20).map(|_| none()));
     let lines = compare(&doc, &script);
-    for want in ["start 0 go 0 1/33 null", "6 6 7 Infinity -2 0.25 4294967337 3.5 true true true", "10 true 100 100 1 true knob 1 4", "frame 2: 2 go!", "Script on frame 4 of the main timeline stopped: line 4: no instance named “ghost” here", "stopped ticking", "up 39 true", "key 65"] {
+    for want in ["Infinity Infinity -Infinity -Infinity", "start 0 go 0 1/33 null", "6 6 7 Infinity -2 -Infinity -Infinity 0.25 4294967337 3.5 true true true", "10 true 100 100 1 true knob 1 4", "frame 2: 2 go!", "Script on frame 4 of the main timeline stopped: line 4: no instance named “ghost” here", "stopped ticking", "up 39 true", "key 65"] {
         assert!(lines.iter().any(|l| l == want), "the logic fixture never wrote {want:?}: {lines:?}");
     }
     assert!(lines.iter().any(|l| l == "click knob true 11"), "{lines:?}");
@@ -893,7 +894,7 @@ fn the_js_player_draws_random_numbers_like_the_rust_player() {
 /// (layout isn't compared: neither player lays text out here).
 fn field_el(id: u64, name: &str, at: Vec2, (w, h): (f32, f32), text: &str, f: Option<anicraft_doc::TextField>) -> Arc<Element> {
     let n = text.chars().count() as f32;
-    let t = anicraft_doc::TextBlock { text: text.into(), font: "Inter".into(), size: 14.0, bold: true, italic: false, color: Rgba::hex(0x112233), align: anicraft_doc::TextAlign::Center, letter_spacing: 0.5, line_spacing: 2.0, width: None, outline: Arc::new(Path::rect(2.0, 2.0, 8.0 * n, 12.0)), box_width: w, box_height: h, field: f, on_path: None };
+    let t = anicraft_doc::TextBlock { text: text.into(), font: "Inter".into(), size: 14.0, bold: true, italic: false, color: Rgba::hex(0x112233), align: anicraft_doc::TextAlign::Center, letter_spacing: 0.5, line_spacing: 2.0, width: None, outline: Arc::new(Path::rect(2.0, 2.0, 8.0 * n, 12.0)), box_width: w, box_height: h, field: f, on_path: None, ..Default::default() };
     Arc::new(Element { id: ElementId(id), name: name.into(), transform: Affine::translate(at.x, at.y), color: ColorEffect::default(), kind: ElementKind::Text(Arc::new(t)) })
 }
 
@@ -1250,7 +1251,7 @@ fn filters_and_soft_masks_compose_in_the_page_as_in_the_renderer() {
                 // A mask over the symbol: its artwork drawn as it looks on its own, read as the
                 // page reads it (canvas.js `maskEnd`).
                 let reveal: Option<Vec<f32>> = (!inside).then(|| {
-                    let art = anicraft_doc::DisplayList { items: dl.items.iter().filter(|i| i.masks.is_some()).map(|i| anicraft_doc::DisplayItem { masks: None, clip: None, group: None, ..i.clone() }).collect(), clip_parents: Vec::new(), clip_modes: Vec::new(), groups: Vec::new() };
+                    let art = anicraft_doc::DisplayList { links: Vec::new(), items: dl.items.iter().filter(|i| i.masks.is_some()).map(|i| anicraft_doc::DisplayItem { masks: None, clip: None, group: None, ..i.clone() }).collect(), clip_parents: Vec::new(), clip_modes: Vec::new(), groups: Vec::new() };
                     let (mp, _) = crate::render(&art, &crate::View { background: None, ..view }).unwrap();
                     mp.data.iter().map(|p| mode.reveal(*p)).collect()
                 });
@@ -1441,4 +1442,145 @@ fn custom_and_per_property_eases_play_in_the_page_as_they_evaluate() {
     d.timeline_mut(0).layers = vec![layer(1, vec![Arc::new(k0), Arc::new(k1)]), layer(2, vec![kf(0, 24, vec![inst(3, 50, "", Affine::translate(100.0, 250.0), Vec::new())], vec![], "")])];
     d.sanitize();
     compare(&d, &vec![(vec![], vec![]); 30]);
+}
+
+// Frozen pre-cutover escaping oracle; original application behavior.
+fn previous_html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+#[test]
+fn shared_html_escape_preserves_all_unicode_scalars() {
+    for ch in (0..=0x10ffff).filter_map(char::from_u32) {
+        let mut buf = [0u8; 4];
+        let text = ch.encode_utf8(&mut buf);
+        assert_eq!(super::escape_html(text), previous_html_escape(text), "{ch:?}");
+    }
+    for text in ["<script>&\"'", "a\n\t\r\0z", "é 😀 &amp;", ""] {
+        assert_eq!(super::escape_html(text), previous_html_escape(text));
+    }
+}
+
+/// ADR 0099: filters on text reach the page as an instance's do (`fx`, `fm`), switched-off ones
+/// left out; the page's player draws the text in a filtered group exactly as `evaluate` does,
+/// static text and fields alike; and what an input field can't show is reported.
+#[test]
+fn filters_on_text_reach_the_page_and_group_as_in_the_renderer() {
+    use anicraft_doc::{Filter, FilterEntry, TextField, TextKind};
+    let with = |e: Arc<Element>, filters: Vec<FilterEntry>, color: ColorEffect| {
+        let mut e = (*e).clone();
+        if let Some(list) = e.kind.filters_mut() {
+            *list = filters;
+        }
+        e.color = color;
+        Arc::new(e)
+    };
+    let shadow = FilterEntry::from(Filter::new("drop_shadow").unwrap());
+    let glow = FilterEntry::from(Filter::Glow { blur_x: 6.0, blur_y: 6.0, strength: 2.0, quality: 2, color: Rgba::hex(0x00aaff), inner: false, knockout: false });
+    let off = FilterEntry { filter: Filter::new("blur").unwrap(), enabled: false };
+    let mut note = TextField::new(TextKind::Dynamic);
+    (note.background, note.border) = (true, true);
+    let mut doc = Document { stage: anicraft_doc::Stage { width: 200, height: 120, fps: 24.0, background: Rgba::hex(0xffffff) }, ..Document::default() };
+    let els = vec![
+        // Static text with a glow, half transparent: the group fades, after the filters.
+        with(field_el(60, "", Vec2::new(5.0, 5.0), (40.0, 16.0), "Hi", None), vec![glow.clone()], ColorEffect::Alpha(0.5)),
+        // A dynamic field with a shadow (and a filter switched off): box, text and border as one.
+        with(field_el(61, "note_txt", Vec2::new(5.0, 30.0), (150.0, 40.0), "Hello", Some(note)), vec![off.clone(), shadow.clone()], ColorEffect::default()),
+        // An input field with a glow: the page's form element draws what is typed.
+        with(field_el(62, "name_txt", Vec2::new(5.0, 80.0), (90.0, 18.0), "", Some(TextField::new(TextKind::Input))), vec![glow.clone()], ColorEffect::default()),
+        // Text whose only filter is off, and plain text: as before, no group.
+        with(field_el(63, "", Vec2::new(120.0, 5.0), (40.0, 16.0), "No", None), vec![off], ColorEffect::default()),
+        field_el(64, "", Vec2::new(160.0, 5.0), (30.0, 16.0), "Ok", None),
+    ];
+    Arc::make_mut(&mut doc.timeline_mut(0).layers[0]).keyframe_mut(0).unwrap().elements = els;
+    let m = movie(&doc, &HtmlOptions::default());
+    let items = m.json["contents"][0]["l"][0]["e"].as_array().unwrap().clone();
+    assert_eq!(items.iter().map(|e| e.get("fx").is_some()).collect::<Vec<_>>(), [true, true, true, false, false]);
+    assert_eq!(items[0]["fx"].as_array().map(Vec::len), Some(1));
+    assert_eq!(items[0]["fx"][0]["k"], "shadow", "a glow is the page's shadow kind");
+    assert_eq!(items[0]["fm"].as_f64(), Some(f64::from(glow.filter.margin())));
+    assert_eq!(items[1]["fx"].as_array().map(Vec::len), Some(1), "the filter that is off is left out: {}", items[1]["fx"]);
+    assert_eq!(items[1]["fm"].as_f64(), Some(f64::from(shadow.filter.margin())));
+    assert!(items[1].get("tf").is_some() && items[0].get("tf").is_none());
+    assert_eq!(m.report.get(INPUT_FILTERS), Some(&1), "{:?}", m.report);
+    // The page's display list is the renderer's: three filtered groups, their items in them.
+    let r = start(&doc, &mut NoScripts);
+    let mut js = Js::new(&m);
+    js.eval("P.start().output");
+    same_display_list(&mut js, &m, &doc, &r.state, "start");
+    let dl = evaluate_player(&doc, &r.state);
+    assert_eq!(dl.groups.iter().map(|g| (g.filters.len(), g.alpha)).collect::<Vec<_>>(), [(1, 0.5), (1, 1.0), (1, 1.0)]);
+    // The page hears each group open and close around its text (canvas.js draws so).
+    let seen = js.eval("(function () { var out = []; P.evaluate({ item: function () { out.push('i'); }, field: function (f) { out.push('f' + f.group); }, clipBegin: function () {}, clipEnd: function () {}, maskBegin: function () {}, maskEnd: function () {}, groupBegin: function (g, grp) { out.push('<' + g + ':' + grp.filters.length + ':' + grp.margin); }, groupEnd: function (g) { out.push('>' + g); } }); return out.join(' '); })()");
+    let want = format!("<0:1:{} i >0 <1:1:{} f1 >1 <2:1:{} f2 >2 i i", glow.filter.margin(), shadow.filter.margin(), glow.filter.margin());
+    assert_eq!(seen, json!(want));
+    // Mask artwork takes no filters: the text masks as it is.
+    let mut masked = doc.clone();
+    let tl = masked.timeline_mut(0);
+    let mut below = Layer::new(LayerId(7), "below");
+    below.keyframe_mut(0).unwrap().elements = vec![rect(70, 0.0, 0.0, 200.0, 120.0, 0x223344)];
+    below.parent = Some(tl.layers[0].id);
+    Arc::make_mut(&mut tl.layers[0]).kind = LayerKind::Mask;
+    tl.layers.push(Arc::new(below));
+    let m = movie(&masked, &HtmlOptions::default());
+    let r = start(&masked, &mut NoScripts);
+    let mut js = Js::new(&m);
+    js.eval("P.start().output");
+    same_display_list(&mut js, &m, &masked, &r.state, "masking");
+    assert!(evaluate_player(&masked, &r.state).groups.is_empty());
+}
+
+#[test]
+fn layer_opacity_comes_across_as_one_fade_group_a_layer() {
+    // The fixture with every layer faded (in the symbols too) and the bottom layer in a faded
+    // folder: the page's display list has the same groups as the evaluator's on every frame
+    // (ADR 0111).
+    let mut doc = fixture();
+    for sym in doc.library.iter_mut() {
+        for l in Arc::make_mut(sym).timeline.layers.iter_mut() {
+            Arc::make_mut(l).opacity = 0.75;
+        }
+    }
+    let tl = doc.timeline_mut(0);
+    for l in tl.layers.iter_mut() {
+        Arc::make_mut(l).opacity = 0.4;
+    }
+    let n = tl.layers.len();
+    let mut folder = Layer::new(LayerId(7100), "Folder");
+    folder.kind = LayerKind::Folder;
+    folder.opacity = 0.5;
+    Arc::make_mut(&mut tl.layers[n - 1]).parent = Some(LayerId(7100));
+    tl.layers.insert(n - 1, Arc::new(folder));
+    doc.sanitize();
+    assert!((doc.timeline(0).layer_opacity(n) - 0.2).abs() < 1e-6, "the folder link survives");
+    let m = movie(&doc, &HtmlOptions::default());
+    let faded: Vec<f64> = m.json["contents"].as_array().unwrap().iter().flat_map(|c| c["l"].as_array().unwrap().iter()).filter_map(|l| l["o"].as_f64()).collect();
+    for want in [0.4, 0.2, 0.75] {
+        assert!(faded.iter().any(|o| (o - want).abs() < 1e-3), "{want} in {faded:?}");
+    }
+    let dl = evaluate_player(&doc, &PlayerState::seeded(1));
+    assert!(dl.groups.iter().any(|g| (g.alpha - 0.2).abs() < 1e-6) && dl.groups.iter().any(|g| g.parent.is_some()), "{:?}", dl.groups);
+    compare(&doc, &vec![(vec![], vec![]); 12]);
+}
+
+#[test]
+fn layers_that_follow_a_parent_layer_come_across() {
+    // The arm sample (ADR 0113): three parented layers, each tweening; the page places every
+    // layer as the Rust player does, on every frame.
+    let arm = sample::arm();
+    compare(&arm, &vec![(vec![], vec![]); 30]);
+    let page = to_html(&arm, &HtmlOptions::default()).unwrap().html;
+    assert!(page.contains("\"r\":["), "followers carry their space");
 }

@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- AniCraft XFL corpus: rectangle and oval primitives and groups (with their own matrices,
-     nested), and a hidden layer that must not draw. Self-authored. -->
+     nested), and a hidden layer that must not draw. Self-authored. As Animate writes groups,
+     members (nested groups too) are placed in the timeline's space, not the group's. -->
 <DOMDocument xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://ns.adobe.com/xfl/2008/" width="320" height="180" frameRate="24" backgroundColor="#FFFFFF">
   <timelines>
     <DOMTimeline name="Scene 1">
@@ -23,14 +24,15 @@
                 <DOMGroup>
                   <matrix><Matrix tx="180" ty="20"/></matrix>
                   <members>
-                    <DOMOvalObject x="0" y="0" objectWidth="60" objectHeight="40">
+                    <DOMOvalObject x="180" y="20" objectWidth="60" objectHeight="40">
                       <fill><SolidColor color="#E07A5F"/></fill>
                       <stroke><SolidStroke weight="3"><fill><SolidColor color="#3D405B"/></fill></SolidStroke></stroke>
                     </DOMOvalObject>
                     <DOMGroup>
-                      <matrix><Matrix a="0.5" d="0.5" tx="70" ty="0"/></matrix>
+                      <matrix><Matrix a="0.5" d="0.5" tx="250" ty="20"/></matrix>
                       <members>
                         <DOMShape>
+                          <matrix><Matrix a="0.5" d="0.5" tx="250" ty="20"/></matrix>
                           <fills><FillStyle index="1"><SolidColor color="#81B29A"/></FillStyle></fills>
                           <edges><Edge fillStyle1="1" edges="!0 0|1600 0|1600 1600|0 1600|0 0"/></edges>
                         </DOMShape>

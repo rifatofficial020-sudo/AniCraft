@@ -18,7 +18,7 @@ fn el(doc: &mut Document, name: &str, transform: Affine, kind: ElementKind) -> A
 }
 
 fn instance(symbol: SymbolId) -> ElementKind {
-    ElementKind::Symbol { symbol, loop_mode: LoopMode::Loop, first_frame: 0, blend: crate::BlendMode::Normal, filters: Vec::new(), events: Vec::new() }
+    ElementKind::Symbol { symbol, loop_mode: LoopMode::Loop, first_frame: 0, blend: crate::BlendMode::Normal, filters: Vec::new(), events: Vec::new(), pivot: None }
 }
 
 fn pose(tx: f32, ty: f32, sx: f32, sy: f32, rotation_deg: f32) -> Affine {
@@ -141,6 +141,40 @@ pub fn demo() -> Document {
 
     d.timeline_mut(0).layers = vec![ball, star, sun, hills, sky];
     d
+}
+
+/// An arm of three parented layers (ADR 0113): the forearm follows the upper arm and the hand
+/// follows the forearm, while each keeps its own classic tween. Every part is drawn from its
+/// joint, so a part's own rotation bends that joint.
+pub fn arm() -> Document {
+    let mut d = Document { stage: Stage { width: 960, height: 540, fps: 24.0, background: Rgba::hex(0xf4f1ea) }, ..demo_base() };
+    // A limb drawn from its joint at the origin along +x, with a round joint.
+    let limb = |len: f32, thick: f32, fill: u32, line: u32| {
+        let mut p = Path::rounded_rect(-thick * 0.5, -thick * 0.5, len + thick, thick, thick * 0.5);
+        p.cmds.extend(Path::ellipse(0.0, 0.0, thick * 0.18, thick * 0.18).cmds);
+        Shape { fill_rule: anicraft_geom::FillRule::EvenOdd, ..Shape::filled(p, Paint::Solid(Rgba::hex(fill))).with_stroke(Rgba::hex(line), 3.0) }
+    };
+    let (upper, fore, hand) = (LayerId(d.alloc_id()), LayerId(d.alloc_id()), LayerId(d.alloc_id()));
+    // One object per layer, the same id on both keyframes: keyed at 0 and 24, tweened between.
+    let part = |d: &mut Document, id: LayerId, name: &str, color: u32, shape: Shape, from: Affine, to: Affine| {
+        let eid = ElementId(d.alloc_id());
+        let at = |m: Affine| Arc::new(Element { id: eid, name: name.into(), transform: m, color: ColorEffect::default(), kind: ElementKind::Shape(shape.clone()) });
+        layer(id.0, name, color, vec![key(0, 24, vec![at(from)], Some(Easing::QuadInOut)), key(24, 1, vec![at(to)], None)])
+    };
+    // Each child's keys are in its parent's space: the forearm starts at the upper arm's far
+    // end (its length along +x), the hand at the forearm's.
+    let upper_l = part(&mut d, upper, "Upper arm", 0xff8a3d, limb(170.0, 54.0, 0xe9a36b, 0x7a4a22), pose(300.0, 190.0, 1.0, 1.0, 70.0), pose(300.0, 190.0, 1.0, 1.0, 10.0));
+    let mut fore_l = part(&mut d, fore, "Forearm", 0x4fa3ff, limb(150.0, 44.0, 0xf0b98a, 0x7a4a22), pose(170.0, 0.0, 1.0, 1.0, -20.0), pose(170.0, 0.0, 1.0, 1.0, -75.0));
+    let mut hand_l = part(&mut d, hand, "Hand", 0x58c26b, limb(46.0, 50.0, 0xf6cfa8, 0x7a4a22), pose(150.0, 0.0, 1.0, 1.0, 15.0), pose(150.0, 0.0, 1.0, 1.0, -35.0));
+    Arc::make_mut(&mut fore_l).rig_parent = Some(upper);
+    Arc::make_mut(&mut hand_l).rig_parent = Some(fore);
+    d.timeline_mut(0).layers = vec![hand_l, fore_l, upper_l];
+    d
+}
+
+/// An empty document with the demo's defaults.
+fn demo_base() -> Document {
+    Document { stage: Stage { width: 1280, height: 720, fps: 24.0, background: Rgba::WHITE }, scenes: vec![Arc::new(crate::Scene::new("Scene 1"))], library: Vec::new(), bitmaps: Vec::new(), sounds: Vec::new(), library_tree: Default::default(), document_class: String::new(), publish: Default::default(), aids: Default::default(), swatches: Arc::new(crate::swatch::default_set()), eases: Default::default(), next_id: 1 }
 }
 
 /// A small interactive movie (ADR 0024): a menu that stops on its first frame with a Play

@@ -392,3 +392,145 @@ fn the_eraser_takes_gradient_fills_too() {
     assert_eq!(fills(&s).len(), 2, "cut in two");
     assert!(before - after > 1500.0, "{before} → {after}");
 }
+
+/// #391: the editor pastes raw artwork floating (`float: true`). It stays whole and selected on
+/// top of the drawing, so it can be dragged off what it landed on; it goes into the drawing
+/// when the selection lets go of it. Undoing the paste takes the merge back with it.
+#[test]
+fn a_floating_paste_stays_whole_and_selected_until_it_is_deselected() {
+    let mut s = raw_session();
+    run(&mut s, "draw.rect", json!({"x": 100, "y": 100, "w": 80, "h": 60, "fill": "#3366ff", "stroke": null}));
+    run(&mut s, "edit.select_all", json!({}));
+    run(&mut s, "edit.copy", json!({}));
+    run(&mut s, "edit.deselect", json!({}));
+    let before = s.doc.clone();
+    assert_eq!(fills(&s).len(), 1);
+
+    // Paste in Place over the original: two shapes, the copy selected, nothing joined.
+    let v = run(&mut s, "edit.paste_in_place", json!({"float": true}));
+    assert_eq!(v["floating"], json!(true));
+    assert_eq!(fills(&s).len(), 2, "the copy floats over the original");
+    assert_eq!(s.selection.id_list(), ids(&v, "pasted"));
+
+    // Dragged away and dropped: the original is whole where it was, the copy beside it.
+    run(&mut s, "element.translate", json!({"dx": 200, "dy": 0}));
+    run(&mut s, "draw.drop", json!({}));
+    let f = fills(&s);
+    assert_eq!(f.len(), 2);
+    assert!(f.iter().all(|e| (area(e) - 4_800.0).abs() < 1.0));
+    assert!(s.floating.is_none(), "dropped: it is part of the drawing");
+
+    // Pasted again and deselected in place: it joins the same-coloured fill under it.
+    run(&mut s, "edit.deselect", json!({}));
+    let two = s.doc.clone();
+    run(&mut s, "edit.paste_in_place", json!({"float": true}));
+    assert_eq!(fills(&s).len(), 3);
+    run(&mut s, "edit.deselect", json!({}));
+    assert_eq!(fills(&s).len(), 2, "deselected: one fill there, not two");
+    assert!(s.selection.is_empty());
+    // One undo: before that paste. Redo: the joined drawing.
+    let joined = s.doc.clone();
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(s.doc, two);
+    run(&mut s, "edit.redo", json!({}));
+    assert_eq!(s.doc, joined);
+    for _ in 0..4 {
+        run(&mut s, "edit.undo", json!({}));
+    }
+    assert_eq!(s.doc, before, "everything undoes back to the single rectangle");
+
+    // A command that deselects it merges it too, and undoing that command brings it back
+    // floating and selected.
+    run(&mut s, "edit.paste_in_place", json!({"float": true}));
+    assert_eq!(fills(&s).len(), 2);
+    run(&mut s, "draw.rect", json!({"x": 400, "y": 300, "w": 20, "h": 20, "fill": "#ff0000", "stroke": null}));
+    assert!(s.floating.is_none());
+    assert_eq!(fills(&s).len(), 2, "the copy joined the original; the red square is new");
+    run(&mut s, "edit.undo", json!({}));
+    assert!(s.floating.is_some() && s.selection.len() == 1, "floating again after the undo");
+    assert_eq!(fills(&s).len(), 2);
+    run(&mut s, "edit.deselect", json!({}));
+    assert_eq!(fills(&s).len(), 1);
+
+    // Without float (scripts) the paste cuts and joins at once, as before.
+    let v = run(&mut s, "edit.paste_in_place", json!({}));
+    assert_eq!(v["merged"], json!(true));
+    assert!(s.floating.is_none());
+    assert_eq!(fills(&s).len(), 1);
+}
+
+/// #292: the Fill checkbox brings back the fill a shape had (a gradient too), not white; with
+/// nothing to remember it takes the tool's fill colour. #393: the same for a stroke.
+#[test]
+fn turning_a_fill_or_stroke_on_again_brings_back_what_it_was() {
+    let mut s = Session::new(anicraft_doc::Document::default());
+    run(&mut s, "draw.rect", json!({"x": 0, "y": 0, "w": 100, "h": 60, "fill": "#3366ff", "stroke": "#112233", "stroke_width": 7, "object": true}));
+    let shape = |s: &Session| match &s.visible_elements()[0].kind {
+        ElementKind::Shape(sh) => sh.clone(),
+        _ => panic!("a shape"),
+    };
+    let was = shape(&s);
+    run(&mut s, "element.set_fill", json!({"on": false}));
+    assert!(shape(&s).fill.is_none());
+    run(&mut s, "element.set_fill", json!({"on": true}));
+    assert_eq!(shape(&s).fill, was.fill, "its own blue, not white");
+    // `color: null` (the swatch's No Colour) is remembered the same way.
+    run(&mut s, "element.set_fill", json!({"color": null}));
+    run(&mut s, "element.set_fill", json!({"on": true}));
+    assert_eq!(shape(&s).fill, was.fill);
+
+    run(&mut s, "element.set_stroke", json!({"on": false}));
+    assert!(shape(&s).stroke.is_none());
+    run(&mut s, "element.set_stroke", json!({"on": true}));
+    assert_eq!(shape(&s).stroke, was.stroke, "the same colour and weight");
+
+    // Nothing remembered: the tool's fill colour and stroke.
+    run(&mut s, "draw.rect", json!({"x": 300, "y": 0, "w": 50, "h": 50, "fill": null, "stroke": "#000000", "object": true}));
+    run(&mut s, "element.set_fill", json!({"on": true}));
+    let sel = s.selection.id_list();
+    let e = s.visible_elements().into_iter().find(|e| sel.contains(&e.id.0)).unwrap();
+    assert_eq!(fill_color(&e), Some(s.style.fill));
+    assert!(s.execute("element.set_fill", &json!({})).is_err(), "a colour or on is required");
+}
+
+/// #291: a raw rectangle whose fill was turned off, then its outline double-clicked (the four
+/// sides selected): Fill on fills the rectangle again, in its own colour. And an outline drawn
+/// without a fill takes one over the area it closes off.
+#[test]
+fn fill_on_a_selected_raw_outline_fills_what_it_surrounds() {
+    let mut s = raw_session();
+    run(&mut s, "draw.rect", json!({"x": 100, "y": 100, "w": 120, "h": 80, "fill": "#3366ff", "stroke": "#000000", "stroke_width": 2}));
+    run(&mut s, "edit.deselect", json!({}));
+    assert_eq!(fills(&s).len(), 1);
+    // Click the fill, turn it off.
+    run(&mut s, "element.pick", json!({"x": 160, "y": 140}));
+    run(&mut s, "element.set_fill", json!({"on": false}));
+    assert!(fills(&s).is_empty());
+    // Double-click the outline: its sides, and nothing else.
+    run(&mut s, "element.select_connected", json!({"x": 100, "y": 140}));
+    assert!(!s.selection.is_empty());
+    run(&mut s, "element.set_fill", json!({"on": true}));
+    let f = fills(&s);
+    assert_eq!(f.len(), 1, "the rectangle is filled again");
+    assert_eq!(fill_color(&f[0]), Rgba::parse_hex("#3366ff"));
+    assert!((area(&f[0]) - 120.0 * 80.0).abs() < 200.0, "{}", area(&f[0]));
+    assert!(raw(&s).iter().all(|e| matches!(&e.kind, ElementKind::Shape(sh) if sh.fill.is_some() != sh.stroke.is_some())), "raw pieces are a fill or a line, never both or neither");
+
+    // An outline that never had a fill: the area it closes off is filled, in the given colour.
+    let mut s = raw_session();
+    run(&mut s, "draw.rect", json!({"x": 100, "y": 100, "w": 120, "h": 80, "fill": null, "stroke": "#000000", "stroke_width": 2}));
+    run(&mut s, "edit.deselect", json!({}));
+    run(&mut s, "element.select_connected", json!({"x": 100, "y": 140}));
+    run(&mut s, "element.set_fill", json!({"color": "#ff0000"}));
+    let f = fills(&s);
+    assert_eq!(f.len(), 1);
+    assert_eq!(fill_color(&f[0]), Rgba::parse_hex("#ff0000"));
+    // An open line closes off nothing: an error that says what to do, and no change.
+    let mut s = raw_session();
+    run(&mut s, "draw.line", json!({"x0": 0, "y0": 0, "x1": 100, "y1": 0, "stroke": "#000000"}));
+    run(&mut s, "edit.select_all", json!({}));
+    let before = s.doc.clone();
+    let err = s.execute("element.set_fill", &json!({"on": true})).unwrap_err().to_string();
+    assert!(err.contains("Paint Bucket"), "{err}");
+    assert_eq!(s.doc, before);
+}

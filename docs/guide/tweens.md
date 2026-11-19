@@ -36,6 +36,24 @@ AniCraft adds a keyframe there for you.
 To take a tween away, choose **Insert › Remove Tween**. The frames keep the first keyframe's
 artwork.
 
+### Squash and stretch that keeps its area
+
+A ball squashed to half its height should spread to twice its width, and stay that full on
+the way. A tween normally moves width and height in straight lines, so the frames in between
+come out bigger than either keyframe. Turn on **Keep area** in **Properties › Frame** and the
+tween scales the way a squash does: from 100 × 100 % to 200 × 50 %, the halfway frame is about
+141 × 71 %, and the area is the same on every frame.
+
+* It works on classic, shape and motion tweens, one tween at a time, and is off until you turn
+  it on. Your eases apply as before.
+* If the two keyframes have different areas, the area changes smoothly from one to the other.
+* An object that is flipped on one keyframe and not on the other tweens the usual way.
+* On a **motion tween** you only need to key one direction. Stretch the width at a later
+  frame and the height squashes by itself to keep the area of the first frame. Key the height
+  too whenever you want to set it yourself. The Motion Editor has the same **Keep area**
+  checkbox and draws the curve the height follows.
+* Every export shows the same squash.
+
 ## Easing
 
 Easing makes motion speed up or slow down instead of moving at one steady pace. Pick an ease
@@ -191,9 +209,25 @@ Motion Editor, below the colour effect, with its numbers under its name: **Blur 
 any other property, so a blur can sharpen with an ease-out and then pulse.
 
 You can also change a filter in **Properties › Filters** with the playhead inside the tween: the
-number you changed gets a key there, as moving the object does. Reordering or removing filters
-takes their keys along with them. A filter's colours, quality and switches aren't animated yet;
-they stay as the object has them.
+value you changed gets a key there, as moving the object does. Reordering or removing filters
+takes their keys along with them.
+
+**Colours.** Under a filter's numbers there is a row for each of its colours: **Colour** for a
+Drop Shadow or a Glow, **Shadow** and **Highlight** for a Bevel, and **Stop 1**, **Stop 2**… for
+the ramp of a Gradient Glow or Gradient Bevel. The swatch shows the colour at the playhead;
+click it and pick a colour to key it there. The diamond adds or removes the colour's key. To
+shape how the colour changes, click the row: it opens to **Red**, **Green**, **Blue** and
+**Alpha**, each with a curve and eases of its own, and a strip along the bottom of the graph
+shows the whole colour across the tween. Colours change the same way a Tint does, so a glow
+and a tint you keyed alike stay alike.
+
+**Quality and the switches.** **Quality**, **Inner**, **Knockout** and **Hide object** come
+last. They can't be half on, so a key holds until the next key: tick **Knockout** at frame 20
+and the artwork is knocked out from frame 20 on, not gradually. Their curves are steps and
+they take no ease. A filter's Type (inner, outer, full) and its eye (on or off) aren't
+animated; they stay as the object has them.
+
+Text takes filters too (see [Text](text.md#filters-on-text)), and they animate the same way.
 
 ### Moving keys in time
 
