@@ -17,6 +17,7 @@ pub mod warp;
 mod bitmap;
 mod color_effect;
 pub mod camera;
+pub mod data;
 mod filter;
 mod easing;
 mod eval;
@@ -30,11 +31,13 @@ pub mod width;
 pub mod stroke_style;
 pub mod player;
 pub mod publish;
+pub mod html_text;
 pub mod rich_text;
 pub mod sample;
 pub mod templates;
 pub mod sound;
 pub mod swatch;
+pub mod video;
 
 pub use filter::{Channel, FILTER_PARAMS, Filter, FilterColor, FilterEntry, FilterParam, FilterProp, FilterSide, MAX_FILTER_SLOTS, pairing as filter_pairing, active as active_filters, any_active as any_active_filter, pairs_up as filters_pair_up, MAX_BLUR, MAX_QUALITY, MAX_RAMP_STOPS, REST_SNAP, default_bevel_ramp, default_glow_ramp, pinned_stop, ramp_at};
 pub use bitmap::{Bitmap, BitmapId, ImageError, MAX_BITMAP_EDGE, Pixels, base64_decode, base64_encode, decode_png, image_to_png};
@@ -47,13 +50,14 @@ pub use sound::{EnvelopePoint, FrameSound, Sound, SoundEffect, SoundFormat, Soun
 pub use width::{MAX_WIDTH_FACTOR, MAX_WIDTH_POINTS, ProfilePreset, WidthPoint, WidthProfile};
 pub use stroke_style::{Cap, Dash, DashKind, Join, StrokeStyle};
 pub use camera::{Camera, DepthKey};
+pub use data::{Binding, BoundProperty, DataColumn, DataId, DataSet, DataTable, Interp};
 pub use swatch::{MAX_SWATCHES, Swatch, SwatchPaint};
 pub use parenting::{MAX_RIG_DEPTH, RigError};
 pub use aids::{Aids, GUIDE_REACH, Grid, Guide, GuideAxis, MAX_GUIDES};
 pub use nine_slice::symbol_box;
 pub use rich_text::{BaselineShift, CharStyle, MAX_TEXT_RUNS, MAX_URL, ParagraphStyle, StyleSummary, TextFill, TextRun, safe_url};
 pub use armature::{Armature, Bone, BoneId, JointAngle, Limits, Pose};
-pub use eval::{DisplayItem, DisplayList, Group, MAX_SYMBOL_DEPTH, evaluate, evaluate_guided, evaluate_layer_elements, evaluate_shown, evaluate_player, evaluate_scene, evaluate_scene_camera, evaluate_timeline, evaluate_timeline_at, guide_walk, instance_start};
+pub use eval::{DisplayItem, DisplayList, Group, MAX_EVAL_ELEMENTS, MAX_SYMBOL_DEPTH, evaluate, evaluate_guided, evaluate_layer_elements, evaluate_shown, evaluate_player, evaluate_scene, evaluate_scene_camera, evaluate_timeline, evaluate_timeline_at, guide_walk, instance_start};
 pub use actions::{Action, ButtonEvent, EventHandler, FrameScript, Language, PluginScript, SourceScript};
 
 use anicraft_geom::{Affine, FillRule, Path, Rect, Vec2};
@@ -102,7 +106,7 @@ impl Rgba {
     pub fn parse_hex(s: &str) -> Option<Rgba> {
         let s = s.trim();
         let h = s.strip_prefix('#').unwrap_or(s);
-        if !h.is_ascii() || (h.len() != 6 && h.len() != 8) {
+        if !h.bytes().all(|c| c.is_ascii_hexdigit()) || (h.len() != 6 && h.len() != 8) {
             return None;
         }
         let byte = |i: usize| h.get(i..i + 2).and_then(|x| u8::from_str_radix(x, 16).ok()).map(|v| v as f32 / 255.0);
@@ -997,6 +1001,26 @@ pub struct TextField {
     /// The ActionScript 1/2 variable the field shows (kept from Animate documents, not run).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub variable: String,
+    /// What the field does when the viewer changes its text (input fields; ADR 0107): actions
+    /// run in the timeline the field is on, as an instance's event handlers are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_change: Vec<actions::Action>,
+    /// The characters whose glyph outlines the HTML export carries for this field's font
+    /// (ADR 0107), so text a script sets is drawn in the author's font where the font's licence
+    /// allows; empty: the viewer's browser fonts. Each character once, at most
+    /// [`MAX_EMBED_CHARS`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub embed: String,
+}
+
+/// Most characters a field embeds.
+pub const MAX_EMBED_CHARS: usize = 1024;
+
+/// A list of characters to embed as a field keeps it: each once, in order, no control
+/// characters, at most [`MAX_EMBED_CHARS`].
+pub fn embed_chars(chars: &str) -> String {
+    let mut seen = std::collections::BTreeSet::new();
+    chars.chars().take(MAX_EMBED_CHARS * 64).filter(|c| !c.is_control() && seen.insert(*c)).take(MAX_EMBED_CHARS).collect()
 }
 
 fn black() -> Rgba {
@@ -1009,7 +1033,7 @@ fn white() -> Rgba {
 impl TextField {
     /// A single-line field of `kind`.
     pub fn new(kind: TextKind) -> TextField {
-        TextField { kind, lines: LineType::Single, selectable: true, border: false, border_color: Rgba::BLACK, background: false, background_color: Rgba::WHITE, max_chars: 0, variable: String::new() }
+        TextField { kind, lines: LineType::Single, selectable: true, border: false, border_color: Rgba::BLACK, background: false, background_color: Rgba::WHITE, max_chars: 0, variable: String::new(), on_change: Vec::new(), embed: String::new() }
     }
 
     /// The width text wraps at in a box `box_width` wide, if its lines wrap.
@@ -1029,7 +1053,9 @@ impl TextField {
 
     /// Values in range: names cut to length, at most [`MAX_FIELD_CHARS`] typed.
     pub fn sanitized(&self) -> TextField {
-        TextField { max_chars: self.max_chars.min(MAX_FIELD_CHARS as u32), variable: self.variable.chars().take(MAX_FIELD_NAME).collect(), ..self.clone() }
+        let mut on_change = self.on_change.clone();
+        actions::sanitize_actions(&mut on_change);
+        TextField { max_chars: self.max_chars.min(MAX_FIELD_CHARS as u32), variable: self.variable.chars().take(MAX_FIELD_NAME).collect(), on_change, embed: embed_chars(&self.embed), ..self.clone() }
     }
 }
 
@@ -1077,16 +1103,18 @@ impl Element {
     }
     /// Local-space bounds (control-point bounds for shapes, `None` for symbols).
     pub fn local_bounds(&self, doc: &Document) -> Rect {
-        element_bounds(doc, self, &Affine::IDENTITY, 0)
+        element_bounds(doc, self, &Affine::IDENTITY, 0, &std::cell::Cell::new(MAX_EVAL_ELEMENTS))
     }
     /// Bounds in the parent's space.
     pub fn bounds(&self, doc: &Document) -> Rect {
-        element_bounds(doc, self, &self.transform, 0)
+        element_bounds(doc, self, &self.transform, 0, &std::cell::Cell::new(MAX_EVAL_ELEMENTS))
     }
 }
 
-fn element_bounds(doc: &Document, el: &Element, xf: &Affine, depth: usize) -> Rect {
-    if depth > MAX_SYMBOL_DEPTH {
+/// `work` is the query's allowance of element visits ([`MAX_EVAL_ELEMENTS`]): past it the rest
+/// adds nothing, as in evaluation.
+fn element_bounds(doc: &Document, el: &Element, xf: &Affine, depth: usize, work: &std::cell::Cell<u32>) -> Rect {
+    if depth > MAX_SYMBOL_DEPTH || !eval::spend(work) {
         return Rect::EMPTY;
     }
     match &el.kind {
@@ -1099,7 +1127,7 @@ fn element_bounds(doc: &Document, el: &Element, xf: &Affine, depth: usize) -> Re
         ElementKind::Group { .. } => {
             let mut r = Rect::EMPTY;
             for child in el.kind.group_members() {
-                r = r.union(&element_bounds(doc, &child, &xf.mul(&child.transform), depth + 1));
+                r = r.union(&element_bounds(doc, &child, &xf.mul(&child.transform), depth + 1, work));
             }
             r
         }
@@ -1110,7 +1138,7 @@ fn element_bounds(doc: &Document, el: &Element, xf: &Affine, depth: usize) -> Re
                 if let Some(kf) = layer.keyframes.first() {
                     for child in &kf.elements {
                         let m = xf.mul(&child.transform);
-                        r = r.union(&element_bounds(doc, child, &m, depth + 1));
+                        r = r.union(&element_bounds(doc, child, &m, depth + 1, work));
                     }
                 }
             }
@@ -1380,6 +1408,10 @@ pub struct Layer {
     /// [`Timeline::repair_rig`]; read through [`Timeline::rig_spaces`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rig_parent: Option<LayerId>,
+    /// A reference video to trace over (ADR 0116): shown on the stage under this layer's
+    /// artwork, never in the movie or an export. Its pictures are not in the document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<Arc<video::VideoRef>>,
 }
 
 /// How a mask layer's artwork reveals the layers it masks (ADR 0070).
@@ -1475,6 +1507,7 @@ impl PartialEq for Layer {
             && self.mask_mode == o.mask_mode
             && self.opacity.to_bits() == o.opacity.to_bits()
             && self.rig_parent == o.rig_parent
+            && self.video == o.video
             && match (&self.armature, &o.armature) {
                 (Some(a), Some(b)) => arc_eq(a, b),
                 (a, b) => a.is_none() && b.is_none(),
@@ -1513,6 +1546,7 @@ impl Layer {
             mask_mode: MaskMode::Coverage,
             opacity: 1.0,
             rig_parent: None,
+            video: None,
         }
     }
     /// The layer's own opacity, `0..=1` whatever a file says (not a number: opaque).
@@ -1883,6 +1917,19 @@ impl Default for Stage {
 /// Largest stage edge accepted from files and commands.
 pub const MAX_STAGE_EDGE: u32 = 16_384;
 
+/// Last addressable frame (0-based); about 70 minutes at 24 fps.
+pub const MAX_FRAME: u32 = 100_000;
+
+/// Drops keyframes past [`MAX_FRAME`] and trims durations to it (files skip command checks).
+fn clamp_frames(l: &mut Layer) {
+    l.keyframes.retain(|k| k.start <= MAX_FRAME);
+    for k in &mut l.keyframes {
+        if k.end() > MAX_FRAME + 1 {
+            Arc::make_mut(k).duration = MAX_FRAME + 1 - k.start;
+        }
+    }
+}
+
 /// A scene: one part of the movie with its own main timeline. Scenes play in order.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Scene {
@@ -1941,6 +1988,9 @@ pub struct Document {
     /// Eases the artist saved by name (ADR 0081), offered with the presets.
     #[serde(default, skip_serializing_if = "eases_is_empty")]
     pub eases: Arc<Vec<SavedEase>>,
+    /// Data tables and what they drive (ADR 0118). Left out of a file that has none.
+    #[serde(default, skip_serializing_if = "data_is_empty")]
+    pub data: Arc<DataSet>,
     /// Next free id for layers, elements and symbols.
     pub next_id: u64,
 }
@@ -1980,6 +2030,8 @@ struct DocumentFile {
     aids: Arc<Aids>,
     #[serde(default)]
     eases: Arc<Vec<SavedEase>>,
+    #[serde(default)]
+    data: Arc<DataSet>,
     #[serde(default = "first_id")]
     next_id: u64,
 }
@@ -1990,7 +2042,7 @@ impl From<DocumentFile> for Document {
         if let Some(tl) = f.timeline {
             scenes.insert(0, Arc::new(Scene { name: "Scene 1".into(), timeline: tl, guides: Vec::new() }));
         }
-        Document { stage: f.stage, scenes, library: f.library, bitmaps: f.bitmaps, sounds: f.sounds, library_tree: f.library_tree, document_class: f.document_class, publish: f.publish, aids: f.aids, swatches: f.swatches, eases: f.eases, next_id: f.next_id }
+        Document { stage: f.stage, scenes, library: f.library, bitmaps: f.bitmaps, sounds: f.sounds, library_tree: f.library_tree, document_class: f.document_class, publish: f.publish, aids: f.aids, swatches: f.swatches, eases: f.eases, data: f.data, next_id: f.next_id }
     }
 }
 
@@ -2000,6 +2052,10 @@ fn first_id() -> u64 {
 
 fn library_tree_is_empty(t: &Arc<LibraryTree>) -> bool {
     t.is_empty()
+}
+
+fn data_is_empty(d: &Arc<DataSet>) -> bool {
+    d.is_empty()
 }
 
 fn eases_is_empty(e: &Arc<Vec<SavedEase>>) -> bool {
@@ -2019,13 +2075,13 @@ static NO_TIMELINE: Timeline = Timeline { layers: Vec::new() };
 
 impl PartialEq for Document {
     fn eq(&self, o: &Document) -> bool {
-        self.stage == o.stage && self.next_id == o.next_id && self.document_class == o.document_class && arcs_eq(&self.scenes, &o.scenes) && arcs_eq(&self.library, &o.library) && arcs_eq(&self.bitmaps, &o.bitmaps) && arcs_eq(&self.sounds, &o.sounds) && arc_eq(&self.library_tree, &o.library_tree) && arc_eq(&self.publish, &o.publish) && arc_eq(&self.aids, &o.aids) && arc_eq(&self.swatches, &o.swatches) && arc_eq(&self.eases, &o.eases)
+        self.stage == o.stage && self.next_id == o.next_id && self.document_class == o.document_class && arcs_eq(&self.scenes, &o.scenes) && arcs_eq(&self.library, &o.library) && arcs_eq(&self.bitmaps, &o.bitmaps) && arcs_eq(&self.sounds, &o.sounds) && arc_eq(&self.library_tree, &o.library_tree) && arc_eq(&self.publish, &o.publish) && arc_eq(&self.aids, &o.aids) && arc_eq(&self.swatches, &o.swatches) && arc_eq(&self.eases, &o.eases) && arc_eq(&self.data, &o.data)
     }
 }
 
 impl Default for Document {
     fn default() -> Self {
-        let mut d = Document { stage: Stage::default(), scenes: vec![Arc::new(Scene::new("Scene 1"))], library: Vec::new(), bitmaps: Vec::new(), sounds: Vec::new(), library_tree: Arc::default(), document_class: String::new(), publish: Arc::default(), aids: Arc::default(), swatches: default_swatches(), eases: Arc::default(), next_id: 1 };
+        let mut d = Document { stage: Stage::default(), scenes: vec![Arc::new(Scene::new("Scene 1"))], library: Vec::new(), bitmaps: Vec::new(), sounds: Vec::new(), library_tree: Arc::default(), document_class: String::new(), publish: Arc::default(), aids: Arc::default(), swatches: default_swatches(), eases: Arc::default(), data: Arc::default(), next_id: 1 };
         let id = LayerId(d.alloc_id());
         d.timeline_mut(0).layers.push(Arc::new(Layer::new(id, "Layer 1")));
         d
@@ -2119,7 +2175,7 @@ impl Document {
         }
         let mut max_id = 0u64;
         let scan = |l: &Layer, max_id: &mut u64| {
-            *max_id = (*max_id).max(l.id.0);
+            *max_id = (*max_id).max(l.id.0).max(l.video.as_ref().map_or(0, |v| v.id.0));
             for b in l.armature.iter().flat_map(|a| &a.bones) {
                 // A shape armature's joint nodes take ids from the same counter (ADR 0071).
                 *max_id = (*max_id).max(b.id.0).max(b.child.0).max(b.parent.0);
@@ -2149,11 +2205,13 @@ impl Document {
             }
             let tl = &mut Arc::make_mut(scene).timeline;
             for l in &mut tl.layers {
+                clamp_frames(Arc::make_mut(l));
                 Arc::make_mut(l).normalize();
                 sanitize_scripts(l);
                 sanitize_depth(l);
                 sanitize_armature(l);
                 sanitize_warps(l);
+                sanitize_video(l);
                 scan(l, &mut max_id);
                 sanitize_groups(l, 0, &mut max_id);
             }
@@ -2188,6 +2246,7 @@ impl Document {
             }
             let tl = &mut Arc::make_mut(sym).timeline;
             for l in &mut tl.layers {
+                clamp_frames(Arc::make_mut(l));
                 Arc::make_mut(l).normalize();
                 sanitize_scripts(l);
                 // Only a scene has a camera; a symbol's camera layer is kept as a normal layer.
@@ -2197,6 +2256,7 @@ impl Document {
                 sanitize_depth(l);
                 sanitize_armature(l);
                 sanitize_warps(l);
+                sanitize_video(l);
                 scan(l, &mut max_id);
                 sanitize_groups(l, 0, &mut max_id);
             }
@@ -2209,7 +2269,18 @@ impl Document {
             max_id = max_id.max(s.id.0);
         }
         self.sanitize_library_tree(&mut max_id);
+        self.sanitize_data(&mut max_id);
         self.next_id = self.next_id.max(max_id.saturating_add(1));
+    }
+}
+
+/// A reference video (ADR 0116) a file can't mean is repaired, or dropped. Touches only what
+/// needs it.
+fn sanitize_video(layer: &mut Arc<Layer>) {
+    let Some(v) = &layer.video else { return };
+    let fixed = v.sanitized();
+    if fixed.as_ref() != Some(&**v) {
+        Arc::make_mut(layer).video = fixed.map(Arc::new);
     }
 }
 
@@ -2401,6 +2472,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hex_with_signs_is_rejected() {
+        for bad in ["#+1+2+3", "#-1-2-3", "#12345g", "#12345+"] {
+            assert_eq!(Rgba::parse_hex(bad), None, "{bad}");
+        }
+        assert!(Rgba::parse_hex("#0a1B2c").is_some());
+        assert!(Rgba::parse_hex("#0a1B2cFF").is_some());
+    }
+
+    #[test]
     fn keyframe_lookup() {
         let mut l = Layer::new(LayerId(1), "a");
         l.keyframes = [Keyframe::new(0, 5), Keyframe::new(5, 3), Keyframe::new(10, 2)].map(Arc::new).to_vec();
@@ -2476,9 +2556,35 @@ mod tests {
         d.stage.width = 0;
         d.stage.fps = f32::NAN;
         d.next_id = 0;
+        Arc::make_mut(&mut d.timeline_mut(0).layers[0]).keyframes = [Keyframe::new(0, u32::MAX), Keyframe::new(u32::MAX - 1, 5)].map(Arc::new).to_vec();
         d.sanitize();
+        assert_eq!(d.frame_count(), MAX_FRAME + 1, "frames past the limit are dropped or trimmed");
+        let keys = &d.timeline(0).layers[0].keyframes;
+        assert_eq!(keys.len(), 1);
+        assert_eq!((keys[0].start, keys[0].duration), (0, MAX_FRAME + 1));
         assert_eq!(d.stage.width, 1);
         assert_eq!(d.stage.fps, 24.0);
         assert!(d.next_id > d.timeline(0).layers[0].id.0);
+    }
+
+    #[test]
+    fn sanitize_clamps_main_and_symbol_timelines_at_the_inclusive_limit() {
+        let cases = [
+            (vec![Keyframe::new(MAX_FRAME, 10), Keyframe::new(MAX_FRAME + 1, 1)], vec![(MAX_FRAME, 1)]),
+            (vec![Keyframe::new(0, MAX_FRAME + 1)], vec![(0, MAX_FRAME + 1)]),
+            (vec![Keyframe::new(0, u32::MAX), Keyframe::new(u32::MAX - 1, 5)], vec![(0, MAX_FRAME + 1)]),
+        ];
+        for (keys, expected) in cases {
+            let mut d = Document::default();
+            Arc::make_mut(&mut d.timeline_mut(0).layers[0]).keyframes = keys.into_iter().map(Arc::new).collect();
+            let timeline = d.timeline(0).clone();
+            d.library.push(Arc::new(Symbol { id: SymbolId(100), name: "boundary".into(), kind: SymbolKind::Graphic, linkage: None, scale_grid_kept: None, scale_grid: None, timeline }));
+            d.sanitize();
+            for timeline in [d.timeline(0), &d.library[0].timeline] {
+                let actual: Vec<_> = timeline.layers[0].keyframes.iter().map(|k| (k.start, k.duration)).collect();
+                assert_eq!(actual, expected);
+                assert_eq!(timeline.frame_count(), MAX_FRAME + 1);
+            }
+        }
     }
 }

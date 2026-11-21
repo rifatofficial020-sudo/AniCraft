@@ -253,7 +253,8 @@ pub fn parse_file(text: &str) -> Result<Vec<Swatch>> {
     if text.trim_start_matches('\u{feff}').trim_start().starts_with("GIMP Palette") {
         return parse_gpl(text).map(|(_, v)| v).map_err(EngineError::Param);
     }
-    let v: Value = serde_json::from_str(text).map_err(|e| EngineError::Param(format!("this isn't a swatch file or a GIMP palette ({e})")))?;
+    let v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
+        .map_err(|e| EngineError::Param(format!("this isn't a swatch file or a GIMP palette ({e})")))?;
     if v.get("format").and_then(Value::as_str) != Some(FORMAT) {
         return Err(EngineError::Param(format!("this JSON isn't a swatch file (its \"format\" must be \"{FORMAT}\")")));
     }
@@ -299,4 +300,17 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
     let text = file_json(&s.doc.swatches);
     crate::vfs::write(&path, text.as_bytes())?;
     Ok(json!({"written": path.display().to_string(), "swatches": s.doc.swatches.len(), "bytes": text.len()}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_swatch_files_accept_a_utf8_byte_order_mark() {
+        let text = file_json(&default_set());
+        let expected = parse_file(&text).unwrap();
+        assert!(!expected.is_empty());
+        assert_eq!(parse_file(&format!("\u{feff}{text}")).unwrap(), expected);
+    }
 }

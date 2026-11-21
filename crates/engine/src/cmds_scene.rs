@@ -26,7 +26,10 @@ pub fn specs() -> Vec<CommandSpec> {
 pub(crate) fn target_scene(s: &Session, p: &Value) -> Result<usize> {
     match opt_u64(p, "scene")? {
         None => Ok(s.scene),
-        Some(i) => usize::try_from(i).ok().filter(|i| *i < s.doc.scenes.len()).ok_or_else(|| EngineError::Param(format!("there is no scene {} (the movie has {})", i + 1, s.doc.scenes.len()))),
+        Some(i) => usize::try_from(i)
+            .ok()
+            .filter(|i| *i < s.doc.scenes.len())
+            .ok_or_else(|| EngineError::Param(format!("there is no scene {} (the movie has {})", u128::from(i) + 1, s.doc.scenes.len()))),
     }
 }
 
@@ -192,4 +195,32 @@ fn step_scene(s: &mut Session, d: i64) -> Result<Value> {
         open_scene(s, i);
     }
     Ok(scene_json(s))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_scene_indices_are_errors_without_edits() {
+        let mut s = Session::default();
+        s.execute("scene.new", &json!({})).unwrap();
+        s.execute("draw.rect", &json!({"x": 0, "y": 0, "w": 10, "h": 10})).unwrap();
+        let before = s.doc.clone();
+        let info = s.info();
+        let params = json!({"scene": u64::MAX});
+        assert!(s.confirmation("scene.delete", &params).is_none());
+        for id in ["scene.select", "scene.duplicate", "scene.rename", "scene.delete", "scene.move_up", "scene.move_down"] {
+            let mut p = params.clone();
+            if id == "scene.rename" {
+                p["name"] = json!("Renamed");
+            }
+            let error = s.execute(id, &p).unwrap_err();
+            assert_eq!(error.to_string(), "there is no scene 18446744073709551616 (the movie has 2)", "{id}");
+            assert_eq!(s.doc, before, "{id} changed the document");
+            assert_eq!(s.info(), info, "{id} changed the view, revision or history");
+        }
+        assert_eq!(target_scene(&s, &json!({"scene": 0})).unwrap(), 0);
+        assert_eq!(target_scene(&s, &json!({})).unwrap(), s.scene);
+    }
 }

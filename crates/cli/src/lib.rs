@@ -6,10 +6,12 @@
 pub mod control;
 pub mod mcp;
 
+use anicraft_engine::access::{self, Roots};
 use anicraft_engine::{Session, commands, format};
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 pub const USAGE: &str = "\
@@ -26,7 +28,8 @@ USAGE:
   anicraft-cli export <file|--sample> --format <id> --out <path> [--from A] [--to B] [--frame N]
                       [--options '<json>'] [--overwrite yes]
                                          any export format: the built-in ones (gif, apng, webp,
-                                         lottie, html, video, svg, png, png-sequence, sprite-sheet)
+                                         lottie, html, video, svg, png, png-sequence, svg-sequence,
+                                         sprite-sheet)
                                          and exporter plug-ins (by id, with --plugins); --options
                                          are the plug-in's options, or a built-in's extra params
   anicraft-cli formats                   lists every export format, plug-ins included (JSON)
@@ -43,13 +46,24 @@ USAGE:
   anicraft-cli bench [--layers N] [--shapes N] [--frames N]   performance probe (use --release)
   anicraft-cli bench --check yes         the default scenario against the budgets in
                                          docs/performance.md; fails when one is missed
-  anicraft-cli serve [file|--sample]     JSON-lines on stdin/stdout:
+  anicraft-cli serve [file|--sample] [--automation-read-root <folder> --automation-write-root <folder>]
+                                         JSON-lines on stdin/stdout:
         {\"id\":1,\"cmd\":\"draw.rect\",\"params\":{\"x\":10,\"y\":10,\"w\":50,\"h\":50}}
-  anicraft-cli mcp [file|--sample]       Model Context Protocol server on stdin/stdout,
-                                         for AI assistants (see docs/mcp.md)
-  anicraft-cli mcp --bridge <port>       the same tools, acting live on the AniCraft window
+                                         with the two roots, commands read and write files
+                                         inside them only, as for mcp
+  anicraft-cli mcp [file|--sample] --automation-read-root <folder> --automation-write-root <folder>
+                                         Model Context Protocol server on stdin/stdout,
+                                         for AI assistants (see docs/mcp.md). Both roots
+                                         are required (exit code 2 without them): commands
+                                         read files only inside the read root and write
+                                         only inside the write root; links and `..` are
+                                         followed first, and a refusal names the root.
+                                         --automation-read-root may be given several times
+  anicraft-cli mcp --bridge <port> --automation-read-root <folder> --automation-write-root <folder>
+                                         the same tools, acting live on the AniCraft window
                                          started with `anicraft --control <port>`
-                                         (docs/control-protocol.md)
+                                         (docs/control-protocol.md); the window applies
+                                         the roots to this assistant's commands
   anicraft-cli --version
 
   --plugins <folder>   loads the WebAssembly plug-ins in a folder first (also the
@@ -74,6 +88,9 @@ impl Args {
         while let Some(a) = it.next() {
             if a == "--sample" {
                 positional.push(a.clone());
+            } else if let Some((k, v)) = a.strip_prefix("--").and_then(|f| f.split_once('=')) {
+                // `--flag=value`, as MCP client configurations often write the roots.
+                flags.push((k.to_string(), v.to_string()));
             } else if let Some(k) = a.strip_prefix("--") {
                 let v = it.next().ok_or_else(|| format!("flag --{k} needs a value"))?;
                 flags.push((k.to_string(), v.clone()));
@@ -83,12 +100,80 @@ impl Args {
         }
         Ok(Args { positional, flags })
     }
+    /// Every value of a flag that may be given several times, in order.
+    pub fn all(&self, k: &str) -> Vec<&str> {
+        self.flags.iter().filter(|(key, _)| key == k).map(|(_, v)| v.as_str()).collect()
+    }
     pub fn flag(&self, k: &str) -> Option<&str> {
         self.flags.iter().rev().find(|(key, _)| key == k).map(|(_, v)| v.as_str())
     }
     pub fn num<T: std::str::FromStr>(&self, k: &str) -> Result<Option<T>, String> {
         self.flag(k).map(|v| v.parse::<T>().map_err(|_| format!("--{k} expects a number, got '{v}'"))).transpose()
     }
+    fn float(&self, k: &str) -> Result<Option<f32>, String> {
+        let value = self.num::<f32>(k)?;
+        if value.is_some_and(|v| !v.is_finite()) {
+            return Err(format!("--{k} expects a finite number"));
+        }
+        Ok(value)
+    }
+}
+
+/// How the error starts when `mcp` is started without its roots; the program then exits with
+/// [`USAGE_EXIT`] (AGENTS.md rule 18, ADR 0124).
+pub const ROOTS_REQUIRED: &str = "mcp needs --automation-read-root <folder> and --automation-write-root <folder>";
+
+/// The exit code of a refused start: the command line is missing something.
+pub const USAGE_EXIT: i32 = 2;
+
+/// The exit code for an error from [`run`].
+pub fn exit_code(error: &str) -> i32 {
+    if error.starts_with(ROOTS_REQUIRED) || error.starts_with("--automation-") || error.starts_with("flag --automation-") { USAGE_EXIT } else { 1 }
+}
+
+/// The folders given with `--automation-read-root` (once or more) and `--automation-write-root`
+/// (once), from the launch folder when relative. `None` when neither flag is there; one
+/// without the other is an error, as is a root that is not a folder.
+pub fn automation_folders(a: &Args) -> Result<Option<(Vec<PathBuf>, PathBuf)>, String> {
+    let (read, write) = (a.all("automation-read-root"), a.all("automation-write-root"));
+    if read.is_empty() && write.is_empty() {
+        return Ok(None);
+    }
+    let folder = |flag: &str, v: &str| -> Result<PathBuf, String> {
+        if v.trim().is_empty() {
+            return Err(format!("--automation-{flag}-root needs a folder"));
+        }
+        std::path::absolute(v).map_err(|e| format!("--automation-{flag}-root {v}: {e}"))
+    };
+    let write = match write.as_slice() {
+        [] => return Err("--automation-read-root needs --automation-write-root <folder> too (it may be the same folder)".into()),
+        [one] => folder("write", one)?,
+        _ => return Err("--automation-write-root may be given once (--automation-read-root may be repeated)".into()),
+    };
+    if read.is_empty() {
+        return Err("--automation-write-root needs --automation-read-root <folder> too (it may be the same folder)".into());
+    }
+    let read = read.iter().map(|v| folder("read", v)).collect::<Result<Vec<_>, _>>()?;
+    Ok(Some((read, write)))
+}
+
+/// [`automation_folders`] as a policy: each root resolved (links followed) and checked to be
+/// a folder that exists.
+pub fn automation_roots(a: &Args) -> Result<Option<Arc<Roots>>, String> {
+    let Some((read, write)) = automation_folders(a)? else { return Ok(None) };
+    Roots::new(&read, Some(&write)).map(|r| Some(Arc::new(r)))
+}
+
+/// Runs one command for an agent: inside `roots` when given (ADR 0124). When the command
+/// fails after a file was refused, the error is the refusal, which names the roots (a command
+/// that asked "is it there?" would otherwise say the file is missing).
+pub(crate) fn execute_in(roots: Option<&Arc<Roots>>, run: impl FnOnce() -> Result<Value, String>) -> Result<Value, String> {
+    let Some(roots) = roots else { return run() };
+    let _confined = access::confine(roots.clone());
+    run().map_err(|e| match access::take_denial() {
+        Some(why) if !e.contains(&why) => why,
+        _ => e,
+    })
 }
 
 /// Opens a session from a path or `--sample`.
@@ -210,7 +295,7 @@ pub fn run(argv: &[String]) -> Result<String, String> {
             let mut s = session(&a, Some(src.ok_or("render needs a file or --sample")?))?;
             let out = a.flag("out").ok_or("render needs --out <file.png>")?;
             let mut p = json!({"path": out, "frame": one_based(&a, "frame")?.unwrap_or(0)});
-            if let Some(sc) = a.num::<f32>("scale")? {
+            if let Some(sc) = a.float("scale")? {
                 p["scale"] = json!(sc);
             }
             exec(&mut s, "file.export_png", &p).map(|v| v.to_string())
@@ -225,7 +310,7 @@ pub fn run(argv: &[String]) -> Result<String, String> {
             if let Some(t) = one_based(&a, "to")? {
                 p["to"] = json!(t);
             }
-            if let Some(sc) = a.num::<f32>("scale")? {
+            if let Some(sc) = a.float("scale")? {
                 p["scale"] = json!(sc);
             }
             exec(&mut s, "file.export_png_sequence", &p).map(|v| v.to_string())
@@ -242,7 +327,7 @@ pub fn run(argv: &[String]) -> Result<String, String> {
             if let Some(t) = one_based(&a, "to")? {
                 p["to"] = json!(t);
             }
-            if let Some(sc) = a.num::<f32>("scale")? {
+            if let Some(sc) = a.float("scale")? {
                 p["scale"] = json!(sc);
             }
             if a.flag("overwrite").is_some_and(|v| v == "yes" || v == "true") {
@@ -274,7 +359,7 @@ pub fn run(argv: &[String]) -> Result<String, String> {
                     p[k] = json!(v);
                 }
             }
-            if let Some(v) = a.num::<f32>("fps")? {
+            if let Some(v) = a.float("fps")? {
                 p["fps"] = json!(v);
             }
             exec(&mut s, "file.new", &p)?;
@@ -321,13 +406,21 @@ pub fn run(argv: &[String]) -> Result<String, String> {
         }
         "bench" => bench(&a),
         "serve" => {
+            // Before anything is opened: a bad root stops the start.
+            let roots = automation_roots(&a)?;
             let mut s = session(&a, src)?;
             let stdin = std::io::stdin();
             let mut stdout = std::io::stdout();
-            serve(&mut s, stdin.lock(), &mut stdout).map_err(|e| e.to_string())?;
+            serve_in(&mut s, roots.as_ref(), stdin.lock(), &mut stdout).map_err(|e| e.to_string())?;
             Ok(String::new())
         }
         "mcp" => {
+            // An agent's entry point refuses to start without both roots (AGENTS.md rule 18),
+            // before any file is opened or any connection made.
+            let Some((read, write)) = automation_folders(&a)? else {
+                return Err(format!("{ROOTS_REQUIRED}: the folders the assistant's commands may read from and write to (they may be the same folder). See docs/mcp.md."));
+            };
+            let roots = Arc::new(Roots::new(&read, Some(&write))?);
             if let Some(target) = a.flag("bridge") {
                 if src.is_some() || a.flag("plugins").is_some() {
                     return Err("mcp --bridge acts on the open AniCraft window: it takes no file or --plugins".into());
@@ -339,14 +432,16 @@ pub fn run(argv: &[String]) -> Result<String, String> {
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    let mut b = control::Bridge::new(control::parse_bridge_target(target)?);
+                    let mut b = control::Bridge::new(control::parse_bridge_target(target)?).with_roots(&roots)?;
                     let stdin = std::io::stdin();
                     let mut stdout = std::io::stdout();
                     mcp::serve(&mut b, stdin.lock(), &mut stdout).map_err(|e| e.to_string())?;
                     return Ok(String::new());
                 }
             }
-            let mut s = session(&a, src)?;
+            // The file and plug-ins named at the start are the person's own choice; the roots
+            // apply to what the assistant asks for from here on.
+            let mut s = mcp::Headless { session: session(&a, src)?, roots };
             let stdin = std::io::stdin();
             let mut stdout = std::io::stdout();
             mcp::serve(&mut s, stdin.lock(), &mut stdout).map_err(|e| e.to_string())?;
@@ -580,8 +675,57 @@ pub fn bench(a: &Args) -> Result<String, String> {
     }
 }
 
-/// Answers one JSON request.
+/// Longest request line `serve` and `mcp` read (64 MiB: far above any real command, base64 images included).
+pub(crate) const MAX_LINE: usize = 64 << 20;
+
+/// One input line, read with a bound.
+pub(crate) enum Line {
+    Eof,
+    Text(String),
+    TooLong,
+}
+
+/// Reads the next line, never holding more than `max` bytes of it; an overlong line is skipped to its end.
+pub(crate) fn read_line<R: BufRead>(input: &mut R, max: usize) -> std::io::Result<Line> {
+    let mut buf = Vec::new();
+    let n = std::io::Read::take(&mut *input, max as u64 + 1).read_until(b'\n', &mut buf)?;
+    if n == 0 {
+        return Ok(Line::Eof);
+    }
+    if buf.len() > max && buf.last() != Some(&b'\n') {
+        loop {
+            let mut skip = Vec::new();
+            let k = std::io::Read::take(&mut *input, 1 << 20).read_until(b'\n', &mut skip)?;
+            if k == 0 || skip.last() == Some(&b'\n') {
+                return Ok(Line::TooLong);
+            }
+        }
+    }
+    while matches!(buf.last(), Some(b'\n' | b'\r')) {
+        buf.pop();
+    }
+    String::from_utf8(buf).map(Line::Text).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Over `serve` and `mcp` a caller may not name the program a command runs (ADR 0004 spirit: an
+/// assistant must not start arbitrary executables); the person sets `ANICRAFT_FFMPEG` instead.
+/// Direct CLI use (`exec`, `run`) keeps the `ffmpeg` parameter. Every command that takes one
+/// means the same by it (Export Video, Import Video, video info, relinking a layer's video), so
+/// the parameter is refused by name: a new command that runs ffmpeg is covered when it is added.
+pub(crate) fn refuse_remote_ffmpeg(_cmd: &str, params: &Value) -> Result<(), String> {
+    if params.get("ffmpeg").is_some_and(|v| !v.is_null()) {
+        return Err("the ffmpeg parameter is not accepted here: set the ANICRAFT_FFMPEG environment variable to choose the program".into());
+    }
+    Ok(())
+}
+
+/// Answers one JSON request, with no automation roots.
 pub fn handle_request(s: &mut Session, line: &str) -> Value {
+    handle_request_in(s, None, line)
+}
+
+/// Answers one JSON request; with `roots`, the command reads and writes inside them only.
+pub fn handle_request_in(s: &mut Session, roots: Option<&Arc<Roots>>, line: &str) -> Value {
     // Windows shells often prefix piped UTF-8 with a byte-order mark.
     let line = line.trim_start_matches('\u{feff}');
     let req: Value = match serde_json::from_str(line) {
@@ -595,7 +739,7 @@ pub fn handle_request(s: &mut Session, line: &str) -> Value {
     let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
     let result = match cmd {
         "commands" => Ok(Value::Array(commands().iter().map(|c| c.to_json()).collect())),
-        _ => s.execute(cmd, &params).map_err(|e| e.to_string()),
+        _ => refuse_remote_ffmpeg(cmd, &params).and_then(|()| execute_in(roots, || s.execute(cmd, &params).map_err(|e| e.to_string()))),
     };
     match result {
         Ok(v) => json!({"id": id, "ok": true, "result": v, "revision": s.revision, "frame": s.frame}),
@@ -605,10 +749,24 @@ pub fn handle_request(s: &mut Session, line: &str) -> Value {
 
 /// JSON-lines loop: one request per line, one response per line. Ends on EOF or `{"cmd":"quit"}`.
 pub fn serve<R: BufRead, W: Write>(s: &mut Session, input: R, out: &mut W) -> std::io::Result<()> {
+    serve_in(s, None, input, out)
+}
+
+/// [`serve`], inside automation roots when given.
+pub fn serve_in<R: BufRead, W: Write>(s: &mut Session, roots: Option<&Arc<Roots>>, input: R, out: &mut W) -> std::io::Result<()> {
     writeln!(out, "{}", json!({"ready": true, "app": "AniCraft", "version": env!("CARGO_PKG_VERSION")}))?;
     out.flush()?;
-    for line in input.lines() {
-        let line = line?;
+    let mut input = input;
+    loop {
+        let line = match read_line(&mut input, MAX_LINE)? {
+            Line::Eof => break,
+            Line::TooLong => {
+                writeln!(out, "{}", json!({"id": null, "ok": false, "error": "request line too long"}))?;
+                out.flush()?;
+                continue;
+            }
+            Line::Text(l) => l,
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -616,7 +774,7 @@ pub fn serve<R: BufRead, W: Write>(s: &mut Session, input: R, out: &mut W) -> st
             writeln!(out, "{}", json!({"ok": true, "bye": true}))?;
             break;
         }
-        let resp = handle_request(s, &line);
+        let resp = handle_request_in(s, roots, &line);
         writeln!(out, "{resp}")?;
         out.flush()?;
     }
@@ -624,8 +782,114 @@ pub fn serve<R: BufRead, W: Write>(s: &mut Session, input: R, out: &mut W) -> st
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// `<temp>/…/{work,out,secret}`: `work` is the read root and `out` the write root.
+    pub(crate) struct Roots3 {
+        pub dir: std::path::PathBuf,
+        pub roots: std::sync::Arc<anicraft_engine::access::Roots>,
+    }
+    impl Drop for Roots3 {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+    impl Roots3 {
+        pub fn new(tag: &str) -> Roots3 {
+            let dir = std::env::temp_dir().join(format!("anicraft-cli-roots-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            for d in ["work", "out", "secret"] {
+                std::fs::create_dir_all(dir.join(d)).unwrap();
+            }
+            std::fs::write(dir.join("secret").join("s.json"), b"{\"steps\": []}").unwrap();
+            let roots = std::sync::Arc::new(anicraft_engine::access::Roots::new(&[dir.join("work")], Some(&dir.join("out"))).unwrap());
+            Roots3 { dir, roots }
+        }
+        pub fn path(&self, parts: &[&str]) -> String {
+            parts.iter().fold(self.dir.clone(), |p, x| p.join(x)).display().to_string()
+        }
+    }
+
+    /// AGENTS.md rule 18: `mcp` refuses to start without both roots, bridge or not, with the
+    /// usage exit code, before it opens anything.
+    #[test]
+    fn mcp_refuses_to_start_without_both_automation_roots() {
+        let r = Roots3::new("start");
+        let run = |v: &[&str]| run(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let (work, out) = (r.path(&["work"]), r.path(&["out"]));
+        for argv in [
+            vec!["mcp"],
+            vec!["mcp", "--sample"],
+            vec!["mcp", "no-such-file.anicraft"],
+            vec!["mcp", "--bridge", "9878"],
+            vec!["mcp", "--automation-read-root", &work],
+            vec!["mcp", "--automation-write-root", &out],
+            vec!["mcp", "--bridge", "9878", "--automation-write-root", &out],
+            vec!["mcp", "--automation-read-root", &work, "--automation-write-root", &out, "--automation-write-root", &out],
+            vec!["mcp", "--automation-read-root", "", "--automation-write-root", &out],
+            vec!["mcp", "--automation-read-root", &work, "--automation-write-root"],
+        ] {
+            let e = run(&argv).unwrap_err();
+            assert!(e.contains("--automation-read-root") || e.contains("--automation-write-root"), "{argv:?}: {e}");
+            assert_eq!(exit_code(&e), USAGE_EXIT, "{argv:?}: {e}");
+        }
+        // A root that is not a folder that exists stops the start too.
+        let missing = r.path(&["nowhere"]);
+        let e = run(&["mcp", "--automation-read-root", &missing, "--automation-write-root", &out]).unwrap_err();
+        assert!(e.contains("nowhere") && exit_code(&e) == USAGE_EXIT, "{e}");
+        let file = r.path(&["secret", "s.json"]);
+        assert!(run(&["serve", "--automation-read-root", &work, "--automation-write-root", &file]).is_err());
+        assert_eq!(exit_code("unknown subcommand 'x'"), 1);
+        // The help says so.
+        let help = run(&["mcp", "--help"]).unwrap();
+        assert!(help.contains("--automation-read-root") && help.contains("--automation-write-root") && help.contains("required"), "{help}");
+        // The flags parse: several read roots, one write root, relative ones from the launch folder.
+        let a = Args::parse(&["--automation-read-root".into(), work.clone(), "--automation-read-root".into(), out.clone(), "--automation-write-root".into(), ".".into()]).unwrap();
+        let (read, write) = automation_folders(&a).unwrap().unwrap();
+        assert_eq!(read.len(), 2);
+        assert!(write.is_absolute());
+        assert!(automation_folders(&Args::parse(&[]).unwrap()).unwrap().is_none(), "serve without roots works as before");
+        let eq = Args::parse(&[format!("--automation-read-root={work}"), format!("--automation-write-root={out}")]).unwrap();
+        assert_eq!(automation_folders(&eq).unwrap().map(|(r, _)| r.len()), Some(1), "--flag=value");
+        assert_eq!(exit_code(&run(&["mcp", "--automation-read-root=", &format!("--automation-write-root={out}")]).unwrap_err()), USAGE_EXIT);
+    }
+
+    #[test]
+    fn serve_keeps_inside_its_roots_when_given_them() {
+        let r = Roots3::new("serve");
+        let mut s = Session::default();
+        let req = |cmd: &str, path: String| json!({"cmd": cmd, "params": {"path": path}}).to_string();
+        let refused = handle_request_in(&mut s, Some(&r.roots), &req("file.save_as", r.path(&["secret", "x.anicraft"])));
+        assert_eq!(refused["ok"], false);
+        assert!(refused["error"].as_str().unwrap().contains("automation write root"), "{refused}");
+        assert_eq!(handle_request_in(&mut s, Some(&r.roots), &req("file.save_as", r.path(&["out", "x.anicraft"])))["ok"], true);
+        // Without roots, serve is the plain CLI it was.
+        assert_eq!(handle_request(&mut s, &req("file.save_as", r.path(&["secret", "y.anicraft"])))["ok"], true);
+    }
+
+    #[test]
+    fn float_flags_reject_nonfinite_values_without_changing_numeric_parsing() {
+        for key in ["fps", "scale"] {
+            let flag = format!("--{key}");
+            for value in ["NaN", "inf", "+inf", "-inf", "1e40", "-1e40"] {
+                let args = Args::parse(&[flag.clone(), value.into()]).unwrap();
+                assert_eq!(args.float(key).unwrap_err(), format!("--{key} expects a finite number"));
+            }
+            for (value, expected) in [("0", 0.0), ("-1", -1.0), ("1.25", 1.25), ("1e2", 100.0)] {
+                let args = Args::parse(&[flag.clone(), value.into()]).unwrap();
+                assert_eq!(args.float(key).unwrap(), Some(expected));
+            }
+            let bad = Args::parse(&[flag.clone(), "oops".into()]).unwrap();
+            assert_eq!(bad.float(key).unwrap_err(), format!("--{key} expects a number, got 'oops'"));
+            assert_eq!(Args::parse(&[]).unwrap().float(key).unwrap(), None);
+            assert!(Args::parse(&[flag]).is_err());
+        }
+        let integer = Args::parse(&["--frame".into(), "12".into()]).unwrap();
+        assert_eq!(integer.num::<u32>("frame").unwrap(), Some(12));
+        let bad_integer = Args::parse(&["--frame".into(), "NaN".into()]).unwrap();
+        assert_eq!(bad_integer.num::<u32>("frame").unwrap_err(), "--frame expects a number, got 'NaN'");
+    }
 
     /// #226: `info`, `render` and the other subcommands take an Animate document as File › Open
     /// does (an import, untitled), not only `.anicraft` files.
@@ -636,6 +900,33 @@ mod tests {
         assert!(s.path.is_none() && !s.doc.timeline(0).layers.is_empty());
         let info = run(&["info".to_string(), xfl.display().to_string()]).unwrap();
         assert!(info.contains("\"layers\""), "{info}");
+    }
+
+    #[test]
+    fn serve_refuses_ffmpeg_path_but_exec_keeps_it() {
+        let mut s = Session::default();
+        let r = handle_request(&mut s, r#"{"cmd":"file.export_video","params":{"path":"a.mp4","ffmpeg":"/bin/sh"}}"#);
+        assert_eq!(r["ok"], false);
+        assert!(r["error"].as_str().unwrap().contains("ANICRAFT_FFMPEG"));
+        // Every command that runs ffmpeg takes the same parameter, and none may be given it here.
+        let takes_it: Vec<&str> = commands().iter().filter(|c| c.params.contains("ffmpeg?")).map(|c| c.id).collect();
+        assert!(takes_it.contains(&"file.export_video") && takes_it.contains(&"file.import_video"), "{takes_it:?}");
+        for id in takes_it {
+            let r = handle_request(&mut s, &json!({"cmd": id, "params": {"path": "a.mp4", "ffmpeg": "/bin/sh"}}).to_string());
+            assert!(r["error"].as_str().is_some_and(|e| e.contains("ANICRAFT_FFMPEG")), "{id}: {r}");
+        }
+        // Direct CLI use is not filtered: the command runs and fails on the missing program, not on the parameter.
+        let e = exec(&mut s, "file.export_video", &json!({"path": "a.mp4", "ffmpeg": "/nonexistent/anicraft-ffmpeg"})).unwrap_err();
+        assert!(!e.contains("ANICRAFT_FFMPEG environment variable"), "{e}");
+    }
+
+    #[test]
+    fn long_lines_are_bounded() {
+        let mut input = &b"abcdefghij\nok\r\nxy"[..];
+        assert!(matches!(read_line(&mut input, 4).unwrap(), Line::TooLong));
+        assert!(matches!(read_line(&mut input, 4).unwrap(), Line::Text(t) if t == "ok"));
+        assert!(matches!(read_line(&mut input, 4).unwrap(), Line::Text(t) if t == "xy"));
+        assert!(matches!(read_line(&mut input, 4).unwrap(), Line::Eof));
     }
 
     #[test]
@@ -751,6 +1042,10 @@ mod tests {
         let svg = dir.join("f.svg");
         run(&argv(&["export", "--sample", "--format", "svg", "--frame", "3", "--out", svg.to_str().unwrap()])).unwrap();
         assert!(std::fs::read_to_string(&svg).unwrap().contains("<svg"));
+        // A sequence goes to a folder, one file per frame (#504).
+        let seq = dir.join("vectors");
+        run(&argv(&["export", "--sample", "--format", "svg-sequence", "--from", "2", "--to", "3", "--out", seq.to_str().unwrap()])).unwrap();
+        assert!(std::fs::read_to_string(seq.join("frame_00002.svg")).unwrap().contains("<svg") && seq.join("frame_00003.svg").exists() && !seq.join("frame_00001.svg").exists());
         // An exporter plug-in that writes "frames:" and the count it was handed.
         let m = r#"{"id":"org.test.count","name":"Count","kind":"exporter","format":{"name":"Count","extension":"txt"}}"#;
         let req = r#"{"op":"movie"}"#;

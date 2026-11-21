@@ -40,7 +40,9 @@ impl Path {
         use std::fmt::Write;
         let mut s = String::with_capacity(self.cmds.len() * 16);
         let pt = |s: &mut String, p: Vec2| {
-            let _ = write!(s, "{} {}", p.x, p.y);
+            // Non-finite values would be rejected by `from_svg`; write 0 so a save always reloads.
+            let f = |v: f32| if v.is_finite() { v } else { 0.0 };
+            let _ = write!(s, "{} {}", f(p.x), f(p.y));
         };
         for c in &self.cmds {
             match *c {
@@ -310,6 +312,28 @@ impl Path {
             .cubic_to(Vec2::new(cx - rx, cy - ky), Vec2::new(cx - kx, cy - ry), Vec2::new(cx, cy - ry))
             .cubic_to(Vec2::new(cx + kx, cy - ry), Vec2::new(cx + rx, cy - ky), Vec2::new(cx + rx, cy))
             .close();
+        p
+    }
+
+    /// Ellipse centred at `(cx, cy)` built from eight cubic arcs (a node every 45 degrees,
+    /// starting at the right), as the Oval tool draws it.
+    pub fn ellipse8(cx: f32, cy: f32, rx: f32, ry: f32) -> Path {
+        // Control-arm length for a 45 degree arc: 4/3 * tan(pi / 16).
+        const K: f32 = 0.265_216_5;
+        const STEP: f32 = std::f32::consts::FRAC_PI_4;
+        let mut p = Path::new();
+        p.move_to(Vec2::new(cx + rx, cy));
+        for i in 0..8 {
+            let (s0, c0) = (i as f32 * STEP).sin_cos();
+            let (s1, c1) = ((i + 1) as f32 * STEP).sin_cos();
+            let end = if i == 7 { Vec2::new(cx + rx, cy) } else { Vec2::new(cx + rx * c1, cy + ry * s1) };
+            p.cubic_to(
+                Vec2::new(cx + rx * (c0 - K * s0), cy + ry * (s0 + K * c0)),
+                Vec2::new(cx + rx * (c1 + K * s1), cy + ry * (s1 - K * c1)),
+                end,
+            );
+        }
+        p.close();
         p
     }
 
@@ -626,6 +650,24 @@ mod tests {
             let e = Path::rect(0.0, 0.0, w, h).bounds();
             assert_eq!((b.min, b.max), (e.min, e.max), "w={w} h={h}");
         }
+    }
+
+    #[test]
+    fn non_finite_coordinates_round_trip_as_zero() {
+        let mut p = Path::default();
+        p.cmds.push(PathCmd::MoveTo(Vec2::new(0.0, 0.0)));
+        p.cmds.push(PathCmd::LineTo(Vec2::new(f32::INFINITY, 1.0)));
+        p.cmds.push(PathCmd::LineTo(Vec2::new(f32::NAN, f32::NEG_INFINITY)));
+        let json = serde_json::to_string(&p).unwrap();
+        let back: Path = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.cmds,
+            vec![
+                PathCmd::MoveTo(Vec2::new(0.0, 0.0)),
+                PathCmd::LineTo(Vec2::new(0.0, 1.0)),
+                PathCmd::LineTo(Vec2::new(0.0, 0.0)),
+            ]
+        );
     }
 
     #[test]

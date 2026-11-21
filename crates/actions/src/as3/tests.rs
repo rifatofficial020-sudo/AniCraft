@@ -32,6 +32,8 @@ struct Mock {
     frame: u32,
     /// Text fields' text, by name.
     texts: BTreeMap<String, String>,
+    /// Text fields' other members a script set (`maxChars`, `restrict`), by name.
+    members: BTreeMap<(String, &'static str), Value>,
 }
 
 impl World for Mock {
@@ -50,10 +52,11 @@ impl World for Mock {
             Prop::CurrentFrame => Value::Num(f64::from(self.frame + 1)),
             Prop::Name => Value::str(&at.to_string()),
             Prop::Visible => Value::Bool(true),
-            Prop::Text | Prop::Length => {
+            Prop::Text | Prop::Length | Prop::HtmlText => {
                 let t = self.texts.get(&at.path.0).ok_or_else(|| format!("“{at}” isn't a text field"))?;
-                if p == Prop::Text { Value::str(t) } else { Value::Num(text_len(t) as f64) }
+                if p == Prop::Length { Value::Num(text_len(t) as f64) } else { Value::str(t) }
             }
+            Prop::MaxChars | Prop::Restrict => self.members.get(&(at.path.0.clone(), p.name())).cloned().unwrap_or(if p == Prop::MaxChars { Value::Num(0.0) } else { Value::Null }),
             p => Value::Num(self.props.get(&(at.path.0.clone(), p.name())).copied().unwrap_or(0.0)),
         })
     }
@@ -77,6 +80,18 @@ impl World for Mock {
         }
         self.log.push(format!("text {at} = {text}"));
         self.texts.insert(at.path.0.clone(), text);
+        Ok(())
+    }
+    fn set_field(&mut self, at: &Place, p: Prop, v: Value) -> Result<(), Option<String>> {
+        if !self.texts.contains_key(&at.path.0) {
+            return Err(Some(format!("“{at}” isn't a text field")));
+        }
+        self.log.push(format!("{} {at} = {}", p.name(), v.text()));
+        if p == Prop::HtmlText {
+            self.texts.insert(at.path.0.clone(), v.text());
+        } else {
+            self.members.insert((at.path.0.clone(), p.name()), v);
+        }
         Ok(())
     }
     fn trace(&mut self, line: String) {
@@ -566,3 +581,47 @@ fn surrogate_pair_escapes() {
     assert_eq!(lines(r#"trace("é\uD83D\uDE00");"#), vec!["é😀".to_string()]);
     assert_eq!(lines(r#"trace("\uD83Dx\uDE00");"#), vec!["\u{FFFD}x\u{FFFD}".to_string()]);
 }
+
+#[test]
+fn scripts_set_html_text_limits_and_listen_for_changes() {
+    let src = r#"
+        name_txt.htmlText = "<b>Hi</b>";
+        name_txt.maxChars = 8.9;
+        name_txt.restrict = "A-Z 0-9";
+        trace(name_txt.htmlText, name_txt.maxChars, name_txt.restrict);
+        name_txt.restrict = null;
+        name_txt.maxChars += 2;
+        trace(name_txt.maxChars, name_txt.restrict);
+        function onChange(e:Event):void { trace("changed " + e.target.text); }
+        name_txt.addEventListener(Event.CHANGE, onChange);
+        name_txt.addEventListener("change", function (e:Event):void { trace("too"); });
+        name_txt.removeEventListener(Event.CHANGE, onChange);
+    "#;
+    let c = ok(src);
+    let mut m = Mock { decls: Decls::build([&c]), ..Mock::default() };
+    m.texts.insert("name_txt".into(), String::new());
+    let (_, r) = run::run_script(&mut m, &c.body, &c.inner, run::FUEL_PER_RUN);
+    assert_eq!(r, Ok(()), "{:?}", m.log);
+    assert!(m.log.contains(&"<b>Hi</b> 8 A-Z 0-9".to_string()), "{:?}", m.log);
+    assert!(m.log.contains(&"10 null".to_string()), "{:?}", m.log);
+    // The IR names the event and the members (what the HTML page's player reads).
+    let json = serde_json::to_string(&c).unwrap();
+    assert!(json.contains("\"ev\":\"change\"") && json.contains("\"p\":\"html_text\"") && json.contains("\"p\":\"max_chars\"") && json.contains("\"k\":\"field\""), "{json}");
+    // What can't be: a null htmlText, a maxChars that isn't a number, writing length, and
+    // change listeners on the stage or the timeline.
+    for (src, want) in [
+        ("name_txt.htmlText = null;", "`htmlText` is set to text"),
+        ("name_txt.maxChars = \"many\";", "`maxChars` is set to a number"),
+    ] {
+        let c = ok(src);
+        let mut m = Mock { decls: Decls::build([&c]), ..Mock::default() };
+        m.texts.insert("name_txt".into(), String::new());
+        let (_, r) = run::run_script(&mut m, &c.body, &c.inner, run::FUEL_PER_RUN);
+        assert!(matches!(&r, Err(Stop::Error { message, .. }) if message.contains(want)), "{src}: {r:?}");
+    }
+    assert!(err("name_txt.length = 3;").2.contains("can only be read"));
+    assert!(err("function f(e:Event):void {} stage.addEventListener(Event.CHANGE, f);").2.contains("input text field"));
+    assert!(err("function f(e:Event):void {} addEventListener(Event.CHANGE, f);").2.contains("input text field"));
+    assert!(err("this.htmlText = \"x\";").2.contains("isn't a text field"));
+}
+

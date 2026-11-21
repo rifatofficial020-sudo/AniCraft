@@ -49,12 +49,23 @@ const PARA_KEYS: &str = "align?: left|center|right, indent? (px, first line), le
 
 pub fn specs() -> Vec<CommandSpec> {
     let c = |id, label, menu, shortcut, params, mutates, run| CommandSpec { id, label, menu, shortcut, params, mutates, run };
-    let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+    // The four params docs put together from the shared key lists: made once and kept, since
+    // the registry is rebuilt by every caller (the menu bar asks each frame; #454: a fresh
+    // copy each time was never freed, about 1.5 kB a frame).
+    static DOCS: std::sync::OnceLock<[String; 4]> = std::sync::OnceLock::new();
+    let [create_doc, edit_doc, style_doc, paragraph_doc] = DOCS.get_or_init(|| {
+        [
+            format!("{{text (may be empty for an input field), type?: static|dynamic|input, x?, y? (top-left; default: centred), width?, {CHAR_KEYS}, {PARA_KEYS}, runs?: [{{chars, …character keys}}] (styles of the text's characters in order; unset keys take the style above), paragraphs?: [{{…paragraph keys}}] (one per line of the text)}} (ADR 0085)"),
+            format!("{{text? (the runs follow the change: typed characters continue the style before them), runs?, paragraphs? (as text.create: replace the styles), width? (px, wraps; null: one line per paragraph), {CHAR_KEYS} (every character), {PARA_KEYS} (every paragraph)}} on the selected text"),
+            format!("{{start?, end? (characters; default: all), {CHAR_KEYS}}} styles those characters of the selected text, splitting and joining its runs (ADR 0085)"),
+            format!("{{start?, end? (characters; default: all), {PARA_KEYS}}} sets the layout of the paragraphs those characters touch in the selected text (ADR 0085)"),
+        ]
+    });
     vec![
-        c("text.create", "New Text", "", None, leak(format!("{{text (may be empty for an input field), type?: static|dynamic|input, x?, y? (top-left; default: centred), width?, {CHAR_KEYS}, {PARA_KEYS}, runs?: [{{chars, …character keys}}] (styles of the text's characters in order; unset keys take the style above), paragraphs?: [{{…paragraph keys}}] (one per line of the text)}} (ADR 0085)")), true, create as crate::RunFn),
-        c("text.edit", "Edit Text", "", None, leak(format!("{{text? (the runs follow the change: typed characters continue the style before them), runs?, paragraphs? (as text.create: replace the styles), width? (px, wraps; null: one line per paragraph), {CHAR_KEYS} (every character), {PARA_KEYS} (every paragraph)}} on the selected text")), true, |s, p| s.each_layer(false, |s| edit(s, p))),
-        c("text.style", "Text Character Style", "", None, leak(format!("{{start?, end? (characters; default: all), {CHAR_KEYS}}} styles those characters of the selected text, splitting and joining its runs (ADR 0085)")), true, |s, p| s.each_layer(false, |s| style_range(s, p))),
-        c("text.paragraph", "Text Paragraph Style", "", None, leak(format!("{{start?, end? (characters; default: all), {PARA_KEYS}}} sets the layout of the paragraphs those characters touch in the selected text (ADR 0085)")), true, |s, p| s.each_layer(false, |s| paragraph_range(s, p))),
+        c("text.create", "New Text", "", None, create_doc.as_str(), true, create as crate::RunFn),
+        c("text.edit", "Edit Text", "", None, edit_doc.as_str(), true, |s, p| s.each_layer(false, |s| edit(s, p))),
+        c("text.style", "Text Character Style", "", None, style_doc.as_str(), true, |s, p| s.each_layer(false, |s| style_range(s, p))),
+        c("text.paragraph", "Text Paragraph Style", "", None, paragraph_doc.as_str(), true, |s, p| s.each_layer(false, |s| paragraph_range(s, p))),
         c("text.styles", "Text Styles", "", None, "{start?, end? (characters; default: all)} of the first selected text: its runs, paragraphs, and what those characters share (a mixed value is null) (ADR 0085)", false, styles_of),
         c("text.fonts", "Fonts", "", None, "{}", false, fonts),
         c(
@@ -68,7 +79,7 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         c("text.path", "Text on Path", "", None, "{offset? (px along the path), flip?: bool (along the path backwards, on its other side), release?: bool (back to lines of text where it starts)} on the selected text on a path (ADR 0070)", true, |s, p| s.each_layer(false, |s| set_path(s, p))),
         c("text.release_path", "Release Text from Path", "Modify/Text", None, "{} the selected text on a path goes back to lines of text (ADR 0070)", true, |s, _| s.each_layer(false, |s| set_path(s, &json!({"release": true})))),
-        c("text.field", "Text Type", "", None, "{type?: static|dynamic|input, lines?: single|multiline|multiline_no_wrap|password (input only), width?, height? (the field's box, px), selectable?, border?, background?, border_color?, background_color?, max_chars? (input; 0: no limit), variable? (kept, not run)} on the selected text; dynamic and input fields are named with instance.set_name and scripted in Test Movie and the HTML export (ADR 0066)", true, |s, p| s.each_layer(false, |s| set_field(s, p))),
+        c("text.field", "Text Type", "", None, "{type?: static|dynamic|input, lines?: single|multiline|multiline_no_wrap|password (input only), width?, height? (the field's box, px), selectable?, border?, background?, border_color?, background_color?, max_chars? (input; 0: no limit), variable? (kept, not run), embed?: characters whose glyph outlines the HTML export carries for this field's font, so text a script sets is drawn in it where the font's licence allows (\"\": none; ADR 0107)} on the selected text; dynamic and input fields are named with instance.set_name and scripted in Test Movie and the HTML export (ADR 0066)", true, |s, p| s.each_layer(false, |s| set_field(s, p))),
     ]
 }
 
@@ -323,9 +334,10 @@ pub(crate) fn lay_out_block(d: &TextBlock) -> Result<(TextBlock, Option<String>,
     let (runs, paras, paints) = rich_parts(&d);
     match (d.field.clone(), d.on_path.clone()) {
         (_, Some(on)) => {
-            // One line along the path (line breaks become spaces), anchored by the alignment.
-            let line: String = d.text.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
-            let l = fonts.layout_rich(&anicraft_text::RichText { text: &line, runs: &runs, paragraphs: &[anicraft_text::ParaStyle::default()], width: None }, true).map_err(layout_err)?;
+            // Lines along the path (ADR 0107): laid out left-aligned with each paragraph's
+            // line spacing; the block's alignment anchors every line along the path.
+            let lines: Vec<anicraft_text::ParaStyle> = paras.iter().map(|q| anicraft_text::ParaStyle { line_spacing: q.line_spacing, ..anicraft_text::ParaStyle::default() }).collect();
+            let l = fonts.layout_rich(&anicraft_text::RichText { text: &d.text, runs: &runs, paragraphs: &lines, width: None }, true).map_err(layout_err)?;
             let offset = if on.offset.is_finite() { on.offset.clamp(-MAX_PATH_OFFSET, MAX_PATH_OFFSET) } else { 0.0 };
             let set = anicraft_text::on_path_boxed(&l.glyphs, &on.path, anicraft_text::PathPlacement { offset, flip: on.flip, align: align_text(d.align) }).ok_or_else(|| EngineError::State("the path has no length to set text along".into()))?;
             d.width = None;
@@ -389,6 +401,18 @@ pub fn field_layout(fonts: &Fonts, style: &TextStyle, field: &TextField, box_wid
     let run = anicraft_text::Run { chars: usize::MAX, style: anicraft_text::RunStyle { family: style.font.clone(), size: style.size, bold: style.bold, italic: style.italic, letter_spacing: style.letter_spacing, ..anicraft_text::RunStyle::default() } };
     let para = anicraft_text::ParaStyle { align: align_text(style.align), line_spacing: style.line_spacing, ..anicraft_text::ParaStyle::default() };
     field_lay(fonts, &anicraft_text::RichText { text: shown, runs: &[run], paragraphs: &[para], width: field.wrap_width(box_width) }, style.align, field, box_width)
+}
+
+/// A field's text laid out in the styles a script gave it with `htmlText` (ADR 0107), and the
+/// colour each of the layout's paints stands for. Links don't cut pieces here: a colour is one
+/// piece.
+pub fn field_layout_rich(fonts: &Fonts, block: &TextBlock, field: &TextField, shown: &str, rich: &anicraft_doc::html_text::RichStyles) -> std::result::Result<(anicraft_text::Layout, Vec<Rgba>), anicraft_text::TextError> {
+    let mut d = TextBlock { text: shown.to_string(), runs: Vec::new(), paragraphs: Vec::new(), ..block.clone() };
+    let runs = rich.runs.iter().map(|r| TextRun { chars: r.chars, style: CharStyle { url: String::new(), ..r.style.clone() } }).collect();
+    d.set_styles(runs, rich.paragraphs.clone());
+    let (runs, paras, paints) = rich_parts(&d);
+    let l = field_lay(fonts, &anicraft_text::RichText { text: shown, runs: &runs, paragraphs: &paras, width: field.wrap_width(block.box_width) }, d.align, field, block.box_width)?;
+    Ok((l, paints.into_iter().map(|(c, _)| c).collect()))
 }
 
 /// `t` with its text changed to `text`, its runs and paragraphs following the change (one
@@ -552,6 +576,11 @@ fn set_field(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::Param(format!("'max_chars' is at most {MAX_FIELD_CHARS}")));
     }
     let variable = opt_str(p, "variable")?.map(|v| v.trim().chars().take(MAX_FIELD_NAME).collect::<String>());
+    let embed = match opt_str(p, "embed")? {
+        Some(e) if e.chars().count() > anicraft_doc::MAX_EMBED_CHARS * 4 => return Err(EngineError::Param(format!("'embed' is at most {} characters", anicraft_doc::MAX_EMBED_CHARS * 4))),
+        Some(e) => Some(anicraft_doc::embed_chars(e)),
+        None => None,
+    };
     let (selectable, border, background) = (opt_bool(p, "selectable")?, opt_bool(p, "border")?, opt_bool(p, "background")?);
     let (border_color, background_color) = (opt_color(p, "border_color")?, opt_color(p, "background_color")?);
     let mut changed = 0;
@@ -605,6 +634,9 @@ fn set_field(s: &mut Session, p: &Value) -> Result<Value> {
             f.max_chars = max_chars.unwrap_or(f.max_chars);
             if let Some(v) = &variable {
                 f.variable.clone_from(v);
+            }
+            if let Some(e) = &embed {
+                f.embed.clone_from(e);
             }
             let (b, n, _) = lay_out_block(&TextBlock { field: Some(f.sanitized()), box_width: width.unwrap_or(bw), box_height: height.unwrap_or(bh), ..(**t).clone() })?;
             (b, n)

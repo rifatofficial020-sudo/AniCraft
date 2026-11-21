@@ -9,6 +9,7 @@
 pub mod edges;
 mod end_record;
 pub mod import;
+mod morph_hints;
 pub mod text;
 pub mod video;
 /// The shared XML reader (`anicraft-xml`), under its old path.

@@ -459,7 +459,10 @@ var AniCraft = (function () {
     if (tf.bd) items.push(mk(tf.r, -1, tf.bd, tf.bk || null, clip, null));
     for (const it of items) dl.items.push(it);
     if (!v) return;
-    if (v.field) v.field({ tf: tf, name: name, m: xf, c: color, clip: clip, group: group, key: key, text: text, focused: focused, items: items });
+    // `rich`: the styles changed text is drawn in when a script set them (`htmlText`).
+    // `rich`: the styles changed text is drawn in when a script set them (`htmlText`); `mx`:
+    // the most characters the viewer may type now.
+    if (v.field) v.field({ tf: tf, name: name, m: xf, c: color, clip: clip, group: group, key: key, text: text, rich: text !== null && fs && fs.rich !== null ? fs.rich : null, mx: fieldMax(fs, tf), focused: focused, items: items });
     else for (const it of items) v.item(it);
   }
 
@@ -513,7 +516,7 @@ var AniCraft = (function () {
   const MAX_LABEL_CHARS = 256;
   const PROP_NAMES = { x: "x", y: "y", alpha: "alpha", visible: "visible", rotation: "rotation", scale_x: "scaleX", scale_y: "scaleY" };
   const PROP_LABELS = { x: "x", y: "y", alpha: "alpha", visible: "visible", rotation: "rotation", scale_x: "scale x", scale_y: "scale y" };
-  const READ_NAMES = { current_frame: "currentFrame", total_frames: "totalFrames", current_label: "currentLabel", mouse_x: "mouseX", mouse_y: "mouseY", name: "name", text: "text", length: "length" };
+  const READ_NAMES = { current_frame: "currentFrame", total_frames: "totalFrames", current_label: "currentLabel", mouse_x: "mouseX", mouse_y: "mouseY", name: "name", text: "text", length: "length", html_text: "htmlText", max_chars: "maxChars", restrict: "restrict" };
   // Longest text a field holds (code points, as lib.rs `MAX_FIELD_CHARS`).
   const MAX_FIELD_CHARS = 16384;
   // How messages name a kind of instance (player.rs `kind_name`).
@@ -889,6 +892,21 @@ var AniCraft = (function () {
       this.lift(this.line, this.w.setText(to.at, String(v)));
       return v;
     }
+    // Another member of a text field (run.rs `LValue::Field`; ADR 0107).
+    if (to.k === "field") {
+      let x;
+      if (to.p === "html_text") {
+        if (v === null || v === undefined) this.err("`htmlText` is set to text, not " + String(v));
+        x = String(v);
+      } else if (to.p === "max_chars") {
+        const n = +v;
+        if (!Number.isFinite(n)) this.err("`maxChars` is set to a number, not " + shown(v));
+        x = Math.min(Math.max(Math.trunc(n), 0), 2147483647) + 0;
+      } else if (to.p === "restrict") x = v === null || v === undefined ? null : String(v);
+      else this.err("`" + READ_NAMES[to.p] + "` can only be read");
+      this.lift(this.line, this.w.setField(to.at, to.p, x));
+      return x;
+    }
     const n = +v;
     if (!Number.isFinite(n)) this.err("`" + PROP_NAMES[to.p] + "` is set to a number, not " + shown(v));
     this.lift(this.line, this.w.set(to.at, to.p, n));
@@ -1084,6 +1102,19 @@ var AniCraft = (function () {
     this.r.setFieldText(n.path, text);
     return undefined;
   };
+  // `field.htmlText = …`, `maxChars`, `restrict` (player.rs `set_field`).
+  Script.prototype.setField = function (at, p, v) {
+    if (!this.r.budget()) return null;
+    const f = this.from();
+    if (f.err !== undefined) return f.err;
+    const i = this.r.place(f.ok, this.ev, at);
+    if (i.err !== undefined) return i.err;
+    const n = i.ok === null ? undefined : this.r.nodes[i.ok];
+    if (!n) return "the stage isn't a text field";
+    if (n.kind !== TEXT) return "“" + n.name + "” is " + kindName(n.kind) + ", not a text field";
+    this.r.setFieldMember(n.path, p, v);
+    return undefined;
+  };
   Script.prototype.trace = function (line) {
     if (this.r.budget()) this.r.out(line);
   };
@@ -1180,19 +1211,39 @@ var AniCraft = (function () {
     return n || null;
   };
   // The viewer changed input field `key`'s text in the page's element: the text the field keeps
-  // (the element's value as the editor would let it in), or null when there is no such input
-  // field. No script runs: listeners hear the keys, as they do in the Rust player.
+  // (the element's value as the editor would let it in: its `maxChars` and `restrict` applied),
+  // or null when there is no such input field. When the text changed, the field's change event
+  // runs (ADR 0107) and `this.changed` holds that step's result (its output and sounds), else
+  // null.
   Player.prototype.typed = function (key, value) {
+    this.changed = null;
     const n = this.fieldNode(key);
     if (n === null || n.tf.k !== "input") return null;
-    const v = typedText(n.tf, String(value === null || value === undefined ? "" : value));
     let fs = this.st.fields.get(key);
     if (!fs) {
       fs = newField(n.path);
       this.st.fields.set(key, fs);
     }
+    const before = fieldValue(fs, n.tf);
+    const v = typedText(n.tf, String(value === null || value === undefined ? "" : value), fs);
+    if (fs.rich !== null && v !== before) {
+      // One edit: the longest common start and end kept (rich_text.rs `diff_chars`).
+      const a = Array.from(before), b = Array.from(v);
+      let pre = 0;
+      while (pre < a.length && pre < b.length && a[pre] === b[pre]) pre++;
+      let suf = 0;
+      while (suf < Math.min(a.length, b.length) - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf]) suf++;
+      fs.rich = { runs: typeIntoRuns(fs.rich.runs, pre, a.length - suf, b.length - suf - pre), paras: editParagraphs(fs.rich.paras, a, pre, a.length - suf, b.slice(pre, b.length - suf)) };
+    }
     fs.text = v;
     fs.caret = fs.anchor = Array.from(v).length;
+    if (v !== before) {
+      const r = new Run(this);
+      r.refresh();
+      r.rememberGraphics();
+      r.changed(n.path);
+      this.changed = r.finish();
+    }
     return v;
   };
   // The keyboard went to field `key` (an input field, or a selectable dynamic one, on the stage
@@ -1235,7 +1286,7 @@ var AniCraft = (function () {
     const kind = (v) => (v === undefined ? "u" : v === null ? "null" : typeof v === "boolean" ? "b" : typeof v === "number" ? "n" : "s");
     const vars = Array.from(st.vars.values()).sort((a, b) => comparePaths(a.path, b.path)).map((x) => [x.path, Object.keys(x.v).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).map((k) => [k, kind(x.v[k]) + ":" + String(x.v[k])])]);
     const stage = st.stage.map((x) => [x.ev, x.owner, x.k]);
-    const fields = Array.from(st.fields.values()).sort((a, b) => comparePaths(a.path, b.path)).map((f) => [f.path, f.text, f.caret, f.anchor]);
+    const fields = Array.from(st.fields.values()).sort((a, b) => comparePaths(a.path, b.path)).map((f) => [f.path, f.text, f.caret, f.anchor, f.rich === null ? null : [f.rich.runs.map((r) => [r.n, r.s.font, r.s.size, r.s.bold, r.s.italic, r.s.color, r.s.ls, r.s.u, r.s.url]), f.rich.paras.map((p) => p.al)], f.mx, f.res]);
     return { scene: st.scene, frame: st.root.frame, playing: st.root.playing, clips: clips, props: props, listeners: listeners, stage: stage, vars: vars, hover: st.hover, pressed: st.pressed, down: st.down, fields: fields, focus: st.focus, selecting: st.selecting, shift: st.shift };
   };
 
@@ -1578,13 +1629,24 @@ var AniCraft = (function () {
           return { ok: "root1" };
         case "text":
         case "length":
+        case "html_text":
+        case "max_chars":
+        case "restrict":
           return { err: "the main timeline isn't a text field" };
       }
     }
-    if (p === "text" || p === "length") {
+    if (p === "text" || p === "length" || p === "html_text" || p === "max_chars" || p === "restrict") {
       if (n.kind !== TEXT) return { err: "“" + n.name + "” is " + kindName(n.kind) + ", not a text field" };
-      const v = fieldValue(st.fields.get(n.key), n.tf);
-      return { ok: p === "text" ? v : v.length };
+      const fs = st.fields.get(n.key);
+      const v = fieldValue(fs, n.tf);
+      if (p === "text") return { ok: v };
+      if (p === "length") return { ok: v.length };
+      if (p === "max_chars") return { ok: fs && fs.mx !== null ? fs.mx : n.tf.mx || 0 };
+      if (p === "restrict") return { ok: fs ? fs.res : null };
+      // The text's styles as HTML: what a script set, the authored runs while the text is
+      // the authored one, else the field's own style.
+      const rich = fieldStyles(fs, n.tf);
+      return { ok: writeHtml(v, rich.runs, rich.paras) };
     }
     const ov = st.props.get(n.key) || {};
     const m = n.local;
@@ -1647,9 +1709,9 @@ var AniCraft = (function () {
     }
     const node = this.nodes[pl.ok];
     if (!node) return;
-    const ok = event === "enter_frame" ? node.kind !== GRAPHIC : node.kind === BUTTON || node.kind === CLIP;
+    const ok = event === "enter_frame" ? node.kind !== GRAPHIC : event === "change" ? node.kind === TEXT : node.kind === BUTTON || node.kind === CLIP;
     if (!ok) {
-      const why = node.kind === ROOT ? "the main timeline doesn't get pointer events here" : "“" + node.name + "” is " + kindName(node.kind) + "; only buttons and movie clips get pointer events";
+      const why = event === "change" ? "“" + node.name + "” is " + kindName(node.kind) + "; only text fields send change events" : node.kind === ROOT ? "the main timeline doesn't get pointer events here" : "“" + node.name + "” is " + kindName(node.kind) + "; only buttons and movie clips get pointer events";
       return this.out(what + ": " + why);
     }
     let list = st.listeners.get(node.key);
@@ -1881,6 +1943,655 @@ var AniCraft = (function () {
     }
   };
 
+
+  // ----- htmlText (html_text.rs; ADR 0107) -----------------------------------------------------
+  //
+  // A line-by-line port of crates/doc/src/html_text.rs: the small HTML Flash text fields took,
+  // read into text, runs and paragraphs and written back. A style is { font, size, bold, italic,
+  // color: [r, g, b] (0 to 255), ls, u, url }; a run { n, s }; a paragraph { al }. Reading is a
+  // sanitiser: nothing of the input is kept as markup.
+  const MAX_HTML = 65536;
+  const MAX_HTML_DEPTH = 64;
+  const MAX_URL = 2048;
+  function sameStyle(a, b) {
+    return a.font === b.font && a.size === b.size && a.bold === b.bold && a.italic === b.italic && a.color[0] === b.color[0] && a.color[1] === b.color[1] && a.color[2] === b.color[2] && a.ls === b.ls && a.u === b.u && a.url === b.url;
+  }
+  function copyStyle(s) {
+    return { font: s.font, size: s.size, bold: s.bold, italic: s.italic, color: [s.color[0], s.color[1], s.color[2]], ls: s.ls, u: s.u, url: s.url };
+  }
+  // A field's own style and first paragraph (the exported `st` and `al`).
+  function baseStyle(tf) {
+    const s = tf.st || {};
+    const c = s.c || [0, 0, 0];
+    return { font: String(s.f || ""), size: Math.fround(s.z || 12), bold: !!s.b, italic: !!s.i, color: [c[0], c[1], c[2]], ls: Math.fround(s.ls || 0), u: !!s.u, url: String(s.url || "") };
+  }
+  function basePara(tf) {
+    return { al: tf.al || "left" };
+  }
+  function rustTrim(s) {
+    const cs = Array.from(s);
+    let a = 0, b = cs.length;
+    while (a < b && rustSpace(cs[a])) a++;
+    while (b > a && rustSpace(cs[b - 1])) b--;
+    return cs.slice(a, b).join("");
+  }
+  const isAlnum = (c) => /^[0-9A-Za-z]$/.test(c);
+  // rich_text.rs `safe_url`: the link, or null when it could run script.
+  function safeUrl(url) {
+    const u = Array.from(rustTrim(url)).filter((c) => !rustControl(c)).slice(0, MAX_URL);
+    const noSpace = u.filter((c) => !rustSpace(c));
+    const colon = noSpace.indexOf(":");
+    const scheme = asciiLower((colon < 0 ? noSpace : noSpace.slice(0, colon)).join(""));
+    const hasScheme = u.indexOf(":") >= 0 && !/[\/?#]/.test(scheme);
+    return hasScheme && (scheme === "javascript" || scheme === "vbscript" || scheme === "data") ? null : u.join("");
+  }
+  // One entity at the start of `s` (after its `&`): [character or null, characters taken], or
+  // null when it is no entity.
+  function htmlEntity(s, from) {
+    let end = -1;
+    for (let k = 0; k < 12 && from + k < s.length; k++) {
+      if (s[from + k] === ";") {
+        end = k;
+        break;
+      }
+    }
+    if (end < 0) return null;
+    const name = s.slice(from, from + end).join("");
+    let c;
+    switch (name) {
+      case "lt":
+        c = "<";
+        break;
+      case "gt":
+        c = ">";
+        break;
+      case "amp":
+        c = "&";
+        break;
+      case "quot":
+        c = '"';
+        break;
+      case "apos":
+        c = "'";
+        break;
+      case "nbsp":
+        c = " ";
+        break;
+      default: {
+        if (name[0] !== "#") return null;
+        const digits = name.slice(1);
+        let code;
+        if (digits[0] === "x" || digits[0] === "X") {
+          const hex = digits.slice(1);
+          if (!/^[0-9A-Fa-f]+$/.test(hex)) return null;
+          code = parseInt(hex, 16);
+        } else {
+          if (!/^[0-9]+$/.test(digits)) return null;
+          code = Number(digits);
+        }
+        if (code > 4294967295) return null;
+        // A code that isn't a character (or is a control) is dropped, not kept as text.
+        const ok = code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff);
+        c = ok ? String.fromCodePoint(code) : null;
+        if (c !== null && rustControl(c) && c !== "\n" && c !== "\t") c = null;
+      }
+    }
+    return [c, end + 1];
+  }
+  function htmlUnescape(s) {
+    let out = "";
+    let i = 0;
+    while (i < s.length) {
+      const c = s[i];
+      i += 1;
+      if (c === "&") {
+        const e = htmlEntity(s, i);
+        if (e !== null) {
+          if (e[0] !== null) out += e[0];
+          i += e[1];
+          continue;
+        }
+      }
+      out += c;
+    }
+    return out;
+  }
+  // A tag's name, whether it closes, and its attributes, from what is between `<` and `>`.
+  function htmlTag(body) {
+    let i = 0;
+    const closing = body[0] === "/";
+    if (closing) i += 1;
+    let name = "";
+    while (i < body.length && isAlnum(body[i])) {
+      name += asciiLower(body[i]);
+      i += 1;
+    }
+    const attrs = [];
+    while (attrs.length < 16) {
+      while (i < body.length && (rustSpace(body[i]) || body[i] === "/")) i += 1;
+      let key = "";
+      while (i < body.length && !rustSpace(body[i]) && body[i] !== "=" && body[i] !== "/") {
+        key += asciiLower(body[i]);
+        i += 1;
+      }
+      if (key === "") break;
+      while (i < body.length && rustSpace(body[i])) i += 1;
+      const value = [];
+      if (body[i] === "=") {
+        i += 1;
+        while (i < body.length && rustSpace(body[i])) i += 1;
+        const q = body[i];
+        if (q === '"' || q === "'") {
+          i += 1;
+          while (i < body.length && body[i] !== q) {
+            value.push(body[i]);
+            i += 1;
+          }
+          i += 1;
+        } else {
+          while (i < body.length && !rustSpace(body[i])) {
+            value.push(body[i]);
+            i += 1;
+          }
+        }
+      }
+      attrs.push([key, htmlUnescape(value)]);
+    }
+    return [name, closing, attrs];
+  }
+  // Where a tag's `>` is from `from`: the first one outside a quoted attribute value, or -1.
+  function htmlTagEnd(src, from) {
+    let quote = null;
+    for (let k = from; k < src.length; k++) {
+      const c = src[k];
+      if (quote !== null) {
+        if (c === quote) quote = null;
+      } else if (c === '"' || c === "'") quote = c;
+      else if (c === ">") return k - from;
+    }
+    return -1;
+  }
+  // A plain decimal number (no exponents, at most 12 characters), as a 32-bit float, or null.
+  function htmlNumber(str) {
+    const s = rustTrim(str);
+    const digits = s[0] === "+" || s[0] === "-" ? s.slice(1) : s;
+    if (digits === "" || s.length > 12 || !/^[0-9.]+$/.test(digits) || digits.split(".").length > 2 || digits === ".") return null;
+    const v = Math.fround(Number(s[0] === "+" ? s.slice(1) : s));
+    return Number.isFinite(v) ? v : null;
+  }
+  function fontTag(style, attrs) {
+    for (const [k, v] of attrs) {
+      if (k === "face") {
+        const face = Array.from(rustTrim(v)).filter((c) => !rustControl(c)).slice(0, 256).join("");
+        if (face !== "") style.font = face;
+      } else if (k === "size") {
+        const n = htmlNumber(v);
+        if (n !== null) {
+          const t = rustTrim(v);
+          const relative = t[0] === "+" || t[0] === "-";
+          style.size = Math.min(Math.max(relative ? Math.fround(style.size + n) : n, 1), 2000);
+        }
+      } else if (k === "color") {
+        const t = rustTrim(v);
+        if (/^#[0-9A-Fa-f]{6}$/.test(t)) {
+          const x = parseInt(t.slice(1), 16);
+          style.color = [(x >> 16) & 255, (x >> 8) & 255, x & 255];
+        }
+      } else if (k === "letterspacing") {
+        const n = htmlNumber(v);
+        if (n !== null) style.ls = Math.min(Math.max(n, -1000), 1000);
+      }
+    }
+  }
+  // html_text.rs `parse`: { text, runs, paras }.
+  function parseHtml(html, base, para) {
+    const src = Array.from(html).slice(0, MAX_HTML);
+    const r = { text: [], runs: [], paras: [], style: copyStyle(base), para: { al: para.al }, closedP: false };
+    const push = (c) => {
+      if (r.text.length >= MAX_FIELD_CHARS) return;
+      r.text.push(c);
+      const last = r.runs[r.runs.length - 1];
+      if (last && sameStyle(last.s, r.style)) last.n += 1;
+      else r.runs.push({ n: 1, s: copyStyle(r.style) });
+      if (c === "\n") r.paras.push({ al: r.para.al });
+    };
+    const endParagraph = () => {
+      if (r.text.length >= MAX_FIELD_CHARS) return;
+      r.text.push("\n");
+      const last = r.runs[r.runs.length - 1];
+      if (last) last.n += 1;
+      else r.runs.push({ n: 1, s: copyStyle(r.style) });
+      r.paras.push({ al: r.para.al });
+    };
+    const textChar = (c) => {
+      if (c === "\r" || (rustControl(c) && c !== "\n" && c !== "\t")) return;
+      r.closedP = false;
+      push(c);
+    };
+    const open = [];
+    let i = 0;
+    while (i < src.length) {
+      const c = src[i];
+      i += 1;
+      if (c === "&") {
+        const e = htmlEntity(src, i);
+        if (e !== null) {
+          i += e[1];
+          if (e[0] !== null) textChar(e[0]);
+          continue;
+        }
+        textChar("&");
+        continue;
+      }
+      if (c !== "<") {
+        textChar(c);
+        continue;
+      }
+      if (i + 3 <= src.length && src[i] === "!" && src[i + 1] === "-" && src[i + 2] === "-") {
+        let end = src.length;
+        for (let k = i + 3; k + 3 <= src.length; k++) {
+          if (src[k] === "-" && src[k + 1] === "-" && src[k + 2] === ">") {
+            end = k + 3;
+            break;
+          }
+        }
+        i = end;
+        continue;
+      }
+      const n0 = src[i];
+      const startsTag = n0 !== undefined && (/^[A-Za-z]$/.test(n0) || n0 === "/" || n0 === "!" || n0 === "?");
+      const len = startsTag ? htmlTagEnd(src, i) : -1;
+      if (len < 0) {
+        textChar("<");
+        continue;
+      }
+      const [name, closing, attrs] = htmlTag(src.slice(i, i + len));
+      i += len + 1;
+      if ((name === "script" || name === "style") && !closing) {
+        let end = src.length;
+        for (let k = i; k < src.length; k++) {
+          if (src[k] === "<" && src[k + 1] === "/") {
+            const word = asciiLower(src.slice(k + 2, k + 2 + name.length).join(""));
+            if (word === name) {
+              let g = -1;
+              for (let j = k; j < src.length; j++) {
+                if (src[j] === ">") {
+                  g = j;
+                  break;
+                }
+              }
+              end = g < 0 ? src.length : g + 1;
+              break;
+            }
+          }
+        }
+        i = end;
+      } else if (name === "br" && !closing) {
+        r.closedP = false;
+        push("\n");
+      } else if (name === "p" && !closing) {
+        if (!(r.text.length === 0 || r.text[r.text.length - 1] === "\n")) push("\n");
+        r.closedP = false;
+        r.para = { al: para.al };
+        const a = attrs.find((x) => x[0] === "align");
+        if (a) {
+          const v = asciiLower(rustTrim(a[1]));
+          if (v === "center") r.para.al = "center";
+          else if (v === "right") r.para.al = "right";
+          else if (v === "left" || v === "justify") r.para.al = "left";
+        }
+      } else if (name === "p") {
+        endParagraph();
+        r.closedP = true;
+        r.para = { al: para.al };
+      } else if (name === "b" || name === "i" || name === "u" || name === "font" || name === "a") {
+        if (!closing) {
+          if (open.length >= MAX_HTML_DEPTH) continue;
+          open.push([name, copyStyle(r.style)]);
+          if (name === "b") r.style.bold = true;
+          else if (name === "i") r.style.italic = true;
+          else if (name === "u") r.style.u = true;
+          else if (name === "font") fontTag(r.style, attrs);
+          else {
+            const a = attrs.find((x) => x[0] === "href");
+            const url = safeUrl(a ? a[1] : "");
+            r.style.url = url === null ? "" : url;
+          }
+        } else {
+          let k = -1;
+          for (let j = open.length - 1; j >= 0; j--) {
+            if (open[j][0] === name) {
+              k = j;
+              break;
+            }
+          }
+          if (k >= 0) {
+            r.style = open[k][1];
+            open.length = k;
+          }
+        }
+      }
+    }
+    if (r.closedP && r.text[r.text.length - 1] === "\n") {
+      r.text.pop();
+      const last = r.runs[r.runs.length - 1];
+      if (last) {
+        last.n -= 1;
+        if (last.n === 0) r.runs.pop();
+      }
+      const p = r.paras.pop();
+      r.para = p || { al: para.al };
+    }
+    r.paras.push({ al: r.para.al });
+    if (r.runs.length === 0) r.runs.push({ n: 0, s: copyStyle(base) });
+    return { text: r.text.join(""), runs: r.runs, paras: r.paras };
+  }
+  // A number as HTML attributes hold it: two decimals at most.
+  function attrNumber(v) {
+    return rustNum(Math.floor((Number.isFinite(v) ? v : 0) * 100 + 0.5) / 100);
+  }
+  function htmlEscape(s, attr) {
+    let out = "";
+    for (const c of s) {
+      if (c === "<") out += "&lt;";
+      else if (c === ">") out += "&gt;";
+      else if (c === "&") out += "&amp;";
+      else if (c === '"' && attr) out += "&quot;";
+      else if (c === " ") out += "&nbsp;";
+      else out += c;
+    }
+    return out;
+  }
+  const hex2 = (v) => (v < 16 ? "0" : "") + v.toString(16);
+  // html_text.rs `write`.
+  function writeHtml(text, runs, paras) {
+    let out = "";
+    const chars = Array.from(text);
+    const lastStyle = runs.length > 0 ? runs[runs.length - 1].s : baseStyle({});
+    let run = 0, left = runs.length > 0 ? runs[0].n : 0;
+    const nextRun = () => {
+      while (run < runs.length && left <= 0) {
+        run += 1;
+        left = run < runs.length ? runs[run].n : 0;
+      }
+      if (run >= runs.length) return Math.max(runs.length - 1, 0);
+      left -= 1;
+      return run;
+    };
+    let line = [];
+    let para = 0;
+    const flush = () => {
+      const p = paras[para] || paras[paras.length - 1];
+      out += '<p align="' + (p ? p.al : "left") + '">';
+      let i = 0;
+      while (i < line.length) {
+        const k = line[i][0];
+        const st = runs[k] ? runs[k].s : lastStyle;
+        out += '<font face="' + htmlEscape(st.font, true) + '" size="' + attrNumber(st.size) + '" color="#' + hex2(st.color[0]) + hex2(st.color[1]) + hex2(st.color[2]) + '"';
+        if (st.ls !== 0) out += ' letterspacing="' + attrNumber(st.ls) + '"';
+        out += ">";
+        if (st.url !== "") out += '<a href="' + htmlEscape(st.url, true) + '">';
+        if (st.bold) out += "<b>";
+        if (st.italic) out += "<i>";
+        if (st.u) out += "<u>";
+        let piece = "";
+        while (i < line.length && line[i][0] === k) {
+          piece += line[i][1];
+          i += 1;
+        }
+        out += htmlEscape(piece, false);
+        if (st.u) out += "</u>";
+        if (st.italic) out += "</i>";
+        if (st.bold) out += "</b>";
+        if (st.url !== "") out += "</a>";
+        out += "</font>";
+      }
+      out += "</p>";
+      line = [];
+    };
+    for (const c of chars) {
+      const k = nextRun();
+      if (c === "\n") {
+        flush();
+        para += 1;
+      } else line.push([k, c]);
+    }
+    flush();
+    return out;
+  }
+  // rich_text.rs: `style_at`, `slice_runs`, `normalize_runs`, `replace_runs`, `type_into_runs`.
+  function styleAt(runs, at) {
+    let end = 0;
+    for (const r of runs) {
+      end += r.n;
+      if (at <= end && (at > end - r.n || at === 0)) return r.s;
+    }
+    return runs.length > 0 ? runs[runs.length - 1].s : baseStyle({});
+  }
+  function sliceRuns(runs, start, end) {
+    const out = [];
+    let at = 0;
+    for (const r of runs) {
+      const a = Math.max(at, start), b = Math.min(at + r.n, end);
+      if (a < b) out.push({ n: b - a, s: r.s });
+      at += r.n;
+      if (at >= end) break;
+    }
+    return out;
+  }
+  function normalizeRuns(runs, n) {
+    const fallback = runs.length > 0 ? runs[0].s : baseStyle({});
+    // fit_runs: the last runs cut or the last one lengthened.
+    let at = 0, keep = 0;
+    const fitted = [];
+    for (const r of runs) {
+      if (at >= n && keep > 0) break;
+      const len = Math.min(r.n, n - at);
+      fitted.push({ n: len, s: r.s });
+      at += len;
+      keep += 1;
+    }
+    if (fitted.length > 0) fitted[fitted.length - 1].n += n - Math.min(at, n);
+    const out = [];
+    for (const r of fitted) {
+      if (r.n === 0) continue;
+      const last = out[out.length - 1];
+      if (last && (sameStyle(last.s, r.s) || out.length >= 10000)) last.n += r.n;
+      else out.push(r);
+    }
+    if (out.length === 0) out.push({ n: n, s: fallback });
+    return out;
+  }
+  function typeIntoRuns(runs, start, end, inserted) {
+    const style = styleAt(runs, start);
+    const total = runs.reduce((s, r) => s + r.n, 0);
+    const a = Math.min(start, total), b = Math.min(Math.max(end, a), total);
+    const out = sliceRuns(runs, 0, a).concat([{ n: inserted, s: style }], sliceRuns(runs, b, total));
+    const n = out.reduce((s, r) => s + r.n, 0);
+    return normalizeRuns(out, n);
+  }
+  // rich_text.rs `edit_paragraphs` (`old` and `inserted` as arrays of characters).
+  function editParagraphs(paras, old, start, end, inserted) {
+    const count = old.filter((c) => c === "\n").length + 1;
+    const fill = paras.length > 0 ? paras[paras.length - 1] : { al: "left" };
+    const full = [];
+    for (let i = 0; i < count; i++) full.push(paras[i] || fill);
+    const before = old.slice(0, start).filter((c) => c === "\n").length;
+    const removed = old.slice(start, Math.max(end, start)).filter((c) => c === "\n").length;
+    const added = inserted.filter((c) => c === "\n").length;
+    const here = full[before] || fill;
+    let out = full.slice(0, before + 1);
+    for (let i = 0; i < added; i++) out.push(here);
+    out = out.concat(full.slice(before + 1 + removed));
+    return out;
+  }
+  // field.rs `allowed`: whether `restrict` lets a viewer type `c`.
+  function restrictAllows(restrict, c) {
+    const r = Array.from(restrict).slice(0, 1024);
+    let ok = r[0] === "^";
+    let include = true;
+    let i = 0;
+    const item = (k) => {
+      if (k >= r.length) return null;
+      if (r[k] === "\\") return k + 1 < r.length ? [r[k + 1], k + 2] : null;
+      return [r[k], k + 1];
+    };
+    const cp = c.codePointAt(0);
+    while (i < r.length) {
+      if (r[i] === "^") {
+        include = !include;
+        i += 1;
+        continue;
+      }
+      const lo = item(i);
+      if (lo === null) break;
+      i = lo[1];
+      let hi = lo[0];
+      if (r[i] === "-") {
+        const e = item(i + 1);
+        if (e !== null) {
+          hi = e[0];
+          i = e[1];
+        }
+      }
+      if (cp >= lo[0].codePointAt(0) && cp <= hi.codePointAt(0)) ok = include;
+    }
+    return ok;
+  }
+
+  // ----- laying out changed text for the page (ADR 0107) ---------------------------------------
+  //
+  // Text a script or the viewer changed has no outline: the page lays it out. This is the part
+  // of that with no canvas in it, so the tests can run it: `text` in `styles` ({ runs, paras })
+  // broken into lines (where it breaks, and in a Multiline field wrapped at the box less its
+  // gutters, greedily at spaces, across runs), each line a list of stretches in one style with
+  // their place. A stretch whose face is embedded (`faces`, the movie's `fonts`) and has every
+  // character is measured by its glyphs' advances and carries the face, for the page to draw
+  // its outlines; any other is measured by `measure(style, text)` (the browser's fonts).
+  const MAX_LINES = 1000;
+  function embeddedFace(faces, st) {
+    for (const f of faces || []) if (f.f === st.font && !!f.b === st.bold && !!f.i === st.italic) return f;
+    return null;
+  }
+  function fieldLayout(tf, text, styles, faces, measure) {
+    const chars = Array.from(text);
+    const runs = styles.runs, paras = styles.paras;
+    if (runs.length === 0) return [];
+    const wrap = tf.ln === "multiline" ? Math.max(tf.w - 4, 1) : 0;
+    const lsp = (tf.font && tf.font.lsp) || 0;
+    // A stretch of characters in run `k`, measured.
+    const token = (cs, k, space) => {
+      const st = runs[k] ? runs[k].s : runs[runs.length - 1].s;
+      let face = embeddedFace(faces, st);
+      let w = 0;
+      if (face !== null) {
+        for (const c of cs) {
+          const g = face.g[c];
+          if (g === undefined) {
+            face = null;
+            break;
+          }
+          w += (g[0] * st.size) / 1000 + st.ls;
+        }
+      }
+      const t = cs.join("");
+      if (face === null) w = measure(st, t);
+      return { text: t, st: st, w: w, face: face, space: space };
+    };
+    const lines = [];
+    let top = 2;
+    let run = 0, left = runs.length > 0 ? runs[0].n : Infinity;
+    const runAt = () => {
+      while (run < runs.length - 1 && left <= 0) {
+        run += 1;
+        left = runs[run].n;
+      }
+      left -= 1;
+      return run;
+    };
+    const flush = (toks, para, firstRun) => {
+      while (toks.length > 0 && toks[toks.length - 1].space) toks.pop();
+      // Room above and below the baseline: the most any stretch needs (an empty line: the run
+      // its paragraph starts in).
+      const metric = (st, face) => (face ? [(face.a * st.size) / 1000, (face.lh * st.size) / 1000] : [st.size * 0.95, st.size * 1.2]);
+      let asc = 0, below = 0;
+      if (toks.length === 0) {
+        const st = runs[firstRun] ? runs[firstRun].s : runs[runs.length - 1].s;
+        const m = metric(st, embeddedFace(faces, st));
+        asc = m[0];
+        below = m[1] - m[0];
+      }
+      let w = 0;
+      for (const t of toks) {
+        const m = metric(t.st, t.face);
+        asc = Math.max(asc, m[0]);
+        below = Math.max(below, m[1] - m[0]);
+        w += t.w;
+      }
+      const al = (paras[para] || paras[paras.length - 1] || { al: "left" }).al;
+      let x = al === "center" ? (tf.w - w) / 2 : al === "right" ? tf.w - 2 - w : 2;
+      const segs = [];
+      for (const t of toks) {
+        const last = segs[segs.length - 1];
+        // Neighbours in one style and face draw as one stretch.
+        if (last && last.st === t.st && last.face === t.face) {
+          last.text += t.text;
+          last.w += t.w;
+        } else segs.push({ text: t.text, st: t.st, x: x, w: t.w, face: t.face });
+        x += t.w;
+      }
+      const h = Math.max(asc + below + lsp, 1);
+      if (lines.length < MAX_LINES) lines.push({ top: top, base: top + asc, h: h, w: w, segs: segs });
+      top += h;
+    };
+    let para = 0;
+    let toks = [], width = 0, breakAt = -1, firstRun = 0, started = false;
+    let word = [], wordRun = -1, wordSpace = false;
+    const endWord = () => {
+      if (word.length === 0) return;
+      const t = token(word, wordRun, wordSpace);
+      word = [];
+      if (wrap && !t.space && width + t.w > wrap && toks.length > 0) {
+        // Wrap: at the last space if there is one, else here.
+        const rest = breakAt >= 0 ? toks.splice(breakAt) : [];
+        flush(toks, para, firstRun);
+        toks = rest;
+        width = rest.reduce((s, x) => s + x.w, 0);
+        breakAt = -1;
+      }
+      toks.push(t);
+      width += t.w;
+      if (t.space) breakAt = toks.length;
+    };
+    for (const c of chars) {
+      const k = runAt();
+      if (!started) {
+        firstRun = k;
+        started = true;
+      }
+      if (c === "\n") {
+        endWord();
+        flush(toks, para, firstRun);
+        toks = [];
+        width = 0;
+        breakAt = -1;
+        para += 1;
+        started = false;
+        continue;
+      }
+      const space = c === " ";
+      if (word.length > 0 && (k !== wordRun || space !== wordSpace)) endWord();
+      wordRun = k;
+      wordSpace = space;
+      word.push(c);
+    }
+    endWord();
+    // An empty last line is in the style the text ends in.
+    if (!started) firstRun = run;
+    flush(toks, para, firstRun);
+    return lines;
+  }
+
   // ----- text fields (player.rs, field.rs; ADR 0066) -------------------------------------------
   //
   // In the browser the viewer types into a real <input> or <textarea> that canvas.js lays over
@@ -1909,14 +2620,33 @@ var AniCraft = (function () {
   }
   // Text the viewer typed into the page's element, as the editor would let it in: no control
   // characters, no line breaks in a one-line field, at most the field's character limit.
-  function typedText(tf, text) {
+  function typedText(tf, text, fs) {
     const one = !multiline(tf);
-    const cs = Array.from(text.replace(/\r\n?/g, "\n")).filter((c) => !rustControl(c) || (c === "\n" && !one));
-    const max = tf.mx > 0 ? Math.min(tf.mx, MAX_FIELD_CHARS) : MAX_FIELD_CHARS;
+    const res = fs ? fs.res : null;
+    const cs = Array.from(text.replace(/\r\n?/g, "\n")).filter((c) => (!rustControl(c) || (c === "\n" && !one)) && (c === "\n" || res === null || restrictAllows(res, c)));
+    const mx = fieldMax(fs, tf);
+    const max = mx > 0 ? Math.min(mx, MAX_FIELD_CHARS) : MAX_FIELD_CHARS;
     return cs.slice(0, max).join("");
   }
+  // `rich`: the text's runs and paragraphs once a script set `htmlText`; `mx` and `res`:
+  // `maxChars` and `restrict` once a script set them (null: the field's own, and any character).
   function newField(path) {
-    return { path: path, text: null, caret: 0, anchor: 0 };
+    return { path: path, text: null, caret: 0, anchor: 0, rich: null, mx: null, res: null };
+  }
+  // The styles a field's text is in now (player.rs `property`, for `htmlText`; the page draws
+  // with them too): what a script set, the field's own style for text set plainly, else the
+  // authored runs.
+  function fieldStyles(fs, tf) {
+    if (fs && fs.rich !== null) return fs.rich;
+    const base = baseStyle(tf);
+    if (fs && fs.text !== null) return { runs: [{ n: Infinity, s: base }], paras: [basePara(tf)] };
+    const runs = tf.rs ? tf.rs.map((r) => ({ n: r[0], s: baseStyle({ st: r[1] }) })) : [{ n: Infinity, s: base }];
+    const paras = tf.ps ? tf.ps.map((a) => ({ al: a })) : [basePara(tf)];
+    return { runs: runs, paras: paras };
+  }
+  // The most characters the viewer may type into a field now (0: no limit).
+  function fieldMax(fs, tf) {
+    return fs && fs.mx !== null ? fs.mx : tf.mx || 0;
   }
   // The caret and selection back inside the text (player.rs `relayout`, without a layout).
   function clampField(fs, tf) {
@@ -1944,14 +2674,20 @@ var AniCraft = (function () {
   Editor.prototype.insert = function (s) {
     if (!this.editable()) return false;
     const one = !multiline(this.tf);
-    let add = Array.from(s).filter((c) => !rustControl(c) || (c === "\n" && !one));
+    const res = this.fs.res;
+    let add = Array.from(s).filter((c) => (!rustControl(c) || (c === "\n" && !one)) && (c === "\n" || res === null || restrictAllows(res, c)));
+    // Typing only what the field refuses does nothing (it doesn't delete the selection).
+    if (add.length === 0 && s !== "") return false;
     const [a, b] = this.selection();
     const value = Array.from(fieldValue(this.fs, this.tf));
     const kept = value.length - (b - a);
-    let room = this.tf.mx > 0 ? Math.max(this.tf.mx - kept, 0) : Infinity;
+    const mx = fieldMax(this.fs, this.tf);
+    let room = mx > 0 ? Math.max(mx - kept, 0) : Infinity;
     room = Math.min(room, Math.max(MAX_FIELD_CHARS - kept, 0));
     if (add.length > room) add = add.slice(0, room);
     if (add.length === 0 && a === b) return false;
+    // Styled text keeps its runs: what is typed continues the style before it.
+    if (this.fs.rich !== null) this.fs.rich = { runs: typeIntoRuns(this.fs.rich.runs, a, b, add.length), paras: editParagraphs(this.fs.rich.paras, value, a, b, add) };
     this.fs.text = value.slice(0, a).concat(add, value.slice(b)).join("");
     this.fs.caret = a + add.length;
     this.fs.anchor = this.fs.caret;
@@ -2027,7 +2763,28 @@ var AniCraft = (function () {
       this.st.fields.set(n.key, fs);
     }
     clampField(fs, n.tf);
-    if (go(new Editor(n.tf, fs))) clampField(fs, n.tf);
+    if (go(new Editor(n.tf, fs))) {
+      clampField(fs, n.tf);
+      this.changed(n.path);
+    }
+  };
+  // The viewer changed field `path`'s text (player.rs `changed`): its change actions run in the
+  // timeline it is on, then the listeners scripts added for `Event.CHANGE`, in the order added.
+  Run.prototype.changed = function (path) {
+    this.refresh();
+    const i = this.indexOf(path);
+    if (i < 0) return;
+    const n = this.nodes[i];
+    const actions = n.kind === TEXT && n.tf.oc && n.tf.oc.length > 0 ? n.tf.oc : null;
+    const ls = (this.st.listeners.get(n.key) || []).filter((l) => l.ev === "change");
+    if (actions === null && ls.length === 0) return;
+    const owner = this.nodes[n.owner];
+    if (actions !== null && owner) this.runList(owner.path, actions, false);
+    for (const l of ls) {
+      if (this.halted) return;
+      this.callListener(l, { key: null, target: path, current: path });
+    }
+    this.settle();
   };
   // The pointer in the focused field: without a layout the caret goes to the end (`extend`:
   // keeping the selection's other end).
@@ -2068,7 +2825,26 @@ var AniCraft = (function () {
       this.st.fields.set(n.key, fs);
     }
     fs.text = fit(text);
+    // Plain text is in the field's own style, as ActionScript's `text` is.
+    fs.rich = null;
     clampField(fs, n.tf);
+  };
+  // A script sets another member of field `path` (player.rs `set_field_member`).
+  Run.prototype.setFieldMember = function (path, p, v) {
+    const n = this.nodes[this.indexOf(path)];
+    if (!n || n.kind !== TEXT) return;
+    let fs = this.st.fields.get(n.key);
+    if (!fs) {
+      fs = newField(n.path);
+      this.st.fields.set(n.key, fs);
+    }
+    if (p === "html_text") {
+      const parsed = parseHtml(String(v), baseStyle(n.tf), basePara(n.tf));
+      fs.text = parsed.text;
+      fs.rich = { runs: parsed.runs, paras: parsed.paras };
+      clampField(fs, n.tf);
+    } else if (p === "max_chars") fs.mx = Math.min(Math.max(+v, 0), MAX_FIELD_CHARS);
+    else if (p === "restrict") fs.res = v === null || v === undefined ? null : Array.from(String(v)).slice(0, 1024).join("");
   };
   // Moves the pointer: what it leaves gets Out, what it reaches gets Over.
   Run.prototype.pointer = function (p) {
@@ -2119,5 +2895,5 @@ var AniCraft = (function () {
     return s.replace(/[A-Z]/g, (c) => c.toLowerCase());
   }
 
-  return { Player: Player, evaluate: evaluate, applyEffect: applyEffect, recolours: recolours, mul: mul, meanScale: meanScale, finite: finite };
+  return { Player: Player, evaluate: evaluate, applyEffect: applyEffect, recolours: recolours, mul: mul, meanScale: meanScale, finite: finite, htmlText: { parse: parseHtml, write: writeHtml }, restrictAllows: restrictAllows, fieldStyles: fieldStyles, fieldLayout: fieldLayout, embeddedFace: embeddedFace };
 })();

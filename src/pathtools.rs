@@ -515,7 +515,8 @@ pub fn commit_pencil(app: &mut App, xf: Xf) {
 /// A selected point: element, command, slot.
 pub type PointRef = (ElementId, usize, u8);
 
-/// Selected shapes on the active layer with their path and transform.
+/// Selected shapes on the active layer with their path and transform, and selected text on a
+/// path with the path it follows.
 fn selected_shapes(app: &App) -> Vec<(ElementId, Arc<Path>, Affine)> {
     app.s
         .visible_elements()
@@ -525,7 +526,10 @@ fn selected_shapes(app: &App) -> Vec<(ElementId, Arc<Path>, Affine)> {
             // Raw shapes show their shared points instead (ADR 0042, below).
             ElementKind::Shape(sh) if sh.merge => None,
             ElementKind::Shape(sh) => Some((e.id, sh.path.clone(), e.transform)),
-            ElementKind::Symbol { .. } | ElementKind::Text(_) | ElementKind::Camera | ElementKind::Group { .. } => None,
+            // Text on a path shows the points of the path it follows (ADR 0107): the same
+            // point commands edit them, and the glyphs follow.
+            ElementKind::Text(t) => t.on_path.as_ref().map(|on| (e.id, Arc::new(on.path.clone()), e.transform)),
+            ElementKind::Symbol { .. } | ElementKind::Camera | ElementKind::Group { .. } => None,
         })
         .take(64)
         .collect()

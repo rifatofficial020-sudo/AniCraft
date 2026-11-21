@@ -51,6 +51,9 @@ pub trait World {
     fn set(&mut self, at: &Place, p: Property, v: f64) -> Result<(), Option<String>>;
     /// Sets a text field's text (ADR 0066).
     fn set_text(&mut self, at: &Place, text: String) -> Result<(), Option<String>>;
+    /// Sets another member of a text field (`htmlText`: text; `maxChars`: a number;
+    /// `restrict`: text or `null`; ADR 0107).
+    fn set_field(&mut self, at: &Place, p: Prop, v: Value) -> Result<(), Option<String>>;
     fn trace(&mut self, line: String);
     /// A timeline variable's value, and writing one (the world knows its type).
     fn read(&mut self, name: &str) -> Result<Value, String>;
@@ -358,6 +361,7 @@ impl Vm<'_> {
                 self.w.get(at, prop).map_err(|message| Stop::Error { line: self.line, message })
             }
             LValue::Text { at } => self.w.get(at, Prop::Text).map_err(|message| Stop::Error { line: self.line, message }),
+            LValue::Field { at, p } => self.w.get(at, *p).map_err(|message| Stop::Error { line: self.line, message }),
         }
     }
 
@@ -389,6 +393,25 @@ impl Vm<'_> {
                     return self.err(format!("`text` is set to text, not {}", v.text()));
                 }
                 self.w.set_text(at, v.text()).map_err(|e| lift(self.line, e))?;
+                Ok(v)
+            }
+            LValue::Field { at, p } => {
+                let v = match p {
+                    Prop::HtmlText if matches!(v, Value::Null | Value::Undefined) => return self.err(format!("`htmlText` is set to text, not {}", v.text())),
+                    Prop::HtmlText => Value::str(&v.text()),
+                    Prop::MaxChars => {
+                        let n = v.number();
+                        if !n.is_finite() {
+                            return self.err(format!("`maxChars` is set to a number, not {}", shown(&v)));
+                        }
+                        // An `int`: whole, and never negative here (0 is no limit).
+                        Value::Num(n.trunc().clamp(0.0, 2_147_483_647.0) + 0.0)
+                    }
+                    Prop::Restrict if matches!(v, Value::Null | Value::Undefined) => Value::Null,
+                    Prop::Restrict => Value::str(&v.text()),
+                    _ => return self.err(format!("`{}` can only be read", p.name())),
+                };
+                self.w.set_field(at, *p, v.clone()).map_err(|e| lift(self.line, e))?;
                 Ok(v)
             }
         }

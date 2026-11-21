@@ -148,6 +148,58 @@ fn bending_an_object_bends_only_it() {
     assert!(areas.iter().any(|a| (a - 8000.0).abs() < 0.5) && areas.iter().any(|a| (a - (8000.0 + 80.0 * (40.0 / 0.75) / 4.0)).abs() < 2.0), "{areas:?}");
 }
 
+/// Whether every anchor inside the subpaths of `e` (stage space) is smooth; the first that is
+/// not, else.
+fn smooth_everywhere(e: &Element) -> Result<(), Vec2> {
+    let ElementKind::Shape(sh) = &e.kind else { return Ok(()) };
+    for sub in anicraft_geom::raw::subpaths(&sh.path.transformed(&e.transform)) {
+        let n = sub.segs.len();
+        for i in 0..n {
+            if !sub.closed && i + 1 == n {
+                break;
+            }
+            let (a, b) = (sub.segs[i], sub.segs[(i + 1) % n]);
+            if !anicraft_geom::raw::smooth_at(a.c[3], a.c[2], b.c[1]) {
+                return Err(a.c[3]);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn bending_an_oval_edge_keeps_its_smooth_ends_smooth() {
+    let mut s = Session::new(anicraft_doc::Document::default());
+    run(&mut s, "draw.object_drawing", json!({"on": false}));
+    run(&mut s, "draw.ellipse", json!({"x": 0, "y": 0, "w": 200, "h": 100, "fill": "#ff0000", "stroke": "#000000"}));
+    run(&mut s, "edit.deselect", json!({}));
+    for e in raw(&s) {
+        assert_eq!(smooth_everywhere(&e), Ok(()), "smooth before the drag");
+    }
+    // Drag the middle of an arc on the south-east side inward (#460). An oval has a node every
+    // 45 degrees (#459), so the middle of its first arc is at 22.5.
+    let (sin, cos) = std::f32::consts::FRAC_PI_8.sin_cos();
+    let at = Vec2::new(100.0 + 100.0 * cos, 50.0 + 50.0 * sin);
+    let r = run(&mut s, "path.bend_segment", json!({"x": at.x, "y": at.y, "dx": -25, "dy": -15}));
+    let got = Vec2::new(r["x"].as_f64().unwrap_or(0.0) as f32, r["y"].as_f64().unwrap_or(0.0) as f32);
+    assert!(got.distance(at + Vec2::new(-25.0, -15.0)) < 1e-2, "the grabbed point follows: {r}");
+    for e in raw(&s) {
+        assert_eq!(smooth_everywhere(&e), Ok(()), "the ends of the bent arc stay smooth");
+    }
+}
+
+#[test]
+fn bending_a_rectangle_side_keeps_its_corners() {
+    let mut s = rect_session();
+    run(&mut s, "path.bend_segment", json!({"x": 50, "y": 0, "dx": 0, "dy": -30}));
+    // Only the bent side is a curve: no handle beside it was turned.
+    let curves = |e: &Arc<Element>| match &e.kind {
+        ElementKind::Shape(sh) => sh.path.cmds.iter().filter(|c| matches!(c, anicraft_geom::PathCmd::CubicTo(..))).count(),
+        _ => 0,
+    };
+    assert!(raw(&s).iter().all(|e| curves(e) <= 1));
+}
+
 // ----- shared points ------------------------------------------------------------------------------
 
 #[test]

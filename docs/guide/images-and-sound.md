@@ -12,6 +12,7 @@ On a Mac, read **⌘** wherever this chapter says **Ctrl**, and **⌥** for **Al
 | Images | PNG, JPEG | A bitmap in the Library, placed on the stage as a bitmap |
 | Drawings | SVG | Editable shapes, groups, gradients, masks and text |
 | Sounds | WAV, Ogg Vorbis, MP3 | A sound in the Library, played from a keyframe |
+| Video | MP4, MOV, WebM, MKV, AVI and whatever else your ffmpeg reads | Frames on a layer, or a reference layer to trace over |
 
 Anything else is turned away with one line in the status bar that says what AniCraft takes.
 
@@ -56,6 +57,35 @@ To show a different image in the same place, select the placed bitmap and use **
 **Bitmap** row of **Properties**. Pick another bitmap from the list. A placed bitmap keeps its
 position and transform and takes the new image's size; a shape painted with a bitmap fill keeps
 its outline and shows the new image inside it. With several bitmaps selected, they all change.
+
+### Trace Bitmap
+
+To turn a picture into shapes you can edit, select the placed bitmap and choose **Modify ›
+Bitmap › Trace Bitmap…**. Each area of colour becomes a filled shape in its place, as one undo
+step, and the shapes are selected. Pixels under half opacity stay empty.
+
+* **Colour threshold** (1 to 500, default 100): neighbouring pixels whose colours differ by less
+  than this are one colour. Raise it for fewer, larger shapes.
+* **Minimum area** (1 to 1000 pixels, default 8): smaller areas join the neighbour they share the
+  most edge with, which clears specks.
+* **Curve fit**: how closely the outlines follow the pixels, from **Pixels** (exactly along the
+  pixel edges) through **Very Tight**, **Tight**, **Normal** and **Smooth** to **Very Smooth**.
+* **Corner threshold**: **Many corners** keeps more sharp turns, **Few corners** smooths more of
+  them.
+
+The shapes are raw shapes made of lines and quadratic curves, and they fit together without gaps.
+Where raw shapes on the same layer touch them, they merge as any drawing does. A large photo at a
+low threshold makes a great many shapes; the trace stops at 20,000 and asks for a higher
+threshold or minimum area. A picture that is nearly all speckle (more than two million separate
+areas of colour) is refused the same way. A bitmap of up to 4096 × 4096 pixels can be traced; a
+large one can take a few seconds.
+
+### Convert to Bitmap
+
+**Modify › Convert to Bitmap** draws the selection, as it looks at the playhead, into a new
+bitmap in the Library (named **Bitmap 1**, **Bitmap 2**, …) and puts that bitmap where the
+selection was, on the topmost of its layers. The bitmap covers the selection's bounds on whole
+pixels, at one pixel per stage unit, up to 4096 × 4096 pixels. Undo brings the artwork back.
 
 ## Importing SVG drawings
 
@@ -131,6 +161,84 @@ Sounds are saved inside the document exactly as imported.
 In the Library, select a sound to see its waveform with a play button. Drag it onto the stage to
 put it on the active layer's keyframe, or use **Place on Timeline**. Deleting a sound that
 keyframes use asks first, and you can undo it.
+
+## Importing video
+
+Use video as reference: trace over film (rotoscoping), or keep footage under your drawing to
+match its timing.
+
+AniCraft reads video with **ffmpeg**, a free program you install yourself. AniCraft has no video
+decoder of its own, so nothing happens to your files that ffmpeg doesn't do. It is the same
+ffmpeg that **Export Video** uses. If it isn't installed, the Import Video window says so: get it
+from ffmpeg.org or your system's package manager so it is on your `PATH`, or set the environment
+variable `ANICRAFT_FFMPEG` to the full path of the `ffmpeg` program.
+
+1. Move the playhead to the frame where the video should start.
+2. Choose **File › Import › Import Video…** and pick the file.
+3. The window shows the video's size, length and frame rate. Choose how to bring it in:
+
+| Import as | What you get | Use it when |
+|---|---|---|
+| **Frames in the document** | The frames become bitmaps on a new layer, one keyframe each, with the sound on a layer below | The clip is short and should be part of the movie |
+| **Reference layer for tracing** | A locked guide layer, right under the layer you are on, that shows the video beneath what you draw | You trace or time against footage that should not be exported |
+
+4. Press **Import** (or **Add Reference Layer**).
+
+For a long or large video the window starts on **Reference layer**, which costs nothing in the
+document.
+
+### Frames in the document
+
+Each frame of the video lands on its own keyframe at the document's frame rate. A 2-second clip
+in a 24 fps document gives 48 keyframes, whatever the video's own frame rate was.
+
+| Option | What it does |
+|---|---|
+| **Start at** | Seconds into the video to begin at |
+| **Length** | Seconds of video to take; 0 takes it to the end |
+| **Frame step** | One picture every this many frames. **2** animates on twos: half the pictures, each held for two frames |
+| **Largest size** | The pictures' longest edge in pixels. A smaller video is never enlarged |
+| **Import the sound track** | The video's sound goes on a layer of its own as a stream sound, so it keeps time with the frames |
+
+Under the options the window says what will come in, for example
+`48 pictures of 1280 × 720 from frame 1, about 169 MB in memory while you edit`. One import takes
+at most 2000 pictures or 1 GB of pictures. If the video is longer, the window tells you before
+you start that the rest will be left out. Raise the frame step, lower the size or shorten the
+length to fit more of it, or use a reference layer.
+
+While ffmpeg reads the frames a progress window shows how far it is. **Cancel** stops it and
+leaves the document exactly as it was. The whole import is one undo step.
+
+The pictures are kept in a Library folder named after the video. They are ordinary bitmaps: you
+can delete keyframes you don't need, swap a bitmap, or trace one into shapes on a layer above.
+
+### A reference layer for tracing
+
+The video shows on the stage under your artwork and follows the playhead as you scrub and play.
+The layer goes right under the layer you are on (under its folder, if it is in one), so what you
+draw sits on the video and artwork further down, such as a background, stays behind it. Drag
+the layer up or down like any other. It is a **guide layer**, so it is never in the movie, in Test Movie or in any export. It is
+locked, so you can't draw on it by mistake. Draw on the layers above it.
+
+* **Fade it**: double-click the layer's icon to open **Layer Properties** and lower **Opacity**.
+* **Hide it**: click the layer's eye, as for any layer.
+* **The file moved**: the stage shows an outline where the video was and the status bar says
+  the file is missing. Open **Layer Properties** and choose **Relink…** to pick it again.
+* **Remove it**: **Remove Video** in Layer Properties, or delete the layer.
+
+The video stays a file on your computer. The document remembers only where it is, so keep the
+file where it was, or relink it. Frames are read as you go and kept within 256 MB of memory;
+the first time you jump to a new place the picture arrives a moment later.
+
+### What video import doesn't do yet
+
+* Hearing the video's sound with a reference layer. Import the frames with sound, or import the
+  sound file to its own layer.
+* Moving, scaling or cropping the reference on the stage. It is centred at the video's own
+  size, or fitted to the stage if it is larger.
+* Transparent video. Frames come in opaque.
+* Importing video in the web version, which can't run ffmpeg. Import the frames as PNG images
+  instead.
 
 ## Sounds on keyframes
 

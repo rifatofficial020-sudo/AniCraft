@@ -41,7 +41,8 @@ pub const PSEUDO: &str = "pseudo";
 /// other locale is embedded but not offered (docs/localisation.md › Scripts and direction).
 /// A regional variant (`es-mx`) is ready when its language is. Georgian is not listed here: its
 /// face is not bundled, so [`ready_codes`] adds it only when the build embedded Noto Sans
-/// Georgian from craft-fonts.
+/// Georgian from craft-fonts. Hebrew (`he`) is not offered at all yet: the build may embed Noto
+/// Sans Hebrew so Hebrew names draw, but the interface needs bidi layout in egui first.
 pub const READY: &[&str] = &[
     "az", "bg", "bs", "ca", "cs", "da", "de", "el", "es", "et", "fi", "fr", "gl", "hr", "hu", "id", "it", "kk", "lt", "lv", "nb", "nl", "pl", "pt", "pt-br", "ro", "ru", "sk", "sl", "sq", "sr", "sr-latn", "sv", "tr", "uk",
 ];
@@ -57,6 +58,29 @@ fn ready_with(georgian_face: bool) -> Vec<&'static str> {
         codes.push("ka");
     }
     codes
+}
+
+/// Whether `code` names a language written right to left (`ar`, `ckb`, `dv`, `fa`, `he`, `ps`,
+/// `sd`, `ug`, `ur`, `yi`, and the legacy `iw`). A script subtag (ISO 15924, in its RFC 5646
+/// place after the language and any extended-language subtags) decides before the language's
+/// default does: `ku-Arab` is, `sd-Deva` is not. Nothing lays out right to left yet (ADR 0040):
+/// this is the one place that will answer the question when egui can.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn is_rtl_code(code: &str) -> bool {
+    let normalized = Languages::normalize_code(code.split(['.', '@']).next().unwrap_or(code));
+    let mut parts = normalized.split('-').filter(|p| !p.is_empty());
+    let Some(base) = parts.next() else { return false };
+    let next = parts.find(|p| !(p.len() == 3 && p.chars().all(|c| c.is_ascii_alphabetic())));
+    if let Some(script) = next.filter(|p| p.len() == 4 && p.chars().all(|c| c.is_ascii_alphabetic())) {
+        return matches!(script, "arab" | "hebr" | "thaa" | "syrc" | "nkoo" | "adlm" | "mand" | "samr" | "rohg");
+    }
+    matches!(base, "ar" | "ckb" | "dv" | "fa" | "he" | "ps" | "sd" | "ug" | "ur" | "yi")
+}
+
+/// Whether the interface language in use is written right to left.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn is_rtl() -> bool {
+    is_rtl_code(code())
 }
 
 enum Kind {
@@ -134,8 +158,21 @@ impl Languages {
         self.list.get(i).or(self.list.first()).unwrap_or(&ENGLISH_LANGUAGE)
     }
 
-    fn find(&self, code: &str) -> Option<usize> {
+    /// A code as catalogs are keyed: lower case, `-` between subtags, and Hebrew's legacy `iw`
+    /// (still what Java and some systems report) as `he`.
+    fn normalize_code(code: &str) -> String {
         let code = code.trim().to_ascii_lowercase().replace('_', "-");
+        if code == "iw" {
+            "he".into()
+        } else if let Some(rest) = code.strip_prefix("iw-") {
+            format!("he-{rest}")
+        } else {
+            code
+        }
+    }
+
+    fn find(&self, code: &str) -> Option<usize> {
+        let code = Self::normalize_code(code);
         self.list.iter().position(|l| l.code == code)
     }
 
@@ -152,7 +189,7 @@ impl Languages {
 
     /// The best offered language for a system locale (`de-AT`, `pt_BR.UTF-8`, `zh-Hans-CN`).
     fn match_system(&self, locale: &str) -> Option<usize> {
-        let locale = locale.split(['.', '@']).next().unwrap_or(locale).to_ascii_lowercase().replace('_', "-");
+        let locale = Self::normalize_code(locale.split(['.', '@']).next().unwrap_or(locale));
         let tags: Vec<&str> = locale.split('-').filter(|t| !t.is_empty()).collect();
         let lang = *tags.first()?;
         let mut candidates = vec![locale.clone()];

@@ -755,7 +755,7 @@ fn depth(y: i8, blur: u8, alpha: u8) -> Shadow {
 
 /// Fonts and the look, at start-up.
 pub fn apply(ctx: &egui::Context) {
-    install_fonts(ctx, None, None);
+    install_fonts(ctx, None, None, &[]);
     apply_palette(ctx, Palette::Graphite);
 }
 
@@ -835,6 +835,7 @@ fn restyle(ctx: &egui::Context, t: Tokens) {
         s.spacing.icon_width = 16.0;
         s.spacing.icon_width_inner = 9.0;
         s.spacing.menu_margin = egui::Margin::same(6);
+        s.spacing.scroll = scroll_bars();
         // Built-in text styles follow the roles, so plain widgets match the guidelines too.
         use egui::TextStyle;
         s.text_styles.insert(TextStyle::Body, font(Type::Body));
@@ -843,6 +844,40 @@ fn restyle(ctx: &egui::Context, t: Tokens) {
         s.text_styles.insert(TextStyle::Heading, font(Type::Title));
         s.text_styles.insert(TextStyle::Monospace, font(Type::Data));
     });
+}
+
+/// Scroll bars (#483) are part of the layout, not an overlay that shows on hover: wherever there
+/// is more than fits, a bar is there at rest, in its own lane beside the content, showing how
+/// much more there is and where you are in it, and wide enough to grab without aiming.
+pub const SCROLL_BAR_WIDTH: f32 = 10.0;
+
+fn scroll_bars() -> egui::style::ScrollStyle {
+    // The handle takes the text colour, toned down at rest so a dark theme isn't striped with
+    // white bars: still at least 3:1 against the panel (a control's contrast), brighter under
+    // the pointer and while dragged.
+    // (egui applies these opacities only to "floating" bars, so the bar floats but keeps its
+    // own lane at full width: laid out like a solid bar, toned like a floating one.)
+    egui::style::ScrollStyle {
+        floating: true,
+        bar_width: SCROLL_BAR_WIDTH,
+        floating_width: SCROLL_BAR_WIDTH,
+        floating_allocated_width: SCROLL_BAR_WIDTH,
+        handle_min_length: TARGET,
+        bar_inner_margin: 2.0,
+        foreground_color: true,
+        dormant_background_opacity: 0.0,
+        dormant_handle_opacity: 0.45,
+        active_handle_opacity: 0.7,
+        interact_handle_opacity: 0.9,
+        ..egui::style::ScrollStyle::floating()
+    }
+}
+
+/// The exception: a one-row toolbar too wide for its place scrolls sideways under a thin bar
+/// laid over it. A lane of its own would push everything below it down whenever the row's
+/// contents changed width.
+pub fn toolbar_scroll_bars(ui: &mut egui::Ui) {
+    ui.spacing_mut().scroll = egui::style::ScrollStyle::floating();
 }
 
 mod craft_fonts {
@@ -873,17 +908,25 @@ pub fn embedded_fonts() -> Vec<std::sync::Arc<[u8]>> {
 }
 
 /// Noto Sans Georgian (craft-fonts `Geor`) when this build embedded a face that parses and covers
-/// the Georgian letters. The
-/// interface offers Georgian only then (`i18n::ready_codes`), and `install_fonts` loads the same
-/// face: epaint panics on bytes it cannot parse, so a damaged file must never reach it.
+/// the Georgian letters. The interface offers Georgian only then (`i18n::ready_codes`), and
+/// `install_fonts` loads the same face: epaint panics on bytes it cannot parse, so a damaged file
+/// must never reach it.
 pub fn georgian_font() -> Option<&'static [u8]> {
     static FACE: std::sync::OnceLock<Option<&'static [u8]>> = std::sync::OnceLock::new();
-    *FACE.get_or_init(|| craft_fonts::GEORGIAN_FONT.filter(|b| parses_as_font(b)))
+    *FACE.get_or_init(|| craft_fonts::GEORGIAN_FONT.filter(|b| covers_range(b, '\u{10D0}'..='\u{10FA}')))
 }
 
-/// Whether `bytes` is a font file that draws every Georgian letter (U+10D0..U+10FA).
-fn parses_as_font(bytes: &[u8]) -> bool {
-    let letters: String = ('\u{10D0}'..='\u{10FA}').collect();
+/// Noto Sans Hebrew (craft-fonts `Hebr`) when this build embedded a face that parses and covers
+/// the Hebrew letters (Alef..Tav), loaded under the same guard as [`georgian_font`]. It draws Hebrew
+/// letters in names; the interface is not offered in Hebrew yet (`i18n::READY`).
+pub fn hebrew_font() -> Option<&'static [u8]> {
+    static FACE: std::sync::OnceLock<Option<&'static [u8]>> = std::sync::OnceLock::new();
+    *FACE.get_or_init(|| craft_fonts::HEBREW_FONT.filter(|b| covers_range(b, '\u{05D0}'..='\u{05EA}')))
+}
+
+/// Whether `bytes` is a valid font file that covers every Unicode scalar in `range`.
+fn covers_range(bytes: &[u8], range: std::ops::RangeInclusive<char>) -> bool {
+    let letters: String = range.collect();
     let fonts = anicraft_engine::text::Fonts::from_faces([bytes.to_vec()]);
     fonts.layout(&letters, &anicraft_engine::text::Style::default()).is_ok_and(|laid| laid.missing == 0)
 }
@@ -892,8 +935,10 @@ fn parses_as_font(bytes: &[u8]) -> bool {
 mod georgian_face_tests {
     #[test]
     fn garbage_bytes_are_not_a_font() {
-        assert!(!super::parses_as_font(b"not a font file at all"));
-        assert!(!super::parses_as_font(&[]));
+        assert!(!super::covers_range(b"not a font file at all", '\u{10D0}'..='\u{10FA}'));
+        assert!(!super::covers_range(&[], '\u{10D0}'..='\u{10FA}'));
+        assert!(!super::covers_range(b"not a font file at all", '\u{05D0}'..='\u{05EA}'));
+        assert!(!super::covers_range(&[], '\u{05D0}'..='\u{05EA}'));
     }
 }
 
@@ -912,9 +957,11 @@ pub type UserFont = (String, Vec<u8>, u32);
 
 /// Installs the UI typefaces (ADR 0005). Order in each family: the user's system font (from
 /// Preferences), then the craft-fonts pair (when embedded at build time), then egui's bundled
-/// fonts, which stay as fallbacks for glyph coverage, then Noto Sans Georgian (when embedded)
-/// for the letters none of them has.
-pub fn install_fonts(ctx: &egui::Context, ui_font: Option<&UserFont>, data_font: Option<&UserFont>) {
+/// fonts, which stay as fallbacks for glyph coverage, then Noto Sans Georgian / Hebrew (when
+/// embedded) for the scripts none of them has, then `fallbacks`: faces of this computer for
+/// scripts none of the above has (Japanese, Chinese, Korean, Arabic…; `font_fallback`, #482).
+/// Being last, they change nothing that drew before.
+pub fn install_fonts(ctx: &egui::Context, ui_font: Option<&UserFont>, data_font: Option<&UserFont>, fallbacks: &[UserFont]) {
     use egui::{FontData, FontDefinitions, FontFamily};
     use std::sync::Arc;
     let mut defs = FontDefinitions::default();
@@ -924,10 +971,21 @@ pub fn install_fonts(ctx: &egui::Context, ui_font: Option<&UserFont>, data_font:
             defs.families.entry(family).or_default().insert(0, name.to_owned());
         }
     }
-    if let Some(b) = georgian_font() {
-        defs.font_data.insert("craft-noto-sans-georgian".to_owned(), Arc::new(FontData::from_static(b)));
+    for (bytes, name) in [(georgian_font(), "craft-noto-sans-georgian"), (hebrew_font(), "craft-noto-sans-hebrew")] {
+        if let Some(b) = bytes {
+            defs.font_data.insert(name.to_owned(), Arc::new(FontData::from_static(b)));
+            for family in [FontFamily::Proportional, FontFamily::Monospace] {
+                defs.families.entry(family).or_default().push(name.to_owned());
+            }
+        }
+    }
+    for (name, bytes, index) in fallbacks {
+        let key = format!("fallback:{name}:{index}");
+        let mut data = FontData::from_owned(bytes.clone());
+        data.index = *index;
+        defs.font_data.insert(key.clone(), Arc::new(data));
         for family in [FontFamily::Proportional, FontFamily::Monospace] {
-            defs.families.entry(family).or_default().push("craft-noto-sans-georgian".to_owned());
+            defs.families.entry(family).or_default().push(key.clone());
         }
     }
     for (user, family) in [(ui_font, FontFamily::Proportional), (data_font, FontFamily::Monospace)] {

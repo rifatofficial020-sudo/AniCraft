@@ -162,3 +162,167 @@ fn text_on_a_path_is_saved_and_older_files_open_without_it() {
     let a = anicraft_render::render_frame(&s.doc, 0, 0.5).unwrap();
     assert!(a.data.iter().any(|p| p[0] < 0.5), "the text draws");
 }
+
+/// The kinds of an outline's commands, in order: the same glyphs in the same order give the
+/// same list wherever they stand.
+fn kinds(t: &TextBlock) -> Vec<u8> {
+    use anicraft_geom::PathCmd as C;
+    t.outline
+        .cmds
+        .iter()
+        .map(|c| match c {
+            C::MoveTo(_) => 0,
+            C::LineTo(_) => 1,
+            C::QuadTo(..) => 2,
+            C::CubicTo(..) => 3,
+            C::Close => 4,
+        })
+        .collect()
+}
+
+#[test]
+fn the_point_commands_edit_the_path_a_text_follows() {
+    if !fonts() {
+        return;
+    }
+    let (mut s, text, line) = text_and_line();
+    run(&mut s, "element.select", json!({"ids": [text.0, line.0]}));
+    run(&mut s, "text.attach_path", json!({}));
+    let (xf0, before) = text_of(&s, text);
+    let steps = s.history().undo_len();
+    // A drag of the path's end point, 100 px down in three moves: one undo step, live each move.
+    s.begin_gesture("Move Points");
+    for _ in 0..4 {
+        run(&mut s, "path.move_points", json!({"id": text.0, "points": [[1, 0]], "dx": 0, "dy": 25}));
+    }
+    s.end_gesture();
+    assert_eq!(s.history().undo_len(), steps + 1, "one undo step per drag");
+    let (xf, t) = text_of(&s, text);
+    let on = t.on_path.as_ref().unwrap();
+    // The path's ends in stage space: the start where it was, the end 100 lower.
+    let stage = on.path.transformed(&xf);
+    let (a, b) = (stage.point(0, 0).unwrap(), stage.point(1, 0).unwrap());
+    assert!((a - anicraft_geom::Vec2::new(100.0, 300.0)).length() < 1e-2 && (b - anicraft_geom::Vec2::new(500.0, 400.0)).length() < 1e-2, "{a:?} {b:?}");
+    // The glyphs follow: the same glyphs in the same order, now running downhill.
+    assert_eq!(kinds(&t), kinds(&before), "glyph order kept");
+    assert_eq!((t.text.as_str(), t.runs.len()), (before.text.as_str(), before.runs.len()));
+    let (b0, b1) = (before.outline.bounds().transformed(&xf0), t.outline.bounds().transformed(&xf));
+    assert!(b1.height() > b0.height() + 10.0, "{b0:?} then {b1:?}");
+    // The box still holds the path and the glyphs from the origin.
+    let local = t.outline.bounds().union(&on.path.bounds());
+    assert!(local.min.x.abs() < 1e-3 && local.min.y.abs() < 1e-3, "{local:?}");
+    // A path squeezed to no length is refused and the text stays as it was.
+    let kept = text_of(&s, text).1;
+    let e = s.execute("path.move_points", &json!({"id": text.0, "points": [[1, 0]], "dx": -400, "dy": -100}));
+    assert!(e.is_err(), "{e:?}");
+    assert_eq!(*text_of(&s, text).1, *kept);
+    // A point added on the path, made smooth, and deleted again.
+    let v = run(&mut s, "path.add_point", json!({"id": text.0, "x": 300, "y": 350, "slop": 3}));
+    let cmd = v["cmd"].as_u64().unwrap();
+    assert_eq!(text_of(&s, text).1.on_path.as_ref().unwrap().path.cmds.len(), 3);
+    run(&mut s, "path.move_points", json!({"id": text.0, "points": [[cmd, 0]], "dx": 0, "dy": -80}));
+    run(&mut s, "path.convert_point", json!({"id": text.0, "cmd": cmd, "smooth": true}));
+    assert_eq!(kinds(&text_of(&s, text).1), kinds(&before));
+    run(&mut s, "path.delete_points", json!({"id": text.0, "cmds": [cmd]}));
+    assert_eq!(text_of(&s, text).1.on_path.as_ref().unwrap().path.cmds.len(), 2);
+    // Plain text still has no points.
+    let plain = ElementId(run(&mut s, "text.create", json!({"text": "plain"}))["element"].as_u64().unwrap());
+    let e = s.execute("path.move_points", &json!({"id": plain.0, "points": [[0, 0]], "dx": 1, "dy": 1})).unwrap_err().to_string();
+    assert!(e.contains("attach it to a path"), "{e}");
+    // Undo walks back through it all to lines of text.
+    while s.history().undo_len() > 0 {
+        s.undo().unwrap();
+    }
+}
+
+#[test]
+fn line_breaks_set_further_lines_parallel_to_the_path() {
+    if !fonts() {
+        return;
+    }
+    let mut s = Session::default();
+    let one = ElementId(run(&mut s, "text.create", json!({"text": "First", "x": 50, "y": 50, "size": 24}))["element"].as_u64().unwrap());
+    let line = ElementId(run(&mut s, "draw.line", json!({"x0": 100, "y0": 300, "x1": 500, "y1": 300}))["element"].as_u64().unwrap());
+    run(&mut s, "element.select", json!({"ids": [one.0]}));
+    run(&mut s, "text.attach_path", json!({"path": line.0}));
+    let (xf, t1) = text_of(&s, one);
+    let b1 = t1.outline.bounds().transformed(&xf);
+    // The same block with a second line: the first line stays, the second is a line height
+    // below the path, starting at the same place.
+    let fonts = anicraft_text::Fonts::get();
+    let lh = fonts.layout("First", &anicraft_text::Style { size: 24.0, family: t1.font.clone(), ..Default::default() }).unwrap().line_height;
+    run(&mut s, "text.edit", json!({"text": "First\nFloor"}));
+    let (xf, t2) = text_of(&s, one);
+    assert_eq!(t2.text, "First\nFloor", "the line break is kept");
+    let b2 = t2.outline.bounds().transformed(&xf);
+    assert!((b2.min.y - b1.min.y).abs() < 0.05 && (b2.min.x - b1.min.x).abs() < 0.05, "the first line didn't move: {b1:?} {b2:?}");
+    assert!((b2.max.y - (b1.max.y + lh)).abs() < 1.5, "the second line is one line height lower: {b1:?} {b2:?} {lh}");
+    // Line spacing moves it further; flipping puts both lines on the path's other side.
+    run(&mut s, "text.edit", json!({"line_spacing": 10}));
+    let (xf, t3) = text_of(&s, one);
+    let b3 = t3.outline.bounds().transformed(&xf);
+    assert!((b3.max.y - b2.max.y - 10.0).abs() < 0.05, "{b2:?} {b3:?}");
+    run(&mut s, "text.path", json!({"flip": true, "offset": 200}));
+    let (xf, t4) = text_of(&s, one);
+    let b4 = t4.outline.bounds().transformed(&xf);
+    assert!(b4.max.y > 300.0 + 10.0 && b4.min.y < 300.0 - lh, "hanging below the line, its second line above it: {b4:?}");
+    // Released, it is two lines of text again.
+    run(&mut s, "text.release_path", json!({}));
+    let (_, t5) = text_of(&s, one);
+    assert!(t5.on_path.is_none() && t5.text == "First\nFloor" && t5.box_height > lh * 1.8);
+}
+
+/// Hostile parameters on the new surfaces (ADR 0107) return errors, never panic, and leave a
+/// document that still evaluates and saves.
+#[test]
+fn hostile_point_edits_embeds_and_change_events_never_panic() {
+    if !fonts() {
+        return;
+    }
+    let (mut s, text, line) = text_and_line();
+    run(&mut s, "element.select", json!({"ids": [text.0]}));
+    run(&mut s, "text.edit", json!({"text": "a\n\n\nb\n".repeat(40)}));
+    run(&mut s, "element.select", json!({"ids": [text.0, line.0]}));
+    run(&mut s, "text.attach_path", json!({}));
+    let id = text.0;
+    let wild = [json!(null), json!(-1), json!(1e308), json!(u64::MAX), json!("x"), json!([]), json!({}), json!(f64::MIN_POSITIVE)];
+    let mut tried = 0;
+    for a in &wild {
+        for b in &wild {
+            for p in [
+                json!({"id": id, "points": [[a, b]], "dx": b, "dy": a}),
+                json!({"id": id, "points": [[1, 0]], "dx": a, "dy": b}),
+                json!({"id": id, "points": a, "dx": 1, "dy": 1, "smooth": b}),
+            ] {
+                let _ = s.execute("path.move_points", &p);
+                tried += 1;
+            }
+            let _ = s.execute("path.add_point", &json!({"id": id, "x": a, "y": b, "slop": a}));
+            let _ = s.execute("path.delete_points", &json!({"id": id, "cmds": [a, b]}));
+            let _ = s.execute("path.convert_point", &json!({"id": id, "cmd": a, "smooth": b}));
+            let _ = s.execute("text.path", &json!({"offset": a, "flip": b}));
+            let _ = s.execute("text.field", &json!({"embed": a, "type": b}));
+            let _ = s.execute("actions.set", &json!({"element": id, "event": "change", "actions": a}));
+            let _ = s.execute("actions.clear", &json!({"element": a, "event": "change"}));
+        }
+    }
+    assert!(tried > 100);
+    // Far moves that stay in range, a path folded onto itself, many lines: still text on a path.
+    for (dx, dy) in [(1e5, -1e5), (-1e5, 1e5), (-399.0, 0.0), (0.5, 0.5)] {
+        let _ = s.execute("path.move_points", &json!({"id": id, "points": [[1, 0]], "dx": dx, "dy": dy}));
+    }
+    let (_, t) = text_of(&s, text);
+    assert!(t.on_path.is_some());
+    assert!(t.outline.cmds.iter().all(|c| match c {
+        anicraft_geom::PathCmd::MoveTo(p) | anicraft_geom::PathCmd::LineTo(p) => p.is_finite(),
+        _ => true,
+    }));
+    let saved = crate::format::to_json(&s.doc).unwrap();
+    assert_eq!(crate::format::from_json(&saved).unwrap(), s.doc);
+    assert!(anicraft_render::render_frame(&s.doc, 0, 0.25).is_ok());
+    // Plug-ins may call what artists can: the namespaces already have their policy.
+    for cmd in ["path.move_points", "text.field", "text.path", "actions.set"] {
+        let _ = crate::cmds_plugin::plugin_may_call(cmd);
+    }
+}
+

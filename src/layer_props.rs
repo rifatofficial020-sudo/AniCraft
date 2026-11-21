@@ -6,7 +6,7 @@
 
 use crate::a11y::Named;
 use crate::app::App;
-use crate::theme::{FORM_LABEL_DIALOG, Type, form_row, text, to_color32};
+use crate::theme::{FORM_LABEL_DIALOG, T, Type, form_row, text, to_color32};
 use anicraft_engine::doc::{LayerId, LayerKind, MAX_LAYER_HEIGHT, Rgba};
 use egui::Key;
 use serde_json::{Value, json};
@@ -100,6 +100,9 @@ pub fn window(app: &mut App, ctx: &egui::Context) {
         (i.and_then(|i| tl.mask_above(i)).is_some(), i.and_then(|i| tl.guide_above(i)).is_some(), kind)
     };
     let fixed = matches!(kind, LayerKind::Folder | LayerKind::Camera | LayerKind::Armature);
+    // A reference video (ADR 0116): its file, and whether it is still there.
+    let video = app.s.timeline().layer(d.layer).and_then(|l| l.video.as_deref()).map(|v| (v.path.clone(), !crate::platform::WEB && !std::path::Path::new(&v.path).is_file()));
+    let (mut relink, mut remove_video) = (false, false);
     let (mut submit, mut cancel) = (false, false);
     crate::windows::new(ctx, tr!("Layer Properties")).id(egui::Id::new("layer_props")).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, -80.0]).show(ctx, |ui| {
         ui.set_min_width(420.0);
@@ -175,6 +178,24 @@ pub fn window(app: &mut App, ctx: &egui::Context) {
                 ui.add(egui::DragValue::new(&mut d.opacity).range(0.0..=100.0).suffix(" %").speed(1.0).max_decimals(0)).on_hover_text(tip).set_name(tr!("Layer opacity (percent)"));
             });
         }
+        if let Some((path, missing)) = &video {
+            form_row(ui, FORM_LABEL_DIALOG, tr!("Reference video"), |ui| {
+                ui.vertical(|ui| {
+                    ui.add(egui::Label::new(text(Type::Data, path.as_str())).truncate()).on_hover_text(path.as_str());
+                    if *missing {
+                        ui.label(text(Type::Caption, tr!("This file is missing. Relink it to show the video again.")).color(T.error));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button(tr!("Relink…")).on_hover_text(tr!("Choose the video file again: where it moved to, or another video")).clicked() {
+                            relink = true;
+                        }
+                        if ui.button(tr!("Remove Video")).on_hover_text(tr!("The layer stays; it no longer shows a video")).clicked() {
+                            remove_video = true;
+                        }
+                    });
+                });
+            });
+        }
         form_row(ui, FORM_LABEL_DIALOG, tr!("Layer height"), |ui| {
             egui::ComboBox::from_id_salt("layer_props_height")
                 .width(96.0)
@@ -199,7 +220,18 @@ pub fn window(app: &mut App, ctx: &egui::Context) {
             }
         });
     });
-    if submit {
+    if relink || remove_video {
+        // The dialog's other changes are dropped, as Cancel drops them: the video command is
+        // its own undo step.
+        let layer = app.layer_props.take().map(|d| d.layer.0);
+        if remove_video {
+            app.perform("layer.set_video", json!({"layer": layer, "remove": true}));
+        } else {
+            // The file dialog's answer goes to the active layer.
+            app.run("layer.select", json!({"layer": layer}));
+            app.invoke("layer.set_video");
+        }
+    } else if submit {
         accept(app);
     } else if cancel {
         app.layer_props = None;

@@ -56,6 +56,30 @@ impl Panel {
         }
     }
 
+    /// The action that opens and closes it from the keyboard (#456): bindable in the shortcut
+    /// editor, shown beside its Window menu item.
+    pub fn action(self) -> &'static str {
+        match self {
+            Panel::Properties => "view.panel.properties",
+            Panel::Align => "view.panel.align",
+            Panel::Colour => "view.panel.colour",
+            Panel::Library => "view.panel.library",
+            Panel::MovieExplorer => "view.movie_explorer",
+            Panel::History => "view.panel.history",
+            Panel::LayerDepth => "view.panel.layer_depth",
+            Panel::Timeline => "view.panel.timeline",
+            Panel::MotionEditor => "view.panel.motion_editor",
+            Panel::Actions => "view.actions",
+            Panel::Output => "view.panel.output",
+            Panel::Swatches => "view.panel.swatches",
+            Panel::Tools => "view.panel.tools",
+        }
+    }
+
+    pub fn from_action(id: &str) -> Option<Panel> {
+        Panel::ALL.into_iter().find(|p| p.action() == id)
+    }
+
     pub fn from_id(id: &str) -> Option<Panel> {
         Panel::ALL.into_iter().find(|p| p.id() == id)
     }

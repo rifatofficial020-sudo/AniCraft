@@ -291,3 +291,70 @@ fn chaining_a_long_chain_drawn_right_to_left_does_linear_work() {
     let moves = c.cmds.iter().filter(|m| matches!(m, anicraft_geom::PathCmd::MoveTo(_))).count();
     assert_eq!(moves, 1);
 }
+
+/// #487 (ADR 0122): a selection moved onto another fill does not cut it while it stays selected,
+/// as in Animate. The editor floats it (`draw.float`) when the drag ends; it can be moved on or
+/// back, and it cuts what it lies on only when the selection lets go of it.
+#[test]
+fn a_moved_selection_floats_until_it_is_deselected() {
+    let holes = |s: &Session| {
+        shapes(s).into_iter().find(|x| x.fill == Some(Paint::Solid(Rgba::hex(0xff0000)))).map(|x| x.path.cmds.iter().filter(|c| matches!(c, anicraft_geom::PathCmd::MoveTo(_))).count())
+    };
+    // One drag of the selection, as the Selection tool does it: one undo step.
+    let drag = |s: &mut Session, dx: i32, dy: i32| {
+        s.begin_gesture("Move");
+        run(s, "element.translate", json!({"dx": dx, "dy": dy}));
+        let r = run(s, "draw.float", json!({}));
+        s.end_gesture();
+        r
+    };
+    let mut s = blank();
+    run(&mut s, "draw.rect", json!({"x": 0, "y": 0, "w": 100, "h": 100, "fill": "#ff0000", "stroke": null}));
+    run(&mut s, "draw.rect", json!({"x": 200, "y": 0, "w": 50, "h": 50, "fill": "#0000ff", "stroke": null}));
+    let blue = s.selection.id_list();
+    assert_eq!(blue.len(), 1, "the square just drawn is selected");
+
+    // Onto the red square and let go of the mouse: still two whole shapes, the blue one selected
+    // and on top.
+    let r = drag(&mut s, -175, 25);
+    assert_eq!(r["floating"], 1);
+    assert_eq!((count(&s), holes(&s)), ((2, 0), Some(1)), "the red square is untouched under the selection");
+    assert_eq!(s.selection.id_list(), blue);
+    assert!(s.floating.is_some());
+    let top = s.active_layer().and_then(|l| l.keyframe_at(0)).and_then(|k| k.elements.last()).map(|e| e.id.0);
+    assert_eq!(top, blue.first().copied(), "the floating shape is drawn over what it lies on");
+
+    // Moved back off it and deselected: nothing was cut.
+    drag(&mut s, 175, -25);
+    run(&mut s, "edit.deselect", json!({}));
+    assert!(s.floating.is_none());
+    assert_eq!((count(&s), holes(&s)), ((2, 0), Some(1)));
+    // (Settling gives the shape a new id; the drawing is the two whole squares, apart.)
+    let apart = s.doc.clone();
+
+    // Moved on again and deselected: now it cuts the red square.
+    run(&mut s, "element.pick", json!({"x": 225, "y": 25}));
+    drag(&mut s, -175, 25);
+    assert_eq!(holes(&s), Some(1));
+    run(&mut s, "edit.deselect", json!({}));
+    assert_eq!(holes(&s), Some(2), "deselected: the red square has a hole where the blue one lies");
+    let cut = s.doc.clone();
+    // One undo takes back the move and the cut it led to; redo brings both back.
+    run(&mut s, "edit.undo", json!({}));
+    assert!(s.doc == apart, "undo: before the move");
+    run(&mut s, "edit.redo", json!({}));
+    assert!(s.doc == cut, "redo: moved and cut");
+
+    // Selecting something else lets go of it too, and a command that needs the drawing merged
+    // (scripts) still has `draw.drop`.
+    run(&mut s, "edit.undo", json!({}));
+    drag(&mut s, -175, 25);
+    run(&mut s, "element.pick", json!({"x": 90, "y": 90}));
+    assert!(s.floating.is_none());
+    assert_eq!(holes(&s), Some(2), "picking the red square let go of the blue one");
+    // Objects (not raw) never float: there is nothing to merge.
+    let mut o = blank();
+    run(&mut o, "draw.rect", json!({"x": 0, "y": 0, "w": 10, "h": 10, "object": true}));
+    assert_eq!(run(&mut o, "draw.float", json!({}))["floating"], 0);
+    assert!(o.floating.is_none());
+}

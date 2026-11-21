@@ -22,6 +22,7 @@ if (-not (Test-Path $App)) { Write-Error "$App was not built" }
 # picture name, then the --open state ("-" for the window as it starts)
 $Shots = @(
   @("workspace", "-"),
+  @("document-tabs", "tabs"),
   @("start-screen", "start"),
   @("library", "library"),
   @("onion-skin", "timelinepolish"),
@@ -30,7 +31,9 @@ $Shots = @(
   @("publish-settings", "publish"),
   @("preferences", "prefs"),
   @("audio-to-keyframes", "audiokeys"),
-  @("lip-sync", "lipsynced")
+  @("lip-sync", "lipsynced"),
+  @("data-chart", "datachart"),
+  @("data-table", "datatable")
 )
 New-Item -ItemType Directory -Force $Out | Out-Null
 foreach ($s in $Shots) {

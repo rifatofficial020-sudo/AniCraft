@@ -374,6 +374,22 @@ impl Props {
     }
 }
 
+/// The transform `props` give `base` (whose own values are `base_props`). With a
+/// transformation point (ADR 0111) the position values carry the point, and the object turns,
+/// scales and skews about it. What a motion tween's curves and a data binding (ADR 0118) place
+/// their object by.
+pub(crate) fn placed(base: &Element, base_props: &Props, props: &Props) -> Affine {
+    let mut m = props.transform();
+    if let Some(p) = base.pivot() {
+        let (d0, d1) = (base_props.transform().translation(), m.translation());
+        let at = base.transform.apply(p) + (d1 - d0);
+        let about = Affine { m: [m.m[0], m.m[1], m.m[2], m.m[3], 0.0, 0.0] };
+        let o = about.apply(p);
+        m = Affine::translate(at.x - o.x, at.y - o.y).mul(&about);
+    }
+    m
+}
+
 /// The object's own value of `p`: its transform's and colour effect's, or a filter's number
 /// (`None` when it has no filter there with that number, ADR 0092).
 pub fn own_value(el: &Element, p: Property) -> Option<f32> {
@@ -1285,16 +1301,7 @@ impl MotionTween {
             }
         }
         if on_path.is_some() || self.tracks.iter().any(|t| t.property.is_transform()) {
-            let mut m = props.transform();
-            // With a transformation point (ADR 0111) the position tracks carry the point, and
-            // the target turns, scales and skews about it.
-            if let Some(p) = base.pivot() {
-                let (d0, d1) = (base_props.transform().translation(), m.translation());
-                let at = base.transform.apply(p) + (d1 - d0);
-                let about = Affine { m: [m.m[0], m.m[1], m.m[2], m.m[3], 0.0, 0.0] };
-                let o = about.apply(p);
-                m = Affine::translate(at.x - o.x, at.y - o.y).mul(&about);
-            }
+            let m = placed(base, &base_props, &props);
             if m.is_finite() {
                 el.transform = m;
             }

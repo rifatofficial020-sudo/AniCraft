@@ -11,7 +11,12 @@
 //! The store is per thread (the browser has one), bounded ([`MAX_MEMORY_BYTES`]), and tests can
 //! switch a thread to it on any platform with [`use_memory`]. So commands read and write files
 //! on their own thread, never from the rayon pool (render there, write after).
+//!
+//! Every function here first asks [`crate::access`] whether automation roots are in force on
+//! this thread (ADR 0124): an agent's commands read and write inside its roots only. A refused
+//! question ("is it there?") answers no; a refused read or write is an error naming the roots.
 
+use crate::access::{Access, check};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io;
@@ -191,10 +196,12 @@ pub fn take_written() -> Vec<(PathBuf, Vec<u8>)> {
 }
 
 pub fn read(path: &Path) -> io::Result<Vec<u8>> {
+    check(path, Access::Read)?;
     mem(|m| m.read(path)).unwrap_or_else(|| std::fs::read(path))
 }
 
 pub fn read_to_string(path: &Path) -> io::Result<String> {
+    check(path, Access::Read)?;
     match mem(|m| m.read(path)) {
         Some(r) => String::from_utf8(r?).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the file is not UTF-8 text")),
         None => std::fs::read_to_string(path),
@@ -202,6 +209,7 @@ pub fn read_to_string(path: &Path) -> io::Result<String> {
 }
 
 pub fn write(path: &Path, data: impl AsRef<[u8]>) -> io::Result<()> {
+    check(path, Access::Write)?;
     match mem(|m| m.write(path, data.as_ref().to_vec())) {
         Some(r) => r,
         None => std::fs::write(path, data),
@@ -211,6 +219,7 @@ pub fn write(path: &Path, data: impl AsRef<[u8]>) -> io::Result<()> {
 /// Like [`write`], but the file must not exist yet (`O_EXCL`: a planted file or symlink makes it
 /// fail instead of being written through). For temporary files.
 pub fn write_new(path: &Path, data: impl AsRef<[u8]>) -> io::Result<()> {
+    check(path, Access::Write)?;
     match mem(|m| m.write(path, data.as_ref().to_vec())) {
         Some(r) => r,
         None => std::fs::OpenOptions::new().write(true).create_new(true).open(path).and_then(|mut f| io::Write::write_all(&mut f, data.as_ref())),
@@ -226,23 +235,34 @@ pub fn random_suffix() -> String {
 
 /// The file's size in bytes (`std::fs::metadata(path)?.len()`).
 pub fn len(path: &Path) -> io::Result<u64> {
+    check(path, Access::Probe)?;
     mem(|m| m.len(path)).unwrap_or_else(|| std::fs::metadata(path).map(|m| m.len()))
 }
 
 pub fn exists(path: &Path) -> bool {
+    if check(path, Access::Probe).is_err() {
+        return false;
+    }
     mem(|m| m.is_file(path) || m.is_dir(path)).unwrap_or_else(|| path.exists())
 }
 
 pub fn is_file(path: &Path) -> bool {
+    if check(path, Access::Probe).is_err() {
+        return false;
+    }
     mem(|m| m.is_file(path)).unwrap_or_else(|| path.is_file())
 }
 
 pub fn is_dir(path: &Path) -> bool {
+    if check(path, Access::Probe).is_err() {
+        return false;
+    }
     mem(|m| m.is_dir(path)).unwrap_or_else(|| path.is_dir())
 }
 
 /// Folders in memory exist through their files, so this only checks the name there.
 pub fn create_dir_all(path: &Path) -> io::Result<()> {
+    check(path, Access::Write)?;
     match mem(|m| if m.is_file(path) { Err(unsupported("a file has that name")) } else { Ok(()) }) {
         Some(r) => r,
         None => std::fs::create_dir_all(path),
@@ -250,15 +270,21 @@ pub fn create_dir_all(path: &Path) -> io::Result<()> {
 }
 
 pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
+    check(from, Access::Write)?;
+    check(to, Access::Write)?;
     mem(|m| m.rename(from, to)).unwrap_or_else(|| std::fs::rename(from, to))
 }
 
 pub fn remove_file(path: &Path) -> io::Result<()> {
+    check(path, Access::Write)?;
     mem(|m| m.remove_file(path)).unwrap_or_else(|| std::fs::remove_file(path))
 }
 
 /// The entries of folder `dir`, at most `limit` (none if it can't be read).
 pub fn list(dir: &Path, limit: usize) -> Vec<PathBuf> {
+    if check(dir, Access::Read).is_err() {
+        return Vec::new();
+    }
     match mem(|m| m.list(dir, limit)) {
         Some(l) => l,
         None => std::fs::read_dir(dir).map(|rd| rd.take(limit).flatten().map(|e| e.path()).collect()).unwrap_or_default(),
@@ -274,6 +300,7 @@ pub enum Writer {
 
 impl Writer {
     pub fn create(path: &Path) -> io::Result<Writer> {
+        check(path, Access::Write)?;
         if in_memory() {
             key(path)?;
             return Ok(Writer::Memory(path.to_path_buf(), Vec::new()));
@@ -283,6 +310,7 @@ impl Writer {
 
     /// Like [`Writer::create`], but the file must not exist yet.
     pub fn create_new(path: &Path) -> io::Result<Writer> {
+        check(path, Access::Write)?;
         if in_memory() {
             return Writer::create(path);
         }

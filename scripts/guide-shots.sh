@@ -31,6 +31,8 @@ SHOTS=(
   "preferences prefs"
   "audio-to-keyframes audiokeys"
   "lip-sync lipsynced"
+  "data-chart datachart"
+  "data-table datatable"
 )
 mkdir -p "$OUT"
 for row in "${SHOTS[@]}"; do

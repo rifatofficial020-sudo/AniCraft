@@ -342,6 +342,55 @@
       g.fillText(lines[i], x, y);
     }
   }
+  // A style's font for the canvas.
+  function styleFont(st) {
+    const family = String(st.font || "").replace(/["\\\r\n;{}]/g, "");
+    return (st.italic ? "italic " : "") + (st.bold ? "bold " : "") + st.size + "px " + (family ? '"' + family + '", ' : "") + "sans-serif";
+  }
+  // Changed text in styles of its own (`htmlText`), or in a face whose glyphs the page carries
+  // (ADR 0107): laid out by the player's `fieldLayout`, then each stretch drawn in its colour,
+  // by its embedded outlines when it has them, else with the browser's fonts; underlines under.
+  function fieldRich(g, f, styles) {
+    const tf = f.tf;
+    const shown = tf.k === "input" && tf.ln === "password" ? Array.from(f.text, () => "*").join("") : f.text;
+    g.textBaseline = "alphabetic";
+    g.textAlign = "left";
+    const measure = (st, t) => {
+      g.font = styleFont(st);
+      if ("letterSpacing" in g) g.letterSpacing = st.ls + "px";
+      return g.measureText(t).width;
+    };
+    const lines = AniCraft.fieldLayout(tf, shown, styles, movie.fonts, measure);
+    for (const line of lines) {
+      if (line.top > tf.h) break;
+      for (const s of line.segs) {
+        const st = s.st;
+        g.fillStyle = css(AniCraft.applyEffect(f.c, [st.color[0] / 255, st.color[1] / 255, st.color[2] / 255, 1]));
+        if (s.face) {
+          const k = st.size / 1000;
+          let x = s.x;
+          for (const c of Array.from(s.text)) {
+            const glyph = s.face.g[c];
+            const p = paths[glyph[1]];
+            if (p) {
+              g.save();
+              g.translate(x, line.base);
+              g.scale(k, k);
+              g.fill(p);
+              g.restore();
+            }
+            x += glyph[0] * k + st.ls;
+          }
+        } else {
+          g.font = styleFont(st);
+          if ("letterSpacing" in g) g.letterSpacing = st.ls + "px";
+          g.fillText(s.text, s.x, line.base);
+        }
+        if (st.u) g.fillRect(s.x, line.base + st.size * 0.08, s.w, Math.max(st.size * 0.06, 1));
+      }
+    }
+    if ("letterSpacing" in g) g.letterSpacing = "0px";
+  }
   // One field on layer `L` (`set` places a layer's context by a stage transform); input fields
   // with an instance path go into `seen`, to get their elements.
   function drawField(L, f, set, seen) {
@@ -371,7 +420,13 @@
           g.fillStyle = fieldColour(f);
           g.fill(p);
         }
-      } else fieldText(g, f);
+      } else {
+        // Styled text and embedded faces go through the layout; plain text in a browser font
+        // is drawn as it always was.
+        const styles = AniCraft.fieldStyles({ text: f.text, rich: f.rich }, tf);
+        if (f.rich !== null || (movie.fonts && styles.runs.some((r) => AniCraft.embeddedFace(movie.fonts, r.s) !== null))) fieldRich(g, f, styles);
+        else fieldText(g, f);
+      }
       g.restore();
     }
     if (tf.bd) {
@@ -417,6 +472,8 @@
       if (v === null) return;
       if (v !== el.value) el.value = v;
       el._shown = v;
+      // The field's change event ran (ADR 0107): its traces and sounds.
+      if (player.changed) report(player.changed);
       draw();
     };
     el.addEventListener("input", (e) => {
@@ -457,6 +514,12 @@
         el.style.color = colour;
         el.style.caretColor = colour;
         el._colour = colour;
+      }
+      // A script set `maxChars`.
+      if (el._mx !== f.mx) {
+        if (f.mx > 0) el.maxLength = f.mx;
+        else el.removeAttribute("maxlength");
+        el._mx = f.mx;
       }
       // A script set its text (setting it unchanged would move the viewer's caret).
       const v = f.text !== null ? f.text : f.tf.t;

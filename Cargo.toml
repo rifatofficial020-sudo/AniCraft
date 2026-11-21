@@ -30,8 +30,8 @@ anicraft-plugins = { path = "crates/plugins" }
 anicraft-audio = { path = "crates/audio" }
 anicraft-gpu = { path = "crates/gpu" }
 anicraft-guide = { path = "crates/guide" }
-craft-anicraft-format = { git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18" }
-craft-svg = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "010702ee9b030844c852939095b1da0d0656a890", default-features = false }
+craft-anicraft-format = { git = "https://github.com/storytold/craft-libs", rev = "08da5e1486ee640de1d2cccd8fe8dd32b1d3b62c" }
+craft-svg = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "b041cd8224af0d57fa62c428184a32a7d5d0f92b", default-features = false }
 craft-mime = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18" }
 craft-html = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18", default-features = false }
 craft-audio = { git = "https://github.com/storytold/craft-libs", rev = "e2bf53f2bdba4828e21097774a568ed9c74b0004", default-features = false, features = ["decode", "pcm-encode"] }
@@ -41,6 +41,9 @@ craft-apng-container = { package = "craft-image-codecs", version = "0.1.0", git 
 craft-image-codecs = { git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18" }
 craft-webp = { git = "https://github.com/storytold/craft-libs", rev = "0c144b7d983899d4b5b281046dd03a8b1ab35fbb" }
 craft-xfl = { git = "https://github.com/storytold/craft-libs", rev = "b67b9f90c50091a3090f93fa054c34e409edba11" }
+# Delimited text (CSV, TSV) for data tables (ADR 0118): encoding and delimiter detection and a
+# bounded record parser. The same reviewed commit as craft-mime and craft-gif.
+craft-csv = { git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18" }
 craft-xml = { git = "https://github.com/storytold/craft-libs", rev = "b67b9f90c50091a3090f93fa054c34e409edba11" }
 # The GPU stage (ADR 0019) uses the wgpu that eframe's egui-wgpu brings, with the same
 # (default) features, so the tree keeps one wgpu build.

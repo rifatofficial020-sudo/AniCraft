@@ -79,6 +79,20 @@ fn slugs_match_github() {
 }
 
 #[test]
+fn numbered_headings_do_not_reuse_generated_slugs() {
+    for (headings, expected) in [
+        (vec!["Foo", "Foo", "Foo-1", "Foo", "Foo-1"], vec!["foo", "foo-1", "foo-1-1", "foo-2", "foo-1-2"]),
+        (vec!["Foo-1", "Foo-2", "Foo", "Foo", "Foo"], vec!["foo-1", "foo-2", "foo", "foo-3", "foo-4"]),
+        (vec!["Préférences", "Préférences", "", "", "-1", "!!!"], vec!["préférences", "préférences-1", "", "-1", "-1-1", "-2"]),
+        (vec!["Onion skin", "Onion skin"], vec!["onion-skin", "onion-skin-1"]),
+    ] {
+        let mut seen = BTreeMap::new();
+        let ids: Vec<String> = headings.into_iter().map(|heading| unique_slug(&mut seen, heading)).collect();
+        assert_eq!(ids, expected);
+    }
+}
+
+#[test]
 fn links_become_pages_and_headings_get_ids() {
     let pages = [Page { file: "index.md", markdown: "# Guide\n\nSee [the timeline](timeline.md#onion-skin) and [web](https://example.com/a.md).\n\n## Same\n\n## Same\n\n<b>raw</b>\n" }, Page { file: "timeline.md", markdown: "# Timeline\n\n## Onion skin\n" }];
     let html = render_page(&pages, 0);

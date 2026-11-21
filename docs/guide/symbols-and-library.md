@@ -260,6 +260,12 @@ shrink together in proportion. If you turn the guides off, AniCraft remembers wh
 The HTML canvas export doesn't do 9-slice scaling yet. It scales such instances as a whole,
 and its report says so.
 
+## Data tables
+
+The Library also keeps **data tables**: numbers imported from a CSV, TSV or JSON file that can
+drive an instance's position, size, rotation, opacity or the frame it shows. See
+[Data-driven animation](data-driven-animation.md).
+
 ## Not there yet
 
 * Shared libraries, and dragging items out of another open document's Library (copy and paste

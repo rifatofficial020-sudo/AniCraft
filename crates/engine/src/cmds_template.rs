@@ -200,6 +200,7 @@ fn delete_template(_: &mut Session, p: &Value) -> Result<Value> {
     // An emptied category goes with its last template.
     if let Some(dir) = path.parent()
         && crate::vfs::list(dir, 1).is_empty()
+        && crate::access::check(dir, crate::access::Access::Write).is_ok()
     {
         let _ = std::fs::remove_dir(dir);
     }

@@ -14,12 +14,12 @@
 param([switch]$Dev)
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
-Set-Location $Root
+Set-Location -LiteralPath $Root
 
 $CargoProfile = if ($Dev) { 'dev' } else { 'web' }
 
 # The CLI and the crate must be the same version, or the generated glue doesn't match.
-$lock = Get-Content -Raw (Join-Path $Root 'Cargo.lock')
+$lock = Get-Content -Raw -LiteralPath (Join-Path $Root 'Cargo.lock')
 $m = [regex]::Match($lock, '(?m)^name = "wasm-bindgen"\r?\nversion = "([^"]+)"')
 if (-not $m.Success) { throw 'Cargo.lock names no wasm-bindgen version' }
 $Want = $m.Groups[1].Value
@@ -43,16 +43,16 @@ $TargetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Pa
 $Dir = if ($Dev) { 'debug' } else { $CargoProfile }
 $Wasm = Join-Path $TargetDir "wasm32-unknown-unknown\$Dir\anicraft.wasm"
 $Out = Join-Path $Root 'web'
-if (Test-Path $Out) { Remove-Item -Recurse -Force $Out }
+if (Test-Path -LiteralPath $Out) { Remove-Item -Recurse -Force -LiteralPath $Out }
 New-Item -ItemType Directory -Force $Out | Out-Null
 & wasm-bindgen --target web --no-typescript --out-dir $Out --out-name anicraft $Wasm
 if ($LASTEXITCODE -ne 0) { throw 'wasm-bindgen failed' }
-Copy-Item (Join-Path $Root 'packaging\web\index.html') (Join-Path $Out 'index.html')
-Copy-Item (Join-Path $Root 'assets\app-icon\hicolor\128x128\apps\ai.storyteller.anicraft.png') (Join-Path $Out 'anicraft.png')
+Copy-Item -LiteralPath (Join-Path $Root 'packaging\web\index.html') -Destination (Join-Path $Out 'index.html')
+Copy-Item -LiteralPath (Join-Path $Root 'assets\app-icon\hicolor\128x128\apps\ai.storyteller.anicraft.png') -Destination (Join-Path $Out 'anicraft.png')
 # The user guide beside the editor: Help › User Guide opens guide/index.html (ADR 0069).
 cargo run -q -p anicraft-cli -- guide --out (Join-Path $Out 'guide')
 if ($LASTEXITCODE -ne 0) { throw 'writing the user guide failed' }
 
-$Bytes = (Get-Item (Join-Path $Out 'anicraft_bg.wasm')).Length
+$Bytes = (Get-Item -LiteralPath (Join-Path $Out 'anicraft_bg.wasm')).Length
 Write-Host ("web\ is ready: anicraft_bg.wasm is {0} KB." -f [math]::Floor($Bytes / 1024))
 Write-Host 'Serve it locally, for example: python -m http.server --directory web 8080  (then open http://localhost:8080)'

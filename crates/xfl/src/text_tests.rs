@@ -61,6 +61,24 @@ fn static_text_keeps_its_style_matrix_and_lines() {
 }
 
 #[test]
+fn line_spacing_left_out_is_two_pixels() {
+    let Some((fonts, family)) = fonts() else { return };
+    // Animate writes `lineSpacing` only when it isn't 2 px (it writes "0" for 0), so a run that
+    // leaves it out, or has no attributes at all, keeps 2 px between its lines.
+    let field = |attrs: &str| format!(r#"<DOMStaticText autoExpand="true"><textRuns>{}</textRuns></DOMStaticText>"#, run("One&#xD;Two", &format!(r#"face="{family}" size="20" {attrs}"#)));
+    let bare = r#"<DOMStaticText autoExpand="true"><textRuns><DOMTextRun><characters>One&#xD;Two</characters></DOMTextRun></textRuns></DOMStaticText>"#;
+    let (doc, report) = import_doc(&doc_with(&[field(""), field(r#"lineSpacing="0""#), field(r#"lineSpacing="-3""#), bare.to_string()].concat()), fonts);
+    let t = texts(&doc);
+    assert_eq!(t.len(), 4, "{report:?}");
+    let spacing: Vec<Vec<f32>> = t.iter().map(|(_, b)| b.paragraph_styles().iter().map(|p| p.line_spacing).collect()).collect();
+    assert_eq!(spacing, [vec![2.0, 2.0], vec![0.0, 0.0], vec![-3.0, -3.0], vec![2.0, 2.0]]);
+    assert_eq!(t[0].1.line_spacing, crate::text::LINE_SPACING);
+    // The default opens the lines 2 px further apart than an explicit 0.
+    let (default, zero) = (t[0].1.box_height, t[1].1.box_height);
+    assert!((default - zero - 2.0).abs() < 0.01, "{default} vs {zero}");
+}
+
+#[test]
 fn fixed_width_fields_wrap_and_auto_size_ones_do_not() {
     let Some((fonts, family)) = fonts() else { return };
     let words = "one two three four five six seven eight nine ten";

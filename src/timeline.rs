@@ -331,6 +331,13 @@ pub fn insert_key_params(app: &App, id: &str) -> Option<serde_json::Value> {
     }
 }
 
+/// Params for Shift+F5 and Shift+F6 with no frame selection (#438): like F5 there, they act on
+/// every layer at the playhead, so the layers that F5 extended together shrink together.
+/// `None`: not one of them, or frames are selected (they act on the selection).
+pub fn remove_key_params(app: &App, id: &str) -> Option<serde_json::Value> {
+    (matches!(id, "timeline.remove_frame" | "timeline.clear_keyframe") && app.frame_sel.is_none()).then(|| json!({"all_layers": true}))
+}
+
 /// A one-frame selection moves with the playhead after F5 / F6 / F7 (as in Animate), instead of
 /// being dropped for being left behind.
 pub fn follow_playhead(app: &mut App) {
@@ -340,6 +347,19 @@ pub fn follow_playhead(app: &mut App) {
         sel.anchor.1 = app.s.frame;
         sel.head.1 = app.s.frame;
     }
+}
+
+/// The width a layer's name may take: from where it starts to where the row's toggles begin,
+/// less the room its "has selected artwork" mark needs. Never negative.
+fn name_room(name_x: f32, toggles_left: f32, mark: f32) -> f32 {
+    (toggles_left - name_x - mark).max(0.0)
+}
+
+/// A layer's name on one line, ending in an ellipsis when it is wider than `width`.
+fn elided_name(p: &egui::Painter, name: &str, color: Color32, width: f32) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(name.to_owned(), font(Type::Body), color);
+    job.wrap = egui::text::TextWrapping { max_width: width.max(1.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+    p.layout_job(job)
 }
 
 /// Frame commands that act on the frame selection.
@@ -449,6 +469,7 @@ const VOLUME_W: f32 = 56.0;
 /// and tween buttons, `width` wide at most. What doesn't fit scrolls sideways (Shift+wheel) in
 /// a small window or at a large interface scale, instead of being cut off.
 pub fn header_tools(app: &mut App, ui: &mut egui::Ui, width: f32) {
+    crate::theme::toolbar_scroll_bars(ui);
     let out = egui::ScrollArea::horizontal().id_salt("tl_header").max_width(width.max(40.0)).show(ui, |ui| ui.horizontal(|ui| header(app, ui)));
     app.tl_header_spill = out.content_size.x - out.inner_rect.width();
 }
@@ -742,13 +763,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         }
         type_icon(icon_x, icon);
         let icon_rect = Rect::from_center_size(pos2(icon_x, left.center().y), vec2(16.0, tg));
-        let name_at = painter.text(pos2(name_x, left.center().y), Align2::LEFT_CENTER, &layer.name, font(Type::Body), name_color);
         let has_selection = holding.contains(&layer.id);
-        if has_selection {
-            let sq = Rect::from_center_size(pos2(name_at.right() + 9.0, left.center().y), vec2(SEL_MARK, SEL_MARK));
-            painter.rect_filled(sq, 0.0, to_color32(layer.color));
-            painter.rect_stroke(sq, 0.0, Stroke::new(1.0, T.text), StrokeKind::Outside);
-        }
 
         // Onion / eye / lock / outline toggles, right to left from the outline square: square
         // targets with a hover fill (smaller on short rows).
@@ -809,6 +824,17 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             None => attach_t.or(speaker).or(onion_t).unwrap_or(eye).left() - 4.0,
         };
         let name_rect = Rect::from_min_max(left.left_top(), pos2(name_end.max(left.left() + 8.0), left.bottom()));
+        // The name stops before the row's toggles, with an ellipsis when it is longer than the
+        // room (#440: a long name, such as an imported sound's file name, ran under them).
+        let mark_room = if has_selection { SEL_MARK + 14.0 } else { 0.0 };
+        let name_galley = elided_name(&painter, &layer.name, name_color, name_room(name_x, name_rect.right(), mark_room));
+        let name_right = name_x + name_galley.rect.width();
+        painter.galley(pos2(name_x, left.center().y - name_galley.rect.height() / 2.0), name_galley, name_color);
+        if has_selection {
+            let sq = Rect::from_center_size(pos2(name_right + 9.0, left.center().y), vec2(SEL_MARK, SEL_MARK));
+            painter.rect_filled(sq, 0.0, to_color32(layer.color));
+            painter.rect_stroke(sq, 0.0, Stroke::new(1.0, T.text), StrokeKind::Outside);
+        }
         if let Some(col) = parent_col {
             // The name gives way to the column: what is under it is painted over.
             let until = attach_t.or(speaker).or(onion_t).unwrap_or(eye).left() - 1.0;
@@ -1943,6 +1969,14 @@ fn fps_label(fps: f32) -> String {
     format!("{s} fps")
 }
 
+/// Side padding of the header's frame and frame-rate fields (points).
+const FIELD_PAD: f32 = 3.0;
+
+/// A typed frame rate: the number, with or without "fps" after it.
+fn parse_fps(s: &str) -> Option<f64> {
+    s.trim().trim_end_matches(|c: char| c.is_alphabetic() || c.is_whitespace()).replace(',', ".").parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
 fn header(app: &mut App, ui: &mut egui::Ui) {
     transport(app, ui);
     ui.add_space(4.0);
@@ -1950,8 +1984,42 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
     let f = app.s.frame;
     // Fixed-width readouts: digits stay put while the playhead moves.
     let digits = app.s.frame_count().max(f + 1).to_string().len().max(3);
-    ui.label(text(Type::DataLarge, format!("{:>digits$}", f + 1)).color(T.accent_text)).named(tr!("Current frame")).on_hover_text(tr!("Current frame"));
-    ui.label(text(Type::Data, fps_label(fps)).color(T.text_dim)).on_hover_text(tr!("Frame rate"));
+    // The current frame is a field (#462): click it and type a frame to go there, or drag it to
+    // scrub. A number past the end goes to the last frame, as in Animate.
+    let mut go = f + 1;
+    let gap = std::mem::replace(&mut ui.spacing_mut().item_spacing.x, 2.0);
+    let field = ui
+        .scope(|ui| {
+            // No wider than the readout it replaces: the header has no room to spare.
+            let face = font(Type::DataLarge);
+            ui.spacing_mut().button_padding.x = FIELD_PAD;
+            ui.spacing_mut().interact_size.x = digits as f32 * face.size * 0.62 + 2.0 * FIELD_PAD;
+            ui.style_mut().override_font_id = Some(face);
+            ui.visuals_mut().override_text_color = Some(T.accent_text);
+            ui.add(egui::DragValue::new(&mut go).range(1..=app.s.frame_count().max(1)).speed(0.25))
+        })
+        .inner
+        .named(tr!("Current frame"))
+        .on_hover_text(tr!("Current frame: click to type the frame to go to, or drag to scrub"));
+    if field.changed()
+        && let Some(to) = go.checked_sub(1).filter(|to| *to != f)
+    {
+        app.playing = false;
+        app.run("timeline.goto", json!({"frame": playhead_target(to, app.s.frame_count())}));
+    }
+    // And so is the frame rate (#461): the same value as the document's in Properties.
+    let mut rate = fps;
+    let field = with_type(ui, Type::Data, |ui| {
+        ui.spacing_mut().button_padding.x = FIELD_PAD;
+        ui.spacing_mut().interact_size.x = 0.0;
+        ui.add(egui::DragValue::new(&mut rate).custom_formatter(|v, _| fps_label(v as f32)).custom_parser(parse_fps).speed(0.1).range(1.0..=120.0))
+    })
+        .named(tr!("Frame rate"))
+        .on_hover_text(tr!("Frame rate: click to type frames per second, or drag"));
+    ui.spacing_mut().item_spacing.x = gap;
+    if field.changed() && rate != fps {
+        crate::panels::live(app, tr_noop!("Frame rate"), "doc.set_stage", json!({"fps": rate}));
+    }
     ui.label(text(Type::Data, format!("{:>6.2} s", f as f32 / fps.max(1.0))).color(T.text_dim)).on_hover_text(tr!("Time at the playhead"));
     ui.separator();
     // Through `invoke`, so the buttons act on the frame selection like the keys do. Icons (the
@@ -2041,6 +2109,56 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #438: with no frame selection Shift+F5 and Shift+F6 act on every layer at the playhead,
+    /// as F5 does; with frames selected they act on the selection.
+    #[test]
+    fn shift_f5_and_shift_f6_follow_f5_onto_every_layer() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_context(&ctx, anicraft_engine::Session::default(), Some(std::path::PathBuf::from("unused.png")));
+        let a = app.s.layer;
+        app.run("layer.new", json!({}));
+        let len = |app: &App, l: LayerId| app.s.timeline().layer(l).map_or(0, |l| l.end_frame());
+        assert!(app.frame_sel.is_none());
+        for _ in 0..4 {
+            app.invoke("timeline.insert_frame");
+        }
+        let b = app.s.layer;
+        assert_eq!((len(&app, a), len(&app, b)), (5, 5), "F5 extends both layers");
+        app.invoke("timeline.remove_frame");
+        app.invoke("timeline.remove_frame");
+        assert_eq!((len(&app, a), len(&app, b)), (3, 3), "Shift+F5 shortens both");
+        assert_eq!(remove_key_params(&app, "timeline.clear_keyframe"), Some(json!({"all_layers": true})));
+        assert_eq!(remove_key_params(&app, "timeline.insert_frame"), None);
+        // A frame selection is what they act on instead.
+        app.frame_sel = Some(FrameSel { anchor: (b, 1), head: (b, 1) });
+        assert_eq!(remove_key_params(&app, "timeline.remove_frame"), None);
+        app.invoke("timeline.remove_frame");
+        assert_eq!((len(&app, a), len(&app, b)), (3, 2), "only the selected layer");
+    }
+
+    /// #440: a layer named after a long file (an imported sound) ran under the row's eye, lock
+    /// and outline toggles. Its name now stops before them and ends in an ellipsis.
+    #[test]
+    fn a_long_layer_name_is_cut_before_the_rows_toggles() {
+        let ctx = egui::Context::default();
+        let long = "Ahhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh Green Screen recording take 12";
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let p = ui.painter();
+            let room = name_room(32.0, 150.0, 0.0);
+            assert_eq!(room, 118.0);
+            let cut = elided_name(p, long, Color32::WHITE, room);
+            assert!(cut.rect.width() <= room + 0.5, "{} wider than {room}", cut.rect.width());
+            assert_eq!(cut.rows.len(), 1);
+            assert!(cut.elided, "the cut is marked, so the name ends in an ellipsis");
+            // A short name is drawn whole, and the mark of selected artwork has its room.
+            let short = elided_name(p, "Ball", Color32::WHITE, room);
+            assert!(!short.elided && short.rect.width() < room);
+            assert_eq!(name_room(32.0, 150.0, 20.0), 98.0);
+            assert_eq!(name_room(140.0, 150.0, 20.0), 0.0, "never negative in a very narrow column");
+        });
+        out.textures_delta.clear();
+    }
 
     fn layers(n: u64) -> Vec<Arc<Layer>> {
         (1..=n).map(|i| Arc::new(Layer::new(LayerId(i), format!("L{i}")))).collect()
@@ -2230,6 +2348,64 @@ mod tests {
         frame(ctx, app, vec![button(at, true, modifiers)], modifiers);
         frame(ctx, app, vec![button(at, false, modifiers)], modifiers);
         settle(ctx, app);
+    }
+
+    /// Where the timeline header's control named `label` is on screen (from the accessibility
+    /// tree): of several with the name, the one beside the current frame.
+    fn control_at(ctx: &egui::Context, app: &mut App, label: &str) -> Pos2 {
+        ctx.enable_accesskit();
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 940.0))), ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+        out.textures_delta.clear();
+        let tree = out.platform_output.accesskit_update.expect("the accessibility tree");
+        let centres = |label: &str| -> Vec<Pos2> {
+            let named = tree.nodes.iter().filter(|(_, n)| n.label() == Some(label)).filter_map(|(_, n)| n.bounds());
+            named.map(|b| Pos2::new(((b.x0 + b.x1) * 0.5) as f32, ((b.y0 + b.y1) * 0.5) as f32)).collect()
+        };
+        let frame = centres("Current frame");
+        assert_eq!(frame.len(), 1, "one current-frame field");
+        centres(label).into_iter().min_by(|a, b| a.distance(frame[0]).total_cmp(&b.distance(frame[0]))).unwrap_or_else(|| panic!("no control named {label}"))
+    }
+    /// Clicks the field named `label`, types `typed` over what it shows and presses Enter.
+    fn type_into(ctx: &egui::Context, app: &mut App, label: &str, typed: &str) {
+        let at = control_at(ctx, app, label);
+        click(ctx, app, at, Modifiers::NONE);
+        frame(ctx, app, vec![Event::Text(typed.to_string())], Modifiers::NONE);
+        frame(ctx, app, vec![Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }], Modifiers::NONE);
+        settle(ctx, app);
+    }
+
+    /// #462 and #461: the timeline's current frame and frame rate are fields. A typed frame
+    /// moves the playhead (past the end: to the last frame); a typed rate is the document's,
+    /// one undo step.
+    #[test]
+    fn the_frame_and_the_frame_rate_are_typed_in_the_timeline_header() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_context(&ctx, anicraft_engine::Session::new(anicraft_engine::doc::sample::demo()), Some(std::path::PathBuf::from("unused.png")));
+        settle(&ctx, &mut app);
+        let frames = app.s.frame_count();
+        assert!(frames > 12, "the sample has frames to go to: {frames}");
+        type_into(&ctx, &mut app, "Current frame", "12");
+        assert_eq!(app.s.frame, 11, "frame 12, counted from one");
+        type_into(&ctx, &mut app, "Current frame", "999999");
+        assert_eq!(app.s.frame, frames - 1, "past the end is the last frame");
+        type_into(&ctx, &mut app, "Current frame", "0");
+        assert_eq!(app.s.frame, 0, "before the start is the first frame");
+        assert!(!app.s.is_dirty(), "moving the playhead changes no document");
+
+        let undo = app.s.history_len();
+        type_into(&ctx, &mut app, "Frame rate", "30");
+        assert_eq!(app.s.doc.stage.fps, 30.0);
+        type_into(&ctx, &mut app, "Frame rate", "12.5 fps");
+        assert_eq!(app.s.doc.stage.fps, 12.5);
+        type_into(&ctx, &mut app, "Frame rate", "9000");
+        assert_eq!(app.s.doc.stage.fps, 120.0, "within the rates a document takes");
+        assert!(app.s.history_len() > undo, "the rate is an undoable edit");
+        assert_eq!(parse_fps("29.97 fps"), Some(29.97));
+        assert_eq!(parse_fps("24"), Some(24.0));
+        assert_eq!(parse_fps("12,5"), Some(12.5));
+        assert_eq!(parse_fps("fps"), None);
+        assert_eq!(parse_fps("NaN"), None);
     }
 
     /// #344: a keyframe moves the way it does in Animate: click it, then drag it. The hand

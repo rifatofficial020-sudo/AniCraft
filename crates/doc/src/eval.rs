@@ -5,12 +5,31 @@ use crate::nine_slice::Slicing;
 use crate::player::PlayerState;
 use crate::{ColorTransform, Document, Element, ElementId, ElementKind, Layer, LayerId, LayerKind, MaskMode, Paint, Rgba, Shape, Stroke, SymbolId, SymbolKind, Timeline, TweenKind};
 use anicraft_geom::walk::PathWalk;
-use anicraft_geom::{Affine, FillRule, Path};
+use anicraft_geom::{Affine, FillRule, Path, Vec2};
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::sync::Arc;
 
 /// Symbols nested deeper than this are not drawn (guards cyclic libraries).
 pub const MAX_SYMBOL_DEPTH: usize = 32;
+
+/// Most elements one evaluation (or one bounds query) visits, nested symbols and groups
+/// included. The depth cap alone leaves a symbol holding two instances of the next, 32 deep,
+/// to expand 2^32 times, which no file may make AniCraft do: past the allowance the rest is
+/// left out, so a hostile or damaged document draws in part instead of hanging or running
+/// out of memory. Real scenes stay far below it (the heaviest benchmark has 50,000 shapes).
+pub const MAX_EVAL_ELEMENTS: u32 = 1_000_000;
+
+/// Takes one visit from `work`; `false` once the allowance is spent.
+pub(crate) fn spend(work: &Cell<u32>) -> bool {
+    match work.get().checked_sub(1) {
+        Some(left) => {
+            work.set(left);
+            true
+        }
+        None => false,
+    }
+}
 
 /// One shape to draw, fully resolved to stage space.
 #[derive(Clone, Debug)]
@@ -163,7 +182,8 @@ pub fn evaluate(doc: &Document, frame: u32) -> DisplayList {
 /// applied: what the stage shows while editing (and what picking and bounds use).
 pub fn evaluate_scene(doc: &Document, scene: usize, frame: u32) -> DisplayList {
     let mut out = DisplayList::default();
-    eval_timeline(doc, doc.timeline(scene), frame, &Ctx::top(Affine::IDENTITY), &mut out, None);
+    let work = Cell::new(MAX_EVAL_ELEMENTS);
+    eval_timeline(doc, doc.timeline(scene), frame, &Ctx::top(Affine::IDENTITY, &work), &mut out, None);
     out
 }
 
@@ -172,7 +192,8 @@ pub fn evaluate_scene(doc: &Document, scene: usize, frame: u32) -> DisplayList {
 /// top-level ones, as a scene's are in [`evaluate_scene`].
 pub fn evaluate_timeline(doc: &Document, tl: &Timeline, frame: u32) -> DisplayList {
     let mut out = DisplayList::default();
-    eval_timeline(doc, tl, frame, &Ctx::top(Affine::IDENTITY), &mut out, None);
+    let work = Cell::new(MAX_EVAL_ELEMENTS);
+    eval_timeline(doc, tl, frame, &Ctx::top(Affine::IDENTITY, &work), &mut out, None);
     out
 }
 
@@ -182,7 +203,8 @@ pub fn evaluate_timeline(doc: &Document, tl: &Timeline, frame: u32) -> DisplayLi
 /// skin or Edit Multiple Frames composes its frames (ADR 0051).
 pub fn evaluate_timeline_at(doc: &Document, tl: &Timeline, frame: u32, xf: Affine) -> DisplayList {
     let mut out = DisplayList::default();
-    eval_timeline(doc, tl, frame, &Ctx::top(xf), &mut out, None);
+    let work = Cell::new(MAX_EVAL_ELEMENTS);
+    eval_timeline(doc, tl, frame, &Ctx::top(xf, &work), &mut out, None);
     out
 }
 
@@ -192,7 +214,8 @@ pub fn evaluate_timeline_at(doc: &Document, tl: &Timeline, frame: u32, xf: Affin
 pub fn evaluate_scene_camera(doc: &Document, scene: usize, frame: u32) -> DisplayList {
     let tl = doc.timeline(scene);
     let mut out = DisplayList::default();
-    eval_timeline(doc, tl, frame, &Ctx::through(tl.camera_at(frame, &doc.stage)), &mut out, None);
+    let work = Cell::new(MAX_EVAL_ELEMENTS);
+    eval_timeline(doc, tl, frame, &Ctx::through(tl.camera_at(frame, &doc.stage), &work), &mut out, None);
     out
 }
 
@@ -201,9 +224,10 @@ pub fn evaluate_scene_camera(doc: &Document, scene: usize, frame: u32) -> Displa
 /// through the scene's camera.
 pub fn evaluate_player(doc: &Document, state: &PlayerState) -> DisplayList {
     let mut out = DisplayList::default();
+    let work = Cell::new(MAX_EVAL_ELEMENTS);
     let play = Play { state, path: Vec::new() };
     let tl = doc.timeline(state.scene);
-    eval_timeline(doc, tl, state.root.frame, &Ctx::through(tl.camera_at(state.root.frame, &doc.stage)), &mut out, Some(&play));
+    eval_timeline(doc, tl, state.root.frame, &Ctx::through(tl.camera_at(state.root.frame, &doc.stage), &work), &mut out, Some(&play));
     out
 }
 
@@ -211,7 +235,8 @@ pub fn evaluate_player(doc: &Document, state: &PlayerState) -> DisplayList {
 /// clip's artwork, as the player sees it when `play` is given.
 pub(crate) fn evaluate_symbol(doc: &Document, tl: &Timeline, frame: u32, xf: Affine, play: Option<&Play<'_>>) -> DisplayList {
     let mut out = DisplayList::default();
-    let mut cx = Ctx::top(xf);
+    let work = Cell::new(MAX_EVAL_ELEMENTS);
+    let mut cx = Ctx::top(xf, &work);
     cx.depth = 1;
     cx.stage = false;
     eval_timeline(doc, tl, frame, &cx, &mut out, play);
@@ -576,7 +601,10 @@ fn interpolate(a: &Element, b: &Element, pr: Progress, morph: bool, hints: &[(an
 
 /// What a timeline is evaluated inside of.
 #[derive(Clone, Copy)]
-struct Ctx {
+struct Ctx<'a> {
+    /// The evaluation's allowance of element visits ([`MAX_EVAL_ELEMENTS`]), shared by everything
+    /// nested in it.
+    work: &'a Cell<u32>,
     /// Local → stage transform and colour effect of the enclosing instance.
     xf: Affine,
     color: ColorTransform,
@@ -603,14 +631,14 @@ struct Ctx {
     slice: Option<Slicing>,
 }
 
-impl Ctx {
-    fn top(xf: Affine) -> Ctx {
-        Ctx { xf, color: ColorTransform::IDENTITY, depth: 0, root: None, outline: None, stage: true, clip: None, masks: None, guide: false, group: None, camera: None, slice: None }
+impl<'a> Ctx<'a> {
+    fn top(xf: Affine, work: &'a Cell<u32>) -> Ctx<'a> {
+        Ctx { work, xf, color: ColorTransform::IDENTITY, depth: 0, root: None, outline: None, stage: true, clip: None, masks: None, guide: false, group: None, camera: None, slice: None }
     }
 
     /// A main timeline seen through `camera`: its tint colours everything.
-    fn through(camera: Option<Camera>) -> Ctx {
-        let mut cx = Ctx::top(Affine::IDENTITY);
+    fn through(camera: Option<Camera>, work: &'a Cell<u32>) -> Ctx<'a> {
+        let mut cx = Ctx::top(Affine::IDENTITY, work);
         cx.stage = false;
         if let Some(c) = camera {
             cx.color = c.color();
@@ -636,22 +664,71 @@ pub fn instance_start(layer: &Layer, frame: u32, id: ElementId, symbol: SymbolId
     start
 }
 
-/// The path a guide layer's first shape traces at `frame`, in the layer's own space.
+/// Most lines of a guide layer that are looked at when joining them into one path.
+const MAX_GUIDE_LINES: usize = 512;
+
+/// How near two line ends are to be one corner of the guide, in the layer's pixels. Lines drawn
+/// with snapping, and the pieces merge drawing cuts a line into, meet much closer than this.
+const GUIDE_JOIN: f32 = 0.75;
+
+/// The path a guide layer traces at `frame`, in the layer's own space: its first shape's line,
+/// continued through every other line on the layer that meets it end to end. A guide drawn as
+/// several strokes (a zigzag made with the Line tool is one raw stroke per straight run, #490)
+/// is one path, sharp corners and all; a closed outline is followed once round.
 pub fn guide_walk(guide: &Layer, frame: u32) -> Option<PathWalk> {
     let (_, els) = evaluate_layer_elements(guide, frame)?;
-    els.iter().find_map(|e| match &e.kind {
-        ElementKind::Shape(s) => {
-            let line = s.path.flatten(&e.transform, 0.25).into_iter().next()?;
-            let mut pts = line.points;
-            if line.closed
-                && let Some(&first) = pts.first()
-            {
-                pts.push(first);
-            }
-            PathWalk::new(&pts)
+    let mut lines = els
+        .iter()
+        .filter_map(|e| match &e.kind {
+            ElementKind::Shape(s) => Some(s.path.flatten(&e.transform, 0.25)),
+            ElementKind::Symbol { .. } | ElementKind::Text(_) | ElementKind::Camera | ElementKind::Group { .. } => None,
+        })
+        .flatten()
+        .filter(|l| l.points.len() >= 2 && l.points.iter().all(|p| p.is_finite()))
+        .take(MAX_GUIDE_LINES);
+    let first = lines.next()?;
+    let mut pts = first.points;
+    if first.closed {
+        // Round and back to its start: nothing joins a closed outline.
+        if let Some(&start) = pts.first() {
+            pts.push(start);
         }
-        ElementKind::Symbol { .. } | ElementKind::Text(_) | ElementKind::Camera | ElementKind::Group { .. } => None,
-    })
+        return PathWalk::new(&pts);
+    }
+    let mut rest: Vec<Vec<Vec2>> = lines.filter(|l| !l.closed).map(|l| l.points).collect();
+    // Grow the path at its end, then at its start, one line at a time (each line is used once,
+    // so this ends after at most `MAX_GUIDE_LINES` joins).
+    let near = |a: Vec2, b: Vec2| a.distance(b) <= GUIDE_JOIN;
+    while let (Some(&head), Some(&tail)) = (pts.first(), pts.last()) {
+        let join = rest.iter().enumerate().find_map(|(i, l)| {
+            let (a, b) = (*l.first()?, *l.last()?);
+            // (which line, joins at the path's end, the line runs backwards)
+            if near(tail, a) {
+                Some((i, true, false))
+            } else if near(tail, b) {
+                Some((i, true, true))
+            } else if near(head, b) {
+                Some((i, false, false))
+            } else if near(head, a) {
+                Some((i, false, true))
+            } else {
+                None
+            }
+        });
+        let Some((i, at_end, backwards)) = join else { break };
+        let mut line = rest.swap_remove(i);
+        if backwards {
+            line.reverse();
+        }
+        if at_end {
+            pts.extend(line.into_iter().skip(1));
+        } else {
+            line.pop();
+            line.extend(pts);
+            pts = line;
+        }
+    }
+    PathWalk::new(&pts)
 }
 
 /// The tweened transform `tw` moved onto the guide: its origin travels from the point on the
@@ -672,7 +749,7 @@ fn follow(g: &PathWalk, orient: bool, from: &Affine, to: &Affine, t: f32, tw: Af
     if out.is_finite() { out } else { tw }
 }
 
-fn eval_timeline(doc: &Document, tl: &Timeline, frame: u32, cx: &Ctx, out: &mut DisplayList, play: Option<&Play<'_>>) {
+fn eval_timeline(doc: &Document, tl: &Timeline, frame: u32, cx: &Ctx<'_>, out: &mut DisplayList, play: Option<&Play<'_>>) {
     if cx.depth > MAX_SYMBOL_DEPTH {
         return;
     }
@@ -716,7 +793,7 @@ fn eval_timeline(doc: &Document, tl: &Timeline, frame: u32, cx: &Ctx, out: &mut 
         let guide = cx.guide || is_guide;
         // A layer guided by a guide layer: its tweens follow the guide's first path.
         let walk = layer.parent.and_then(|p| tl.layer(p)).filter(|g| g.kind == LayerKind::Guide).and_then(|g| guide_walk(g, frame));
-        let Some((kf_start, elements)) = evaluate_shown(layer, frame, walk.as_ref(), doc.stage.fps) else { continue };
+        let shown = evaluate_shown(layer, frame, walk.as_ref(), doc.stage.fps);
         let layer_outline = cx.outline.or(if layer.outline && cx.stage { Some(layer.color) } else { None });
         // Through a camera, each layer is placed by the camera and its own depth (an attached
         // layer stays put); a layer the camera has passed isn't drawn.
@@ -731,6 +808,33 @@ fn eval_timeline(doc: &Document, tl: &Timeline, frame: u32, cx: &Ctx, out: &mut 
             Some(space) => layer_xf.mul(space),
             None => layer_xf,
         };
+        // A reference video (ADR 0116) goes under the layer's artwork: a placeholder with no
+        // paint, marked as guide artwork, so it is in no movie and no export. The stage alone
+        // fills it with the video's frame. Only on the timeline being looked at, never through
+        // a symbol or in mask artwork.
+        if let Some(v) = layer.video.as_deref().filter(|v| cx.depth == 0 && masks.is_none() && v.time_at(frame, doc.stage.fps).is_some()) {
+            out.items.push(DisplayItem {
+                path: Arc::new(Path::rect(0.0, 0.0, v.width as f32, v.height as f32)),
+                transform: layer_xf.mul(&v.transform),
+                fill: None,
+                stroke: None,
+                fill_rule: FillRule::NonZero,
+                color: ColorTransform::alpha(tl.layer_opacity(index)),
+                layer: layer.id,
+                element: v.id,
+                outline: None,
+                clip: None,
+                masks: None,
+                guide: true,
+                group: None,
+                image: None,
+                smooth: true,
+                warp: None,
+            });
+        }
+        let Some((kf_start, elements)) = shown else { continue };
+        // Data bindings (ADR 0118): a table's column in place of a bound instance's property.
+        let elements = doc.bound_elements(elements, frame);
         let lc = LayerCtx { layer, frame, kf_start, clip, masks, guide, outline: layer_outline, xf: layer_xf };
         // A layer below full opacity (its own, or a folder's it is in; ADR 0111) fades as one:
         // its artwork composites in a group, and the group blends at the layer's opacity, so
@@ -767,7 +871,11 @@ struct LayerCtx<'a> {
     xf: Affine,
 }
 
-fn eval_element(doc: &Document, cx: &Ctx, lc: &LayerCtx<'_>, el: &Element, out: &mut DisplayList, play: Option<&Play<'_>>) {
+fn eval_element(doc: &Document, cx: &Ctx<'_>, lc: &LayerCtx<'_>, el: &Element, out: &mut DisplayList, play: Option<&Play<'_>>) {
+    // Every element drawn counts, however deep: see MAX_EVAL_ELEMENTS.
+    if !spend(cx.work) {
+        return;
+    }
     let LayerCtx { layer, frame, kf_start, clip, masks, guide, outline: layer_outline, xf: layer_xf } = *lc;
     // In the player, a symbol instance has its own path, and maybe properties a script set.
     let child = match (&el.kind, play) {
@@ -925,7 +1033,7 @@ fn eval_element(doc: &Document, cx: &Ctx, lc: &LayerCtx<'_>, el: &Element, out: 
             };
             // A symbol with 9-slice guides, scaled: its shapes are sliced (ADR 0055).
             let slice = crate::nine_slice::slicing(doc, sym, &el.transform).map(|s| Slicing { post: layer_xf.mul(&s.post), ..s });
-            let inner = Ctx { xf, color, depth: cx.depth + 1, root: Some((root_layer, root_el)), outline: layer_outline, stage: cx.stage, clip, masks, guide, group, camera: None, slice };
+            let inner = Ctx { work: cx.work, xf, color, depth: cx.depth + 1, root: Some((root_layer, root_el)), outline: layer_outline, stage: cx.stage, clip, masks, guide, group, camera: None, slice };
             eval_timeline(doc, &sym.timeline, local, &inner, out, child.as_ref());
         }
     }
@@ -981,6 +1089,11 @@ fn field_items(t: &crate::TextBlock, f: &crate::TextField, live: Option<(Option<
     // The text: laid out by the player when it changed, else the authored outline (a field whose
     // text changed but couldn't be laid out shows none).
     match (state.and_then(|s| s.text.as_ref()), look) {
+        (_, Some(l)) if !l.pieces.is_empty() => {
+            for (color, piece) in l.pieces.iter() {
+                out.items.push(item(piece.clone(), text_xf, Some(Paint::Solid(*color)), None, Some(inner), None));
+            }
+        }
         (_, Some(l)) => out.items.push(item(l.outline.clone(), text_xf, Some(Paint::Solid(t.color)), None, Some(inner), None)),
         (None, None) => text_fills(t, out, |path, color| item(path, text_xf, Some(Paint::Solid(color)), None, Some(inner), None)),
         (Some(_), None) => {}

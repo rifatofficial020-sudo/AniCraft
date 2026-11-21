@@ -139,6 +139,7 @@ fn kind_rank(doc: &Document, e: LibraryEntry) -> u8 {
         },
         LibraryEntry::Item(LibraryItem::Bitmap(_)) => 4,
         LibraryEntry::Item(LibraryItem::Sound(_)) => 5,
+        LibraryEntry::Item(LibraryItem::Data(_)) => 6,
     }
 }
 
@@ -162,6 +163,7 @@ fn detail(doc: &Document, e: LibraryEntry) -> String {
         }),
         LibraryEntry::Item(LibraryItem::Bitmap(id)) => doc.bitmap(id).map_or_else(String::new, |b| tr!("Bitmap · {width}×{height}", width = b.width, height = b.height)),
         LibraryEntry::Item(LibraryItem::Sound(id)) => doc.sound(id).map_or_else(String::new, |x| tr!("Sound · {seconds} s", seconds = format!("{:.1}", x.seconds()))),
+        LibraryEntry::Item(LibraryItem::Data(id)) => doc.data_table(id).map_or_else(String::new, crate::data_ui::table_detail),
     }
 }
 
@@ -531,6 +533,7 @@ fn list_ui(app: &mut App, ui: &mut egui::Ui, list: &[Row], unused: &HashSet<Libr
                 }
                 LibraryEntry::Item(LibraryItem::Sound(_)) => icons::paint(p, icon.expand(1.0), Icon::Sound, color(Type::Body)),
                 LibraryEntry::Item(LibraryItem::Bitmap(_)) => icons::paint(p, icon.expand(1.0), Icon::Image, color(Type::Body)),
+                LibraryEntry::Item(LibraryItem::Data(_)) => crate::data_ui::paint_table_icon(p, icon, color(Type::Body)),
             }
             let name_rect = Rect::from_min_max(pos2(icon.right() + 8.0, r.top()), pos2(r.right() - 40.0, r.bottom()));
             let uses_text = row.uses.map(|n| n.to_string()).unwrap_or_default();
@@ -674,6 +677,8 @@ fn list_ui(app: &mut App, ui: &mut egui::Ui, list: &[Row], unused: &HashSet<Libr
             LibraryEntry::Item(LibraryItem::Symbol(id)) => {
                 app.run("symbol.edit", json!({"symbol": id.0}));
             }
+            // A data table opens in the table viewer (ADR 0118).
+            LibraryEntry::Item(LibraryItem::Data(id)) => app.data_view = Some(id),
             LibraryEntry::Item(i) => place(app, i),
             LibraryEntry::Folder(f) => {
                 if !app.library.expanded.remove(&f) {
@@ -714,7 +719,15 @@ fn row_menu(app: &mut App, ui: &mut egui::Ui, e: LibraryEntry) {
             }
         }
     }
-    let items = selected_items(app);
+    if let LibraryEntry::Item(LibraryItem::Data(id)) = e
+        && !many
+        && ui.button(tr!("View Table")).clicked()
+    {
+        ui.close();
+        app.data_view = Some(id);
+    }
+    // (A data table isn't artwork: it is bound, not placed.)
+    let items: Vec<LibraryItem> = selected_items(app).into_iter().filter(|i| !matches!(i, LibraryItem::Data(_))).collect();
     if !items.is_empty() {
         let label = if items.iter().all(|i| matches!(i, LibraryItem::Sound(_))) { tr!("Place on Timeline") } else { tr!("Place on Stage") };
         if ui.button(label).on_hover_text(tr!("At the centre of the view, on the active layer (Enter; or drag onto the stage)")).clicked() {
@@ -772,6 +785,14 @@ fn actions_row(app: &mut App, ui: &mut egui::Ui) {
         {
             items.push(i);
         }
+        // A data table isn't artwork: it is viewed and bound, not placed (ADR 0118).
+        if let [LibraryItem::Data(id)] = items.as_slice() {
+            if ui.button(tr!("View Table")).on_hover_text(tr!("Shows every row and column (or double-click the table in the list)")).clicked() {
+                app.data_view = Some(*id);
+            }
+            return;
+        }
+        items.retain(|i| !matches!(i, LibraryItem::Data(_)));
         if !items.is_empty() && items.iter().all(|i| matches!(i, LibraryItem::Sound(_))) {
             if ui.button(tr!("Place on timeline")).on_hover_text(tr!("Puts it on the active layer's keyframe at the playhead (Enter, or drag it onto the stage)")).clicked() {
                 place_items(app, &items, None);
@@ -826,6 +847,7 @@ fn properties(app: &mut App, ui: &mut egui::Ui) {
                 with_type(ui, Type::Data, |ui| ui.label(text(Type::Caption, info)));
             }
         }
+        LibraryItem::Data(id) => crate::data_ui::library_properties(app, ui, id),
     }
 }
 
@@ -844,6 +866,8 @@ fn preview(app: &mut App, ui: &mut egui::Ui) {
     };
     let inner = r.shrink(6.0);
     match item {
+        // A data table (ADR 0118): its first rows.
+        LibraryItem::Data(id) => crate::data_ui::preview(app, ui, inner, id),
         LibraryItem::Sound(id) => {
             waveform(app, ui, inner, id);
             let play = Rect::from_min_size(pos2(r.right() - TARGET - 4.0, r.top() + 4.0), vec2(TARGET, TARGET));
@@ -915,7 +939,7 @@ fn picture(ctx: &egui::Context, doc: &Document, item: LibraryItem, area: Rect) -
             let options = if b.smoothing { egui::TextureOptions::LINEAR } else { egui::TextureOptions::NEAREST };
             Some(ctx.load_texture("library-preview", image, options))
         }
-        LibraryItem::Sound(_) => None,
+        LibraryItem::Sound(_) | LibraryItem::Data(_) => None,
     }
 }
 

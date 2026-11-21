@@ -64,9 +64,19 @@ fn selected_instance(app: &App) -> Option<(Element, SymbolKind)> {
     (kind != SymbolKind::Graphic).then(|| ((**e).clone(), kind))
 }
 
+/// The selected input text field, if exactly one element is selected and it is one (ADR 0107):
+/// its change event is edited where an instance's events are.
+fn selected_input(app: &App) -> Option<Element> {
+    let sel = app.s.selected_elements();
+    let [(_, e)] = sel.as_slice() else { return None };
+    let ElementKind::Text(t) = &e.kind else { return None };
+    t.field.as_ref().is_some_and(|f| f.kind == anicraft_engine::doc::TextKind::Input).then(|| (**e).clone())
+}
+
 /// The panel's contents, wherever it is.
 pub fn panel(app: &mut App, ui: &mut egui::Ui) {
     let inst = selected_instance(app);
+    let input = if inst.is_none() { selected_input(app) } else { None };
     ui.horizontal_wrapped(|ui| {
         if ui.selectable_label(app.actions.tab == Tab::Frame, tr!("Frame")).on_hover_text(tr!("What runs when the playhead enters a keyframe")).clicked() {
             app.actions.tab = Tab::Frame;
@@ -78,9 +88,13 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
                 (false, true) => tr!("Movie clip (unnamed)").to_string(),
                 (false, false) => tr!("Movie clip “{name}”", name = e.name),
             },
-            None => tr!("Instance").to_string(),
+            None => match &input {
+                Some(e) if e.name.is_empty() => tr!("Input text (unnamed)").to_string(),
+                Some(e) => tr!("Input text “{name}”", name = e.name),
+                None => tr!("Instance").to_string(),
+            },
         };
-        let r = ui.add_enabled(inst.is_some(), egui::Button::selectable(app.actions.tab == Tab::Instance, label)).on_hover_text(tr!("What the selected button or movie clip does on clicks and the pointer"));
+        let r = ui.add_enabled(inst.is_some() || input.is_some(), egui::Button::selectable(app.actions.tab == Tab::Instance, label)).on_hover_text(tr!("What the selected button or movie clip does on clicks and the pointer"));
         let r = r.on_disabled_hover_text(tr!("Select one button or movie clip instance on the stage"));
         if r.clicked() {
             app.actions.tab = Tab::Instance;
@@ -89,9 +103,12 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
     ui.separator();
     match (app.actions.tab, inst) {
         (Tab::Instance, Some((e, _))) => instance_tab(app, ui, &e),
-        (Tab::Instance, None) => {
-            ui.label(text(Type::Caption, tr!("Select one button or movie clip instance on the stage to give it events (a graphic can't have them: set its symbol's Type in Properties).")));
-        }
+        (Tab::Instance, None) => match input {
+            Some(e) => input_tab(app, ui, &e),
+            None => {
+                ui.label(text(Type::Caption, tr!("Select one button or movie clip instance on the stage to give it events (a graphic can't have them: set its symbol's Type in Properties). An input text field has a change event.")));
+            }
+        },
         (Tab::Frame, _) => frame_tab(app, ui),
     }
 }
@@ -613,6 +630,37 @@ fn instance_tab(app: &mut App, ui: &mut egui::Ui, e: &Element) {
                 }
             }
         });
+    }
+}
+
+/// An input text field's one event (ADR 0107): what it does each time the viewer changes its
+/// text.
+fn input_tab(app: &mut App, ui: &mut egui::Ui, e: &Element) {
+    let ElementKind::Text(t) = &e.kind else { return };
+    let Some(f) = &t.field else { return };
+    let doc = app.s.doc.clone();
+    let tl = app.s.timeline().clone();
+    let cx = Choices::new(&doc, &tl, true);
+    ui.label(text(Type::Caption, tr!("Runs each time the viewer changes the field's text, on the timeline the field is on. Scripts hear the same event with addEventListener(Event.CHANGE, …).")));
+    ui.add_space(6.0);
+    if f.on_change.is_empty() {
+        if ui.button(tr!("Add change event")).on_hover_text(tr!("Do something each time the viewer types in this field")).clicked() {
+            let first = Action::Play { target: Target::this() };
+            app.run("actions.set", json!({"element": e.id.0, "event": "change", "actions": [first]}));
+        }
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.label(text(Type::Body, tr!("On change")).strong()).on_hover_text(tr!("The viewer changed the field's text"));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button(tr!("Remove event")).clicked() {
+                app.run("actions.clear", json!({"element": e.id.0, "event": "change"}));
+                app.status_ok(tr!("Removed the change event — {undo} to undo", undo = app.undo_key()));
+            }
+        });
+    });
+    if let Some((new, live)) = edit_list(ui, "change", &f.on_change, &cx) {
+        run(app, live, tr_noop!("Edit event"), "actions.set", json!({"element": e.id.0, "event": "change", "actions": new}));
     }
 }
 

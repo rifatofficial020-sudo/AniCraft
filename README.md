@@ -182,8 +182,12 @@ and answers with its status, `{"id": 1, "ok": true, "result": {}, "revision": 7,
 Register the MCP server with Claude Code:
 
 ```sh
-claude mcp add anicraft -- /path/to/anicraft-cli mcp
+claude mcp add anicraft -- /path/to/anicraft-cli mcp \
+  --automation-read-root /path/to/project --automation-write-root /path/to/project
 ```
+
+The two folders are required: the assistant's commands read files only inside the first and
+write only inside the second.
 
 The details, including the server entry for other MCP clients, are in [`docs/mcp.md`](docs/mcp.md).
 

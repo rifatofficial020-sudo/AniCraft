@@ -236,6 +236,32 @@ The CPU stage (the oracle through the render service's 256 px tiles, `onion_timi
 frames 12, 30 and 48) with hairlines: onion ±5 outlines **17.1 ms** against 14.8 tinted at
 1080p (was 34–39 against 16.2–17.2).
 
+### Gradient selection stipple (#295)
+
+The selection overlay inverts the artwork's 256-entry gradient ramp with alpha ignored. It
+checks the colour range and midpoint of each 64-device-pixel strip before testing the pixels
+covered by dots. Sharp lookup transitions and a possible radial minimum inside a strip trigger
+refinement. One frame shares a limit of 131,072 pixel probes and 16,384 extra rectangles over
+all gradient fills. Each fill reserves some of its allowance for later scanline spans.
+
+After a span or frame uses its allowance, the remaining strips blend their corner colours.
+This keeps the entire selected area covered. Some narrow transitions can be softened or missed
+on busy fills. Features missing from the artwork's lookup table also stay out of the stipple.
+
+Two optimized CPU benchmark runs used identical pre-clipped 3840 × 2160 spans, with 31 timed
+mesh builds per implementation after warm-up. The 14-stop elliptical radial had an offset
+focal point, two clusters of close stops, a 31° rotation, and non-uniform scale. Times are the
+range of the two medians and include mesh allocation. Span preparation and drawing are outside
+the timings.
+
+| Spread | Original mesh | Pixel-by-pixel adaptive mesh | Bounded mesh |
+|---|---:|---:|---:|
+| Pad | 32,460 rectangles, 9.1–10.7 ms | 54,992 rectangles, 106.2–126.2 ms | 48,405 rectangles, 10.5–12.3 ms |
+| Reflect | 32,460 rectangles, 15.2–18.9 ms | 68,675 rectangles, 211.2–225.2 ms | 48,844 rectangles, 18.5–22.1 ms |
+
+The bounded mesh took 1.15–1.21× the original CPU time in these runs. The reflected fill can
+still exceed a 60 fps frame budget on this machine.
+
 ### How budgets are enforced
 
 * **Budgets that don't depend on the machine** (undo memory, snapshot sharing, file size,

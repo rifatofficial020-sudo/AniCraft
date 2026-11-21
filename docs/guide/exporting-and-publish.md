@@ -14,6 +14,7 @@ On a Mac, read **⌘** wherever this chapter says **Ctrl** (so **Ctrl+Shift+F12*
 | PNG image | **Export Frame as PNG…** | A still of the current frame |
 | SVG image | **Export Frame as SVG…** | A still of the current frame as a vector drawing |
 | PNG sequence | **Export PNG Sequence…** | One PNG per frame, for compositing and editing tools |
+| SVG sequence | **Export SVG Sequence…** | One SVG per frame (`frame_00001.svg`, …), for programs that read vector frames |
 | Animated GIF | **Export Animated GIF…** | Short loops anywhere; 256 colours |
 | Animated PNG | **Export Animated PNG…** | Full colour and real transparency, for the web and chat apps |
 | Animated WebP | **Export Animated WebP…** | Like animated PNG, lossless and usually smaller |
@@ -39,8 +40,8 @@ current frame for PNG and SVG stills. To choose frames, scale, looping or a back
 **Publish Settings** (below): you can turn on just the one format you need.
 
 If the file is already there, AniCraft asks before replacing it. A sprite sheet asks if either
-the PNG or its frame map is there, and a PNG sequence asks if the folder already holds exported
-frames.
+the PNG or its frame map is there, and a PNG or SVG sequence asks if the folder already holds
+exported frames of its kind.
 
 ## Notes on each format
 

@@ -33,6 +33,7 @@ mod colour;
 mod colour_panel;
 mod envelope;
 mod find_panel;
+mod font_fallback;
 mod publish_panel;
 mod erasertool;
 mod bind_tool;
@@ -41,10 +42,12 @@ mod bone_tool;
 mod camera_tool;
 mod context_help;
 mod convert_symbol;
+mod data_ui;
 mod layer_depth;
 mod layer_props;
 mod desktop_ui;
 mod dialogs;
+mod doc_settings;
 mod dock;
 mod dock_float;
 mod dock_ui;
@@ -97,9 +100,11 @@ mod start;
 mod startup;
 mod templates;
 mod test_movie;
+mod video_import;
 mod theme;
 mod theme_file;
 mod timeline;
+mod trace_dialog;
 #[cfg(target_arch = "wasm32")]
 mod web;
 mod widthtool;
@@ -299,7 +304,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
 /// `--help` (the console's text, in English).
 #[cfg(not(target_arch = "wasm32"))]
 // i18n-exempt: the --help console text
-const HELP: &str = "anicraft [file.anicraft|file.fla|file.xfl] [--version] [--screenshot out.png [--shot-width <px>]] [--renderer gl|wgpu|vulkan|dx12|metal] [--theme dark|light|high-contrast|<file>.json] [--check-theme <file>.json] [--scale <percent>] [--lang <code>|auto|pseudo] [--control <port>] [--open palette|shortcuts|helpbone|lastscene|start|drop|droplibrary|select|selectzoom|about|files|confirm|transform|shapecommands|expandfill|softenfill|origins|pivot|layeropacity|points|merge|rawparts|rawedit|rawsub|rawpoints|rawsnap|rulers|editguides|editgrid|symboledit|groups|combine|nineslice|nineslicedit|brush|brushing|polystar|paintinside|drawingedit|shapeenvelope|brushlibrary|brushcurve|paintbrush|eraser|erasing|erasemerge|tiltbrush|eyedropper|pen|frames|span|bucket|tlzoom|tlwide|motion|motionspan|motionpath|motionpoints|motionedit|motionpins|motionpinsspan|hints|hintsend|camera|cameraview|bones|springbones|shapebones|shapeweights|mixedbones|layerdepth|layerdepthview|filters|strokes|prefs|licenses|zoom|recovery|plugins|actions|script|scriptproblems|testmovie|testmovieinside|testscript|textfields|testtext|richtext|softmask|pathtext|button|testhits|exporthtml|publish|publishreport|publishanim|sound|envelope|ease|easepreset|plugineases|pluginexport|pluginexportwindow|library|librarymenu|libraryfolders|colour|layerprops|frameview|layercolour|timelinepolish|dock|dockicons|floattabs|docknarrow|workspaces|animator|designer|gradient|gradientbucket|swatches|swatchpanel]\n\
+const HELP: &str = "anicraft [file.anicraft|file.fla|file.xfl] [--version] [--screenshot out.png [--shot-width <px>]] [--renderer gl|wgpu|vulkan|dx12|metal] [--theme dark|light|high-contrast|<file>.json] [--check-theme <file>.json] [--scale <percent>] [--lang <code>|auto|pseudo] [--control <port>] [--open palette|shortcuts|helpbone|lastscene|start|drop|droplibrary|select|selectzoom|about|files|confirm|transform|shapecommands|expandfill|softenfill|tracebitmap|docsettings|origins|pivot|layeropacity|points|merge|rawparts|rawedit|rawsub|rawpoints|rawsnap|rulers|editguides|editgrid|symboledit|groups|combine|nineslice|nineslicedit|brush|brushing|polystar|paintinside|drawingedit|shapeenvelope|brushlibrary|brushcurve|paintbrush|eraser|erasing|erasemerge|tiltbrush|eyedropper|pen|frames|span|bucket|tlzoom|tlwide|motion|motionspan|motionpath|motionpoints|motionedit|motionpins|motionpinsspan|hints|hintsend|camera|cameraview|bones|springbones|shapebones|shapeweights|mixedbones|layerdepth|layerdepthview|filters|strokes|prefs|licenses|zoom|recovery|plugins|actions|script|scriptproblems|testmovie|testmovieinside|testscript|textfields|testtext|htmltext|embedfield|richtext|softmask|pathtext|pathedit|button|testhits|exporthtml|publish|publishreport|publishanim|sound|envelope|ease|easepreset|plugineases|pluginexport|pluginexportwindow|library|librarymenu|libraryfolders|colour|layerprops|frameview|layercolour|timelinepolish|dock|dockicons|floattabs|docknarrow|workspaces|animator|designer|gradient|gradientbucket|swatches|swatchpanel|video|videoimport|datachart|datatable]\n\
      --renderer   the window's graphics (also ANICRAFT_RENDERER); default automatic, falling back to OpenGL\n\
      --theme      a built-in look, or a theme file of your own, for this run only\n\
      --check-theme  says whether a theme file would be used (exit 0) or why it is refused (exit 1)\n\
@@ -513,6 +518,8 @@ mod rulers_tests;
 mod retime_ui_tests;
 #[cfg(test)]
 mod layer_ui_tests;
+#[cfg(test)]
+mod video_import_tests;
 #[cfg(test)]
 mod parenting_ui_tests;
 #[cfg(test)]

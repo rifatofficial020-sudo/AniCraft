@@ -1029,7 +1029,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         let start = app.s.doc.scene_start(app.s.scene);
         let frame = app.s.frame;
         // Inside a symbol open in place, onion skin composes the symbol's own frames (ADR 0051).
-        let jobs: Vec<(TileSpec, FrameJob)> = visible.into_iter().map(|t| { let j = make_job_for(raster, state, &pic.doc, pic.frame, t.view, onion).through_camera(preview).inside(pic.front.clone()); (t, j) }).collect();
+        // Reference videos (ADR 0116): their pictures for this frame, on the stage alone. The
+        // ones not decoded yet are on their way, and bring a repaint.
+        let reference = crate::video_import::stage_frames(app, ui.ctx(), &pic.doc, pic.frame, true);
+        let jobs: Vec<(TileSpec, FrameJob)> = visible.into_iter().map(|t| { let j = make_job_for(raster, state, &pic.doc, pic.frame, t.view, onion).through_camera(preview).inside(pic.front.clone()).with_reference(reference.clone()); (t, j) }).collect();
         let keys: Vec<u64> = jobs.iter().map(|(_, j)| j.key).collect();
         let missing: Vec<usize> = (0..jobs.len()).filter(|&i| !app.stage_cache.has(keys[i])).collect();
 
@@ -1094,10 +1097,12 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 let n = app.s.frame_count().max(1);
                 for d in 1..=LOOKAHEAD.min(n - 1) {
                     let f = (frame + d) % n;
-                    ahead.extend(jobs.iter().map(|(t, _)| make_job_for(raster, state, &app.s.doc, start + f, t.view, None).through_camera(preview)));
+                    // With the pictures already decoded for that frame (none are asked for).
+                    let then = anicraft_engine::video::shown(&app.video, &app.s.doc, start + f, false).frames;
+                    ahead.extend(jobs.iter().map(|(t, _)| make_job_for(raster, state, &app.s.doc, start + f, t.view, None).through_camera(preview).with_reference(then.clone())));
                 }
             } else {
-                ahead.extend(tiles_for(z, stage_px, px, 1, bg, pasteboard).into_iter().filter(|t| !jobs.iter().any(|(v, _)| v.rect == t.rect)).map(|t| make_job_for(raster, state, &pic.doc, pic.frame, t.view, onion).through_camera(preview)));
+                ahead.extend(tiles_for(z, stage_px, px, 1, bg, pasteboard).into_iter().filter(|t| !jobs.iter().any(|(v, _)| v.rect == t.rect)).map(|t| make_job_for(raster, state, &pic.doc, pic.frame, t.view, onion).through_camera(preview).with_reference(reference.clone())));
             }
             svc.prefetch(ahead);
         }
@@ -1205,6 +1210,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         let mut backing = egui::Mesh::default();
         let mut dots = egui::Mesh::default();
         let mut budget = MAX_DOTS;
+        let mut gradient_budget = GradientMeshBudget::default();
         let dl = app.s.display_list();
         let mut occluders = Occluders::of(&dl, &to_px, canvas, gap);
 
@@ -1264,6 +1270,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                         &fills,
                         &gradient,
                         gap,
+                        &mut gradient_budget,
                     );
                 } else {
                     pattern_mesh(&mut pattern, &fills, fill_colour, gap);
@@ -1834,6 +1841,9 @@ fn selection_backing_colour(
 
 struct SelectionGradient {
     shader: anicraft_engine::render::paint::Shader,
+    colours: [Color32; 256],
+    sharp_edges: [u8; 256],
+    spread: anicraft_engine::doc::Spread,
 }
 
 impl SelectionGradient {
@@ -1841,46 +1851,101 @@ impl SelectionGradient {
         item: &anicraft_engine::doc::DisplayItem,
         to_screen: &Affine,
     ) -> Option<Self> {
+        use anicraft_engine::doc::{Rgba, Spread};
+        use anicraft_engine::render::paint::Shader;
+
         let mut paint = item.fill.as_ref()?.clone();
-
-        if !paint.is_gradient() {
-            return None;
-        }
-
-        // Selection dots use original RGB independently of alpha.
+        // Keep the RGB even when a stop is fully transparent, including on a collapsed fill.
         for stop in paint.stops_mut()? {
             stop.color.a = 1.0;
         }
-
-        let shader = anicraft_engine::render::paint::Shader::new(
-            &paint,
-            to_screen,
-            &item.color.without_alpha(),
-            None,
-        );
-
-        Some(Self { shader })
+        let shader = Shader::new(&paint, to_screen, &item.color.without_alpha(), None);
+        let invert = |[r, g, b, _]: [f32; 4]| {
+            let c = to_color32(Rgba::new(r, g, b, 1.0));
+            crate::theme::artwork_rgb(255 - c.r(), 255 - c.g(), 255 - c.b())
+        };
+        let (colours, spread) = match &shader {
+            Shader::Linear { lut, spread, .. } | Shader::Radial { lut, spread, .. } => (lut.map(invert), *spread),
+            Shader::Solid(c) => ([invert(*c); 256], Spread::Pad),
+            _ => return None,
+        };
+        // Prefix sum lets a strip check all lookup entries in its range in constant time.
+        let mut sharp_edges = [0; 256];
+        let mut count = 0;
+        for (edge, pair) in sharp_edges.iter_mut().skip(1).zip(colours.windows(2)) {
+            count += u8::from(rgb_difference(pair[0], pair[1]) >= 8);
+            *edge = count;
+        }
+        Some(Self { shader, colours, sharp_edges, spread })
     }
 
-
+    #[cfg(test)]
     fn colour_at(&self, p: Pos2) -> Color32 {
-        let [r, g, b, _] = self.shader.at(
-            p.x.floor() as i32,
-            p.y.floor() as i32,
-        );
-
-        let rgb = anicraft_engine::doc::Rgba::new(
-            r, g, b, 1.0,
-        );
-
-        let original = to_color32(rgb);
-
-        crate::theme::artwork_rgb(
-            255 - original.r(),
-            255 - original.g(),
-            255 - original.b(),
-        )
+        self.lookup(self.position(p))
     }
+
+    #[inline]
+    fn position(&self, p: Pos2) -> f32 {
+        use anicraft_engine::render::paint::{Shader, focal_t};
+        let p = Vec2::new(p.x, p.y);
+        match &self.shader {
+            Shader::Linear { inv, start, dir, .. } => (inv.apply(p) - *start).dot(*dir),
+            Shader::Radial { inv, center, inv_radius, focal, .. } => focal_t((inv.apply(p) - *center) * *inv_radius, *focal),
+            _ => 0.0,
+        }
+    }
+
+    #[inline]
+    fn index(&self, position: f32) -> usize {
+        // The CPU renderer and GPU stage both round to the nearest of the 256 entries.
+        (self.spread.apply(position) * 255.0 + 0.5) as usize & 255
+    }
+
+    #[inline]
+    fn lookup(&self, position: f32) -> Color32 {
+        self.colours[self.index(position)]
+    }
+
+    fn crosses_sharp_edge(&self, low: f32, high: f32) -> bool {
+        use anicraft_engine::doc::Spread;
+        // Only a strip crossing a repeat seam or a reflection turn needs to check both sides.
+        (self.spread != Spread::Pad && low.floor() != high.floor())
+            || self.sharp_edges[self.index(low)] != self.sharp_edges[self.index(high)]
+    }
+
+    /// The gradient coordinate at the strip centre and a lower bound over the strip.
+    /// Both linear and focal radial coordinates are convex, so the centre's tangent is
+    /// a lower bound. This catches small radial features even if every corner misses them.
+    fn centre_and_lower_bound(&self, strip: Rect) -> (f32, f32) {
+        use anicraft_engine::render::paint::Shader;
+        let centre = strip.center();
+        let p = Vec2::new(centre.x, centre.y);
+        let (t, slope) = match &self.shader {
+            Shader::Linear { inv, start, dir, .. } => ((inv.apply(p) - *start).dot(*dir), *dir),
+            Shader::Radial { inv, center, inv_radius, focal, .. } => {
+                let u = (inv.apply(p) - *center) * *inv_radius;
+                let d = u - Vec2::new(*focal, 0.0);
+                let k = 1.0 - focal * focal;
+                let fd = focal * d.x;
+                let root = (fd * fd + k * d.dot(d)).sqrt();
+                if root <= 1e-8 {
+                    return (0.0, 0.0);
+                }
+                ((fd + root) / k, Vec2::new((focal + d.x / root) / k, d.y / root) * *inv_radius)
+            }
+            _ => return (0.0, 0.0),
+        };
+        let (Shader::Linear { inv, .. } | Shader::Radial { inv, .. }) = &self.shader else { return (t, t) };
+        let [a, b, c, d, _, _] = inv.m;
+        let x = slope.dot(Vec2::new(a, b)).abs() * strip.width();
+        let y = slope.dot(Vec2::new(c, d)).abs() * strip.height();
+        (t, t - (x + y) * 0.5)
+    }
+}
+
+#[inline]
+fn rgb_difference(a: Color32, b: Color32) -> u8 {
+    a.r().abs_diff(b.r()).max(a.g().abs_diff(b.g())).max(a.b().abs_diff(b.b()))
 }
 
 /// Animate-style selection pattern: staggered two-point dots on an
@@ -1927,66 +1992,194 @@ fn pattern_mesh(
     colour: Color32,
     gap: f32,
 ) {
-    let tile = 2.0 * gap;
-    let uv = |p: Pos2| {
-        pos2(
-            (p.x + gap * 0.5) / tile,
-            (p.y + gap * 0.5) / tile,
-        )
-    };
-
     for r in spans {
         mesh.add_rect_with_uv(
             *r,
-            Rect::from_min_max(uv(r.min), uv(r.max)),
+            Rect::from_min_max(pattern_uv(r.min, gap), pattern_uv(r.max, gap)),
             colour,
         );
     }
 }
 
+fn pattern_uv(p: Pos2, gap: f32) -> Pos2 {
+    let tile = 2.0 * gap;
+    pos2((p.x + gap * 0.5) / tile, (p.y + gap * 0.5) / tile)
+}
+
+/// Which cell of the repeating dot tile contains this device pixel, along one axis.
+fn dot_cell(pixel: i32) -> Option<i32> {
+    let step = GAP as i32;
+    let half_dot = step / 4;
+    let phase = (pixel.rem_euclid(2 * step) + half_dot) % (2 * step);
+    (phase % step < 2 * half_dot).then_some(phase / step)
+}
+
+const GRADIENT_PROBE_BUDGET: usize = 131_072;
+const GRADIENT_SPLIT_BUDGET: usize = 16_384;
+
+/// Shared by all gradient fills in the frame. Base strips remain visible after refinement runs out.
+struct GradientMeshBudget {
+    probes: usize,
+    splits: usize,
+}
+
+impl Default for GradientMeshBudget {
+    fn default() -> Self {
+        Self { probes: GRADIENT_PROBE_BUDGET, splits: GRADIENT_SPLIT_BUDGET }
+    }
+}
 
 fn gradient_pattern_mesh(
     mesh: &mut egui::Mesh,
     spans: &[Rect],
     gradient: &SelectionGradient,
     gap: f32,
+    budget: &mut GradientMeshBudget,
 ) {
-    // Subdivide each scanline into manageable strips.
-    // Vertex colours interpolate across each strip.
+    use anicraft_engine::doc::Spread;
+
     const STRIP_GAPS: f32 = 16.0;
     let strip_width = gap * STRIP_GAPS;
+    let pixel = gap / GAP;
+    let first_pixel = |edge: f32| (edge / pixel - 0.5).ceil() as i32;
+    let mut samples = Vec::new();
+    let mut dot_rows = Vec::new();
 
-    for span in spans {
+    for (span_index, span) in spans.iter().enumerate() {
+        // Reserve a share for later rows. Unused work carries forward through the fill.
+        let remaining_spans = spans.len() - span_index;
+        let mut row_budget = GradientMeshBudget {
+            probes: budget.probes.div_ceil(remaining_spans),
+            splits: budget.splits.div_ceil(remaining_spans),
+        };
+        let starting_probes = row_budget.probes;
+        let starting_splits = row_budget.splits;
+        dot_rows.clear();
+        dot_rows.extend((first_pixel(span.top())..first_pixel(span.bottom()))
+            .filter_map(|y| Some((dot_cell(y)?, (y as f32 + 0.5) * pixel))));
         let mut left = span.min.x;
-
         while left < span.max.x {
             let right = (left + strip_width).min(span.max.x);
             if right <= left {
                 break;
             }
 
-            let strip = Rect::from_min_max(
-                pos2(left, span.min.y),
-                pos2(right, span.max.y),
-            );
-
-            // Reuse the existing screen-anchored texture mapping.
-            let first_vertex = mesh.vertices.len();
-            pattern_mesh(
-                mesh,
-                std::slice::from_ref(&strip),
-                Color32::WHITE,
-                gap,
-            );
-
-            // Tint each corner using the gradient at that position.
-            // egui interpolates vertex colours across the rectangle.
-            for vertex in &mut mesh.vertices[first_vertex..] {
-                vertex.color = gradient.colour_at(vertex.pos);
+            let strip = Rect::from_x_y_ranges(left..=right, span.y_range());
+            left = right;
+            let corners = strip_corners(strip);
+            let (middle, lower) = gradient.centre_and_lower_bound(strip);
+            // A large part of a padded radial fill is often the flat colour outside its ring.
+            if gradient.spread == Spread::Pad && lower >= 1.0 {
+                gradient_quad(mesh, corners, [gradient.colours[255]; 4], gap);
+                continue;
+            }
+            let positions = corners.map(|p| gradient.position(p));
+            let colours = positions.map(|t| gradient.lookup(t));
+            let first = first_pixel(strip.left());
+            let end = first_pixel(strip.right());
+            // Each physical row contains two lit pixels per eight-pixel tile.
+            let columns = (end - first) as usize;
+            let tile = 2 * GAP as usize;
+            let max_probes = (columns / tile * 2 + (columns % tile).min(2)) * dot_rows.len();
+            if row_budget.splits == 0 || row_budget.probes < max_probes {
+                gradient_quad(mesh, corners, colours, gap);
+                continue;
+            }
+            // The upper bound of a convex gradient coordinate is at a corner. Check for a
+            // sharp lookup edge, a hidden radial minimum, or a nonlinear midpoint.
+            let low_corner = positions.into_iter().fold(middle, f32::min);
+            let upper = positions.into_iter().fold(middle, f32::max);
+            let midpoint_error = gradient.lookup(middle).to_array().into_iter()
+                .zip(colours[1].to_array().into_iter().zip(colours[2].to_array()))
+                .any(|(actual, (a, b))| actual.abs_diff(a.midpoint(b)) >= 8);
+            if !gradient.crosses_sharp_edge(lower, upper) && !midpoint_error
+                && rgb_difference(gradient.lookup(lower), gradient.lookup(low_corner)) < 8
+            {
+                gradient_quad(mesh, corners, colours, gap);
+                continue;
             }
 
-            left = right;
+            // Check only the device pixels the stipple actually covers, and only on strips
+            // likely to need it. After the shared budget is spent, use corner blending.
+            samples.clear();
+            for x in first..end {
+                let Some(cell) = dot_cell(x) else { continue };
+                for &(row, y) in &dot_rows {
+                    if row == cell {
+                        let p = pos2((x as f32 + 0.5) * pixel, y);
+                        samples.push((p, gradient.lookup(gradient.position(p))));
+                    }
+                }
+            }
+            row_budget.probes -= samples.len();
+            gradient_strip(mesh, strip, colours, gradient, gap, &samples, &mut row_budget);
         }
+        budget.probes -= starting_probes - row_budget.probes;
+        budget.splits -= starting_splits - row_budget.splits;
+    }
+}
+
+fn strip_corners(strip: Rect) -> [Pos2; 4] {
+    [strip.left_top(), strip.right_top(), strip.left_bottom(), strip.right_bottom()]
+}
+
+fn gradient_quad(mesh: &mut egui::Mesh, corners: [Pos2; 4], colours: [Color32; 4], gap: f32) {
+    let base = mesh.vertices.len() as u32;
+    for (pos, color) in corners.into_iter().zip(colours) {
+        mesh.vertices.push(egui::epaint::Vertex { pos, uv: pattern_uv(pos, gap), color });
+    }
+    mesh.add_triangle(base, base + 1, base + 2);
+    mesh.add_triangle(base + 2, base + 1, base + 3);
+}
+
+fn gradient_strip(
+    mesh: &mut egui::Mesh,
+    strip: Rect,
+    colours: [Color32; 4],
+    gradient: &SelectionGradient,
+    gap: f32,
+    samples: &[(Pos2, Color32)],
+    budget: &mut GradientMeshBudget,
+) {
+    let (Some(&(first, _)), Some(&(last, _))) = (samples.first(), samples.last()) else { return };
+    let corners = strip_corners(strip);
+    let channels = colours.map(|c| c.to_array().map(f32::from));
+    if budget.splits == 0 || samples.iter().all(|&(p, colour)| {
+        let x = (p.x - strip.left()) / strip.width();
+        let y = (p.y - strip.top()) / strip.height();
+        // Use the same diagonal as the emitted triangles.
+        let (a, b, c, x, y) = if x + y <= 1.0 {
+            (channels[0], channels[1], channels[2], x, y)
+        } else {
+            (channels[3], channels[2], channels[1], 1.0 - x, 1.0 - y)
+        };
+        let rgb = colour.to_array();
+        (0..3).all(|i| (a[i] + x * (b[i] - a[i]) + y * (c[i] - a[i]) - f32::from(rgb[i])).abs() <= 3.0)
+    }) {
+        gradient_quad(mesh, corners, colours, gap);
+    } else if first.x < last.x {
+        // Split between sampled pixel columns. Each half has at most half the column range.
+        let middle = samples.partition_point(|(p, _)| p.x < (first.x + last.x) * 0.5);
+        let (left, right) = samples.split_at(middle);
+        if let (Some(&(a, _)), Some(&(b, _))) = (left.last(), right.first()) {
+            budget.splits -= 1;
+            let x = (a.x + b.x) * 0.5;
+            let top = gradient.lookup(gradient.position(pos2(x, strip.top())));
+            let bottom = gradient.lookup(gradient.position(pos2(x, strip.bottom())));
+            let [tl, tr, bl, br] = colours;
+            gradient_strip(mesh, Rect::from_x_y_ranges(strip.left()..=x, strip.y_range()), [tl, top, bl, bottom], gradient, gap, left, budget);
+            gradient_strip(mesh, Rect::from_x_y_ranges(x..=strip.right(), strip.y_range()), [top, tr, bottom, br], gradient, gap, right, budget);
+        }
+    } else if let Some(extra) = budget.splits.checked_sub(samples.len() - 1) {
+        // A single device-pixel column can still have different colours on its two dot rows.
+        budget.splits = extra;
+        let pixel = gap / GAP;
+        for &(p, colour) in samples {
+            let rect = strip.intersect(Rect::from_center_size(p, vec2(pixel, pixel)));
+            pattern_mesh(mesh, &[rect], colour, gap);
+        }
+    } else {
+        gradient_quad(mesh, corners, colours, gap);
     }
 }
 
@@ -2512,6 +2705,10 @@ fn subtract_spans(spans: &mut Vec<Rect>, occluders: &[Rect]) {
 mod pattern_tests {
     use super::*;
     use anicraft_engine::geom::{FillRule, Path};
+
+    fn gradient_pattern_mesh(mesh: &mut egui::Mesh, spans: &[Rect], gradient: &SelectionGradient, gap: f32) {
+        super::gradient_pattern_mesh(mesh, spans, gradient, gap, &mut GradientMeshBudget::default());
+    }
 
     fn area(spans: &[Rect]) -> f32 {
         spans.iter().map(|r| r.area()).sum()
@@ -3193,6 +3390,174 @@ mod pattern_tests {
         );
     }
 
+    /// A small radial-gradient centre must affect the
+    /// actual stipple mesh, not just the gradient sampler.
+    #[test]
+    fn small_radial_gradient_centre_is_preserved_in_mesh() {
+        use anicraft_engine::doc::{GradientStop, Paint, Rgba};
+        use anicraft_engine::geom::Vec2;
+
+        let mut shape = item(
+            Path::rect(0.0, 98.0, 64.0, 4.0),
+            true,
+            None,
+        );
+
+        // Black centre, white outside an 8-point radius.
+        shape.fill = Some(Paint::radial(
+            Vec2::new(32.5, 100.5),
+            8.0,
+            vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: Rgba::BLACK,
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: Rgba::WHITE,
+                },
+            ],
+        ));
+
+        let gradient = SelectionGradient::new(
+            &shape,
+            &Affine::IDENTITY,
+        )
+        .expect("radial gradient should have a sampler");
+
+        // First prove that the sampler sees the black centre.
+        let centre = gradient.colour_at(pos2(32.0, 100.0));
+        assert!(
+            centre.r() > 200,
+            "the black centre should produce light selection dots"
+        );
+
+        // Now test the generated mesh itself.
+        let span = Rect::from_min_max(
+            pos2(0.0, 98.0),
+            pos2(64.0, 102.0),
+        );
+
+        let mut mesh = egui::Mesh::default();
+
+        gradient_pattern_mesh(
+            &mut mesh,
+            &[span],
+            &gradient,
+            GAP,
+        );
+
+        assert!(
+            mesh.vertices.iter().any(|v| {
+                (v.pos.x - 32.5).abs() <= GAP
+                    && v.color.r() > 150
+            }),
+            "the mesh missed the small radial centre"
+        );
+    }
+
+    // Read the colour of the triangle covering a lit pixel in the pattern texture.
+    fn mesh_red_at(mesh: &egui::Mesh, p: Pos2) -> u8 {
+        for indices in mesh.indices.as_chunks::<3>().0 {
+            let a = mesh.vertices[indices[0] as usize];
+            let b = mesh.vertices[indices[1] as usize];
+            let c = mesh.vertices[indices[2] as usize];
+            let cross = |u: egui::Vec2, v: egui::Vec2| u.x * v.y - u.y * v.x;
+            let area = cross(b.pos - a.pos, c.pos - a.pos);
+            let wb = cross(p - a.pos, c.pos - a.pos) / area;
+            let wc = cross(b.pos - a.pos, p - a.pos) / area;
+            let wa = 1.0 - wb - wc;
+            if [wa, wb, wc].iter().all(|w| *w >= -1e-5) {
+                return (wa * f32::from(a.color.r()) + wb * f32::from(b.color.r())
+                    + wc * f32::from(c.color.r())).round() as u8;
+            }
+        }
+        panic!("no gradient mesh at {p:?}");
+    }
+
+    #[test]
+    fn gradient_mesh_matches_artwork_when_a_band_falls_between_lookup_entries() {
+        use anicraft_engine::doc::{GradientStop, Paint, Rgba};
+
+        let mut shape = item(Path::rect(0.0, -1.0, 32.0, 2.0), true, None);
+        shape.fill = Some(Paint::linear(
+            Vec2::new(-1003.75, 0.0),
+            Vec2::new(1044.25, 0.0),
+            vec![
+                GradientStop { offset: 0.49975, color: Rgba::WHITE },
+                GradientStop { offset: 0.5, color: Rgba::new(0.0, 0.0, 0.0, 0.0) },
+                GradientStop { offset: 0.50025, color: Rgba::WHITE },
+            ],
+        ));
+
+        let gradient = SelectionGradient::new(&shape, &Affine::IDENTITY).expect("linear gradient");
+        let gap = dot_gap_points(2.0);
+        let span = Rect::from_min_max(pos2(0.0, -1.0), pos2(32.0, 1.0));
+        let mut mesh = egui::Mesh::default();
+        gradient_pattern_mesh(&mut mesh, &[span], &gradient, gap);
+
+        // Neither of the lookup entries around 0.5 sees the black band.
+        assert_eq!(mesh_red_at(&mesh, pos2(20.25, 0.25)), 0);
+        assert_eq!(mesh_red_at(&mesh, pos2(19.75, 0.25)), 0);
+        assert_eq!(mesh_red_at(&mesh, pos2(24.25, 0.25)), 0);
+    }
+
+    #[test]
+    fn gradient_mesh_preserves_a_visible_one_pixel_band() {
+        use anicraft_engine::doc::{GradientStop, Paint, Rgba};
+
+        let center = 128.0 / 255.0;
+        let start = 20.25 - center * 128.0;
+        let mut shape = item(Path::rect(0.0, -1.0, 32.0, 2.0), true, None);
+        shape.fill = Some(Paint::linear(
+            Vec2::new(start, 0.0), Vec2::new(start + 128.0, 0.0),
+            vec![
+                GradientStop { offset: center - 0.002, color: Rgba::WHITE },
+                GradientStop { offset: center, color: Rgba::new(0.0, 0.0, 0.0, 0.0) },
+                GradientStop { offset: center + 0.002, color: Rgba::WHITE },
+            ],
+        ));
+        let gradient = SelectionGradient::new(&shape, &Affine::IDENTITY).expect("linear gradient");
+        let span = Rect::from_min_max(pos2(0.0, -1.0), pos2(32.0, 1.0));
+        let mut mesh = egui::Mesh::default();
+        gradient_pattern_mesh(&mut mesh, &[span], &gradient, dot_gap_points(2.0));
+
+        assert!(mesh_red_at(&mesh, pos2(20.25, 0.25)) >= 252);
+        assert!(mesh_red_at(&mesh, pos2(19.75, 0.25)) <= 3);
+    }
+
+    #[test]
+    fn gradient_mesh_preserves_the_focus_of_a_rotated_elliptical_fill() {
+        use anicraft_engine::doc::{GradientStop, Paint, Rgba};
+
+        let mut shape = item(Path::rect(-32.0, -32.0, 64.0, 64.0), true, None);
+        let mut paint = Paint::radial(
+            Vec2::ZERO,
+            8.0,
+            vec![
+                GradientStop { offset: 0.0, color: Rgba::BLACK },
+                GradientStop { offset: 1.0, color: Rgba::WHITE },
+            ],
+        );
+        if let Paint::Radial { focal, matrix, .. } = &mut paint {
+            *focal = 0.75;
+            *matrix = Affine::scale(0.5, 2.0);
+        }
+        shape.fill = Some(paint);
+        let to_screen = Affine::translate(24.5, 21.5)
+            .mul(&Affine::rotate(std::f32::consts::FRAC_PI_2));
+        let gradient = SelectionGradient::new(&shape, &to_screen).expect("elliptical gradient");
+        let span = Rect::from_min_max(pos2(0.0, 22.0), pos2(64.0, 26.0));
+        let mut mesh = egui::Mesh::default();
+        gradient_pattern_mesh(&mut mesh, &[span], &gradient, GAP);
+
+        // Rotation puts the focus three pixels down from the ellipse centre.
+        assert!(mesh_red_at(&mesh, pos2(24.5, 24.5)) >= 252);
+        // One pixel up is 1/7 of the way from the focus to the far edge.
+        assert!(mesh_red_at(&mesh, pos2(24.5, 23.5)).abs_diff(219) <= 3);
+        assert!(mesh_red_at(&mesh, pos2(48.5, 24.5)) <= 3);
+    }
+
     /// Gradients use smooth RGB inversion, even at middle grey.
     /// Applying the solid-colour contrast fallback here creates
     /// abrupt bands and triangular interpolation artifacts.
@@ -3287,7 +3652,7 @@ mod pattern_tests {
         .expect("radial gradient should have a sampler");
 
         assert_eq!(
-            gradient.colour_at(pos2(50.0, 50.0)),
+            gradient.colour_at(pos2(50.5, 50.5)),
             Color32::WHITE,
             "black centre should have white dots",
         );
@@ -3298,7 +3663,7 @@ mod pattern_tests {
             "outside the white edge should have black dots",
         );
 
-        let middle = gradient.colour_at(pos2(65.0, 50.0));
+        let middle = gradient.colour_at(pos2(65.5, 50.5));
 
         for channel in [middle.r(), middle.g(), middle.b()] {
             assert!(
@@ -3349,13 +3714,13 @@ mod pattern_tests {
             .expect("rotated elliptical gradient should have a sampler");
 
         assert_eq!(
-            gradient.colour_at(pos2(150.0, 150.0)),
+            gradient.colour_at(pos2(150.5, 150.5)),
             Color32::WHITE,
             "the black centre should produce white dots",
         );
 
         // Thirty pixels down is still inside the long axis.
-        let along_long_axis = gradient.colour_at(pos2(150.0, 180.0));
+        let along_long_axis = gradient.colour_at(pos2(150.5, 180.5));
 
         for channel in [
             along_long_axis.r(),
@@ -3370,7 +3735,7 @@ mod pattern_tests {
 
         // Thirty pixels right is beyond the short axis.
         assert_eq!(
-            gradient.colour_at(pos2(180.0, 150.0)),
+            gradient.colour_at(pos2(180.5, 150.5)),
             Color32::BLACK,
             "outside the short axis should produce black dots",
         );
@@ -3463,6 +3828,38 @@ mod pattern_tests {
     }
 
     #[test]
+    fn complex_gradient_refinement_budget_is_shared_across_fills() {
+        use anicraft_engine::doc::{GradientStop, Paint, Rgba, Spread};
+
+        let clip = Rect::from_min_max(pos2(0.0, 0.0), pos2(3840.0, 2160.0));
+        let mut shape = item(Path::rect(-10.0, -10.0, 3860.0, 2180.0), true, None);
+        let stops = [0.0, 0.298, 0.300, 0.302, 0.304, 0.68, 0.682, 0.684, 1.0]
+            .into_iter().enumerate().map(|(i, offset)| GradientStop {
+                offset, color: if i.is_multiple_of(2) { Rgba::BLACK } else { Rgba::WHITE },
+            }).collect();
+        shape.fill = Some(Paint::Radial {
+            center: Vec2::ZERO, radius: 1.0, stops, spread: Spread::Reflect, linear_rgb: false,
+            focal: 0.55, matrix: Affine::scale(256.0, 80.0),
+        });
+        let transform = Affine::translate(1920.0, 1080.0).mul(&Affine::rotate(0.54));
+        let gradient = SelectionGradient::new(&shape, &transform).expect("elliptical gradient");
+        let mut spans = Vec::new();
+        pattern_spans(&shape.path.flatten(&Affine::IDENTITY, 0.5), shape.fill_rule, clip, &mut spans, GAP);
+        let base_quads = spans.len() * 60;
+        let mut mesh = egui::Mesh::default();
+        let mut budget = GradientMeshBudget::default();
+        super::gradient_pattern_mesh(&mut mesh, &spans, &gradient, GAP, &mut budget);
+        assert!(mesh.vertices.len() / 4 > base_quads);
+        assert!(budget.splits < GRADIENT_SPLIT_BUDGET);
+        assert!(budget.probes < GRADIENT_PROBE_BUDGET);
+
+        let first_vertices = mesh.vertices.len();
+        super::gradient_pattern_mesh(&mut mesh, &spans, &gradient, GAP, &mut budget);
+        assert!(mesh.vertices.len() / 4 <= 2 * base_quads + GRADIENT_SPLIT_BUDGET);
+        assert!(mesh.vertices[first_vertices..].iter().any(|v| v.pos.y == clip.bottom()));
+    }
+
+    #[test]
     fn translucent_gradient_selection_dots_use_interpolated_rgb() {
         use anicraft_engine::doc::{GradientStop, Paint, Rgba};
 
@@ -3497,7 +3894,6 @@ mod pattern_tests {
 
         // Red-to-blue produces purple at the midpoint.
         // Its RGB inverse should be light green.
-        // Allow a few levels for the shader's 256-entry LUT.
         assert!(
             midpoint.r().abs_diff(128) <= 4,
             "unexpected red channel: {midpoint:?}"

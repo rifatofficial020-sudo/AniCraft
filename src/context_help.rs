@@ -67,6 +67,7 @@ pub enum Dialog {
     BrushLibrary,
     ConvertSymbol,
     ShapeEdges,
+    TraceBitmap,
     LayerProperties,
     EditGrid,
     EditGuides,
@@ -89,7 +90,7 @@ pub enum Dialog {
 }
 
 impl Dialog {
-    pub const ALL: [Dialog; 30] = [
+    pub const ALL: [Dialog; 31] = [
         Dialog::Preferences,
         Dialog::Shortcuts,
         Dialog::Licenses,
@@ -101,6 +102,7 @@ impl Dialog {
         Dialog::BrushLibrary,
         Dialog::ConvertSymbol,
         Dialog::ShapeEdges,
+        Dialog::TraceBitmap,
         Dialog::LayerProperties,
         Dialog::EditGrid,
         Dialog::EditGuides,
@@ -136,6 +138,7 @@ impl Dialog {
             Dialog::BrushLibrary => "brush_library",
             Dialog::ConvertSymbol => "convert_symbol",
             Dialog::ShapeEdges => "shape_edges",
+            Dialog::TraceBitmap => "trace_bitmap",
             Dialog::LayerProperties => "layer_props",
             Dialog::EditGrid => "edit_grid",
             Dialog::EditGuides => "edit_guides",
@@ -167,6 +170,7 @@ impl Dialog {
             Dialog::BrushLibrary => "drawing.md#the-brush",
             Dialog::ConvertSymbol => "symbols-and-library.md#making-a-symbol",
             Dialog::ShapeEdges => "drawing.md#lines-to-fills-expanding-and-softening-fills",
+            Dialog::TraceBitmap => "images-and-sound.md#trace-bitmap",
             Dialog::LayerProperties => "timeline.md#layer-properties",
             Dialog::EditGrid | Dialog::EditGuides => "drawing.md#rulers-grid-and-guides",
             Dialog::Plugins => "plugins.md#managing-plug-ins",
@@ -201,6 +205,10 @@ pub const COMMAND_TOPICS: &[(&str, &str)] = &[
     ("control.", "interactivity.md#test-movie"),
     ("desktop.", "getting-started.md#running-the-appimage"),
     ("doc.", "workspace.md#properties"),
+    ("data.", "data-driven-animation.md#binding-a-column-to-an-instance"),
+    ("data.bake", "data-driven-animation.md#baking-to-keyframes"),
+    ("data.import_table", "data-driven-animation.md#importing-a-table"),
+    ("data.set_key", "data-driven-animation.md#a-row-per-frame-or-a-row-per-time"),
     ("draw.", "drawing.md#drawing-shapes-and-lines"),
     ("ease.", "tweens.md#easing"),
     ("edit.", "drawing.md#clipboard-and-duplicates"),
@@ -212,6 +220,9 @@ pub const COMMAND_TOPICS: &[(&str, &str)] = &[
     ("file.new", "getting-started.md#the-start-screen"),
     ("file.export", "exporting-and-publish.md#exporting-one-format"),
     ("file.import", "images-and-sound.md#importing-images"),
+    ("file.import_video", "images-and-sound.md#importing-video"),
+    ("file.video_info", "images-and-sound.md#importing-video"),
+    ("layer.set_video", "images-and-sound.md#importing-video"),
     ("file.publish", "exporting-and-publish.md#publish"),
     ("file.recovery", "getting-started.md#autosave-and-crash-recovery"),
     ("filter.", "drawing.md#filters-and-blend-modes"),
@@ -222,10 +233,12 @@ pub const COMMAND_TOPICS: &[(&str, &str)] = &[
     ("library.", "symbols-and-library.md#the-library-panel"),
     ("macro.", "saved-commands.md#saving-steps-as-a-command"),
     ("modify.", "drawing.md#transforming-artwork"),
+    ("modify.convert_to_bitmap", "images-and-sound.md#convert-to-bitmap"),
     ("modify.convert_to_symbol", "symbols-and-library.md#making-a-symbol"),
     ("modify.expand_fill", "drawing.md#lines-to-fills-expanding-and-softening-fills"),
     ("modify.lines_to_fills", "drawing.md#lines-to-fills-expanding-and-softening-fills"),
     ("modify.soften_fill_edges", "drawing.md#lines-to-fills-expanding-and-softening-fills"),
+    ("modify.trace_bitmap", "images-and-sound.md#trace-bitmap"),
     ("motion.", "tweens.md#motion-tweens"),
     ("paint.", "drawing.md#paint-bucket-ink-bottle-and-eyedropper"),
     ("path.", "drawing.md#editing-points-with-subselection"),
@@ -346,6 +359,9 @@ pub fn subject(app: &App, ctx: &egui::Context, pointer: bool) -> Subject {
     // Expand Fill and Soften Fill Edges (ADR 0109).
     if app.shape_dialog.is_some() {
         return Subject::Dialog(Dialog::ShapeEdges);
+    }
+    if app.trace.is_some() {
+        return Subject::Dialog(Dialog::TraceBitmap);
     }
     // Convert Audio to Keyframes and Auto Lip-Sync (ADR 0114).
     if let Some(d) = &app.audio_keys {

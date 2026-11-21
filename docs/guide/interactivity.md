@@ -171,8 +171,9 @@ there; lines with problems are marked by their numbers.
   `ROLL_OVER`, `ROLL_OUT`), `Event.ENTER_FRAME`, and `KeyboardEvent.KEY_DOWN` and `KEY_UP` on
   the stage with `e.keyCode` and the `Keyboard` constants; `removeEventListener`;
   `e.target` and `e.currentTarget`.
-* **Text fields**: set and read `.text`, use `appendText(…)`, and read `.length` on dynamic and
-  input text fields.
+* **Text fields**: set and read `.text` and `.htmlText` (formatted text), use `appendText(…)`,
+  read `.length`, set `.maxChars` and `.restrict`, and listen for `Event.CHANGE` on input text
+  fields. See [Text](text.md#formatted-text-from-a-script).
 * `trace(…)`, which writes to Output.
 
 Keys and frames, for a small game:

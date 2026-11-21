@@ -5,6 +5,7 @@ use crate::{CommandSpec, EngineError, Result, Selection, Session};
 use anicraft_doc::{ColorEffect, ColorStyle, Element, ElementId, ElementKind, Layer, LayerId, LibraryEntry, LibraryItem, LoopMode, Paint, ScaleGrid, Shape, Stroke, Symbol, SymbolId, SymbolKind, Timeline};
 use anicraft_geom::{Affine, Decomposed, Path, Vec2};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -50,6 +51,24 @@ pub fn specs() -> Vec<CommandSpec> {
         c("arrange.send_backward", "Send Backward", "Modify/Arrange", Some("Ctrl+Down"), "{} (within each layer)", true, |s, _| s.each_layer(true, |s| arrange_step(s, false))),
         c("arrange.send_to_back", "Send to Back", "Modify/Arrange", Some("Ctrl+Shift+Down"), "{} (within each layer)", true, |s, _| s.each_layer(true, |s| arrange(s, false))),
         c("modify.convert_to_symbol", "Convert to Symbol…", "Modify", Some("F8"), "{name? (default: the next free “Symbol n”; a name the folder holds gets a number), kind?: graphic|movie_clip|button (default: graphic), folder?: Library folder id (default: the top level)} → {symbol, instance, name, layer, folder} (a selection on several layers becomes one symbol with those layers inside; the instance lands on the topmost)", true, convert_to_symbol),
+        c(
+            "modify.convert_to_bitmap",
+            "Convert to Bitmap",
+            "Modify",
+            None,
+            "{} the selection, as it is drawn at the playhead, becomes one bitmap in the Library (the next free “Bitmap n”), placed where the selection was, on the topmost of its layers, and selected → {bitmap, element, name, width, height}",
+            true,
+            convert_to_bitmap,
+        ),
+        c(
+            "modify.trace_bitmap",
+            "Trace Bitmap…",
+            "Modify/Bitmap",
+            None,
+            "{color_threshold? (1..500, default 100: neighbouring pixels whose red, green and blue differ by less, added up, are one colour), min_area? (1..1000 pixels, default 8: smaller areas join the neighbour they share the most edge with), curve_fit?: pixels|very_tight|tight|normal|smooth|very_smooth (default normal), corner_threshold?: many|normal|few (default normal)} the selected bitmaps become filled raw shapes, one per area of colour, in their place (pixels under half opacity stay empty) → {shapes, elements}",
+            true,
+            |s, p| s.each_layer(false, |s| trace_bitmap(s, p)),
+        ),
         c("modify.break_apart", "Break Apart", "Modify", Some("Ctrl+B"), "{} the selected symbol instances become their contents, text becomes shapes, and drawing objects become raw shapes that merge with the raw shapes they touch", true, |s, p| s.each_layer(false, |s| break_apart(s, p))),
         c("library.place", "Place on Stage", "", None, "{symbol | bitmap | sound: id, x?, y?} or {items: [{symbol | bitmap | sound: id}, ..], x?, y?} → {element, elements, sound?}: symbols and bitmaps centred on x, y (default: the stage centre; inside an open symbol, in its space) in the active layer's keyframe at the playhead, selected; a sound goes onto that keyframe, its span grown to fit (one sound per keyframe). One undo step", true, place),
     ]
@@ -150,7 +169,7 @@ fn draw_rect(s: &mut Session, p: &Value) -> Result<Value> {
 fn draw_ellipse(s: &mut Session, p: &Value) -> Result<Value> {
     let (x, y, w, h) = rect_params(p)?;
     let (fill, stroke) = style(s, p, true)?;
-    add_shape(s, "ellipse", Path::ellipse(0.0, 0.0, w / 2.0, h / 2.0), Vec2::new(x + w / 2.0, y + h / 2.0), fill, stroke, object_param(s, p)?)
+    add_shape(s, "ellipse", Path::ellipse8(0.0, 0.0, w / 2.0, h / 2.0), Vec2::new(x + w / 2.0, y + h / 2.0), fill, stroke, object_param(s, p)?)
 }
 
 fn draw_star(s: &mut Session, p: &Value) -> Result<Value> {
@@ -1025,6 +1044,208 @@ pub(crate) fn convert_to_symbol(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"symbol": sym_id.0, "instance": inst_id.0, "name": name, "layer": top.0, "folder": folder.map(|f| f.0)}))
 }
 
+// ----- bitmaps ----------------------------------------------------------------------------
+
+/// The selected items as the stage draws them, and nothing else: masks from outside the
+/// selection let go of it, and outline-only layers show their artwork.
+fn selection_list(s: &Session) -> anicraft_doc::DisplayList {
+    let sel: HashSet<(LayerId, ElementId)> = s.selection.iter().collect();
+    let full = s.display_list();
+    let items: Vec<anicraft_doc::DisplayItem> = full.items.iter().filter(|i| sel.contains(&(i.layer, i.element))).cloned().collect();
+    let kept: HashSet<u32> = items.iter().filter_map(|i| i.masks).collect();
+    let parents = &full.clip_parents;
+    let nearest = |mut c: Option<u32>| {
+        for _ in 0..=parents.len() {
+            match c {
+                Some(id) if !kept.contains(&id) => c = parents.get(id as usize).copied().flatten().filter(|&p| p < id),
+                _ => break,
+            }
+        }
+        c.filter(|id| kept.contains(id))
+    };
+    let clip_parents = parents.iter().enumerate().map(|(i, p)| if kept.contains(&(i as u32)) { nearest(*p) } else { None }).collect();
+    let groups = full.groups.iter().map(|g| anicraft_doc::Group { clip: nearest(g.clip), ..g.clone() }).collect();
+    let items = items
+        .into_iter()
+        .map(|mut i| {
+            i.clip = nearest(i.clip);
+            i.outline = None;
+            i
+        })
+        .collect();
+    anicraft_doc::DisplayList { items, clip_parents, clip_modes: full.clip_modes.clone(), groups, links: Vec::new() }
+}
+
+/// Convert to Bitmap (#463): the selection, drawn by the CPU renderer on whole pixels of the
+/// space being edited, becomes a bitmap in the Library and one placed bitmap where it was, as
+/// Convert to Symbol places its instance.
+fn convert_to_bitmap(s: &mut Session, _: &Value) -> Result<Value> {
+    let layers = s.selected_layers();
+    let Some(&top) = layers.first() else {
+        return Err(EngineError::State("select something to convert".into()));
+    };
+    let b = s.selection_bounds();
+    if b.is_empty() || !(b.min.is_finite() && b.max.is_finite()) {
+        return Err(EngineError::State("the selection draws nothing to make a bitmap of".into()));
+    }
+    let (x0, y0) = (b.min.x.floor(), b.min.y.floor());
+    let (w, h) = ((b.max.x.ceil() - x0).max(1.0), (b.max.y.ceil() - y0).max(1.0));
+    let edge = anicraft_doc::MAX_BITMAP_EDGE as f32;
+    if w > edge || h > edge || f64::from(w) * f64::from(h) > anicraft_render::MAX_PIXELS as f64 {
+        return Err(EngineError::State("the selection is too large to become a bitmap (at most 4096 × 4096 pixels)".into()));
+    }
+    let (w, h) = (w as u32, h as u32);
+    let view = anicraft_render::View { transform: Affine::translate(-x0, -y0), width: w, height: h, background: None };
+    let (pm, _) = anicraft_render::render(&selection_list(s), &view)?;
+    let id = anicraft_doc::BitmapId(s.doc.alloc_id());
+    let name = s.doc.numbered_name(None, "Bitmap", 1);
+    let bitmap = anicraft_doc::Bitmap::from_rgba(id, name.clone(), w, h, pm.to_rgba8())
+        .ok_or_else(|| EngineError::State("the bitmap couldn't be made".into()))?;
+    let inst_id = ElementId(s.doc.alloc_id());
+    let instance = Arc::new(Element {
+        id: inst_id,
+        name: name.clone(),
+        transform: Affine::translate(x0, y0),
+        color: ColorEffect::default(),
+        kind: ElementKind::Shape(Shape {
+            path: Arc::new(Path::rect(0.0, 0.0, w as f32, h as f32)),
+            fill: Some(Paint::Bitmap { bitmap: id, repeat: false, matrix: Affine::IDENTITY }),
+            stroke: None,
+            fill_rule: anicraft_geom::FillRule::NonZero,
+            merge: false,
+            warp: None,
+        }),
+    });
+    for l in layers {
+        let sel = s.selection.on(l);
+        s.with_layer(l, |s| -> Result<()> {
+            let kf = s.editable_keyframe()?;
+            let first = kf.elements.iter().position(|e| sel.contains(&e.id)).unwrap_or(kf.elements.len());
+            kf.elements.retain(|e| !sel.contains(&e.id));
+            if l == top {
+                kf.elements.insert(first.min(kf.elements.len()), instance.clone());
+            }
+            Ok(())
+        })?;
+    }
+    s.doc.bitmaps.push(Arc::new(bitmap));
+    s.layer = top;
+    s.select_only([inst_id]);
+    Ok(json!({"bitmap": id.0, "element": inst_id.0, "name": name, "width": w, "height": h}))
+}
+
+/// The Trace Bitmap dialog's settings from params (Animate's defaults for those not given).
+pub fn trace_settings(p: &Value) -> Result<crate::trace::TraceSettings> {
+    use crate::trace::{Corners, CurveFit};
+    let mut set = crate::trace::TraceSettings::default();
+    if let Some(v) = opt_u32(p, "color_threshold")? {
+        if !(1..=500).contains(&v) {
+            return Err(EngineError::Param("param 'color_threshold' must be between 1 and 500".into()));
+        }
+        set.color_threshold = v;
+    }
+    if let Some(v) = opt_u32(p, "min_area")? {
+        if !(1..=1000).contains(&v) {
+            return Err(EngineError::Param("param 'min_area' must be between 1 and 1000 pixels".into()));
+        }
+        set.min_area = v;
+    }
+    if let Some(k) = opt_str(p, "curve_fit")? {
+        set.curve_fit = CurveFit::from_key(k)
+            .ok_or_else(|| EngineError::Param(format!("unknown curve fit '{k}' (pixels, very_tight, tight, normal, smooth or very_smooth)")))?;
+    }
+    if let Some(k) = opt_str(p, "corner_threshold")? {
+        set.corners = Corners::from_key(k).ok_or_else(|| EngineError::Param(format!("unknown corner threshold '{k}' (many, normal or few)")))?;
+    }
+    Ok(set)
+}
+
+/// A placed bitmap's pixels and its pixel → keyframe transform: a shape filled once with a
+/// bitmap (unwarped) whose outline is the image's rectangle, as a bitmap placed from the Library.
+fn traceable(doc: &anicraft_doc::Document, e: &Element) -> Option<(Affine, Arc<anicraft_doc::Pixels>)> {
+    let ElementKind::Shape(sh) = &e.kind else { return None };
+    let Some(Paint::Bitmap { bitmap, repeat: false, matrix }) = &sh.fill else { return None };
+    if sh.warp.is_some() {
+        return None;
+    }
+    let b = doc.bitmap(*bitmap)?;
+    let image = anicraft_geom::Rect::new(0.0, 0.0, b.width as f32, b.height as f32).transformed(matrix);
+    let outline = sh.path.bounds();
+    let near = |a: f32, b: f32| (a - b).abs() <= 0.5;
+    if !(near(image.min.x, outline.min.x) && near(image.min.y, outline.min.y) && near(image.max.x, outline.max.x) && near(image.max.y, outline.max.y))
+    {
+        return None;
+    }
+    Some((e.transform.mul(matrix), b.pixels()?))
+}
+
+/// Trace Bitmap (#463): each selected placed bitmap becomes raw shapes, one per area of colour
+/// (`crate::trace`), in its place. Where raw shapes on the keyframe touch them they merge, as
+/// drawing does (ADR 0031); otherwise they take the bitmap's place in the stacking.
+fn trace_bitmap(s: &mut Session, p: &Value) -> Result<Value> {
+    let set = trace_settings(p)?;
+    let sel = s.selection.on(s.layer);
+    let els = s.editable_keyframe()?.elements.clone();
+    let targets: Vec<(ElementId, ColorEffect, Affine, Arc<anicraft_doc::Pixels>)> =
+        els.iter().filter(|e| sel.contains(&e.id)).filter_map(|e| traceable(&s.doc, e).map(|(m, px)| (e.id, e.color, m, px))).collect();
+    if targets.is_empty() {
+        return Err(EngineError::State("select a bitmap on the stage to trace".into()));
+    }
+    let mut made: Vec<ElementId> = Vec::new();
+    for (id, color, to_key, px) in targets {
+        let traced = crate::trace::trace(&px, &set)?;
+        if traced.is_empty() {
+            continue;
+        }
+        let pieces: Vec<Element> = traced
+            .into_iter()
+            .map(|t| {
+                let path = t.path.transformed(&to_key);
+                let c = path.bounds().center();
+                Element {
+                    id: ElementId(s.doc.alloc_id()),
+                    name: String::new(),
+                    transform: Affine::translate(c.x, c.y),
+                    color,
+                    kind: ElementKind::Shape(Shape {
+                        path: Arc::new(path.transformed(&Affine::translate(-c.x, -c.y))),
+                        fill: Some(Paint::Solid(t.color)),
+                        stroke: None,
+                        fill_rule: anicraft_geom::FillRule::NonZero,
+                        merge: true,
+                        warp: None,
+                    }),
+                }
+            })
+            .collect();
+        let area = pieces
+            .iter()
+            .filter_map(|e| crate::merge::mergeable(e).map(|sh| crate::merge::reach(sh, &e.transform)))
+            .fold(anicraft_geom::Rect::EMPTY, |r, b| r.union(&b));
+        let kf = s.editable_keyframe()?;
+        let Some(at) = kf.elements.iter().position(|e| e.id == id) else { continue };
+        kf.elements.remove(at);
+        let touches = kf
+            .elements
+            .iter()
+            .any(|e| crate::merge::mergeable(e).is_some_and(|sh| !crate::merge::reach(sh, &e.transform).intersect(&area).is_empty()));
+        if touches {
+            made.extend(crate::merge::merge_in(s, pieces)?);
+            continue;
+        }
+        if kf.elements.len() + pieces.len() > 100_000 {
+            return Err(EngineError::State("too many elements on this keyframe".into()));
+        }
+        made.extend(pieces.iter().map(|e| e.id));
+        kf.elements.splice(at..at, pieces.into_iter().map(Arc::new));
+    }
+    if made.is_empty() {
+        return Err(EngineError::State("the bitmap has nothing opaque to trace".into()));
+    }
+    s.select_only(made.iter().copied());
+    Ok(json!({"shapes": made.len(), "elements": made.iter().map(|e| e.0).collect::<Vec<_>>()}))
+}
+
 fn break_apart(s: &mut Session, _: &Value) -> Result<Value> {
     let sel = s.selection.on(s.layer);
     if sel.is_empty() {
@@ -1160,10 +1381,12 @@ pub(crate) fn place(s: &mut Session, p: &Value) -> Result<Value> {
                 LibraryItem::Symbol(id) => format!("no symbol with id {}", id.0),
                 LibraryItem::Bitmap(id) => format!("no bitmap with id {}", id.0),
                 LibraryItem::Sound(id) => format!("no sound with id {} in the library", id.0),
+                LibraryItem::Data(id) => format!("no data table with id {}", id.0),
             }));
         }
         match i {
             LibraryItem::Symbol(id) if crate::editing::would_nest(s, id) => return Err(EngineError::State("a symbol can't be placed inside itself".into())),
+            LibraryItem::Data(_) => return Err(EngineError::State("a data table isn't artwork, so it can't be placed: bind one of its columns to an instance (Modify › Data › Bind to Data, or data.bind)".into())),
             LibraryItem::Sound(id) => {
                 if sound.is_some_and(|x| x != id) {
                     return Err(EngineError::State("a keyframe holds one sound; place sounds one at a time, on different keyframes or layers".into()));
@@ -1183,7 +1406,7 @@ pub(crate) fn place(s: &mut Session, p: &Value) -> Result<Value> {
         match i {
             LibraryItem::Symbol(id) => placed.push(place_symbol(s, id, x, y)?),
             LibraryItem::Bitmap(id) => placed.push(place_bitmap(s, id, x, y)?),
-            LibraryItem::Sound(_) => {}
+            LibraryItem::Sound(_) | LibraryItem::Data(_) => {}
         }
     }
     let mut out = json!({"element": placed.first().map(|e| e.0), "elements": placed.iter().map(|e| e.0).collect::<Vec<_>>()});

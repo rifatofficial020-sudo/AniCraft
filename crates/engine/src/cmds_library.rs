@@ -33,16 +33,17 @@ pub fn specs() -> Vec<CommandSpec> {
 /// Most entries one command takes.
 const MAX_ENTRIES: usize = 100_000;
 
-/// The entry a JSON object names: `{"symbol": id}`, `{"bitmap": id}`, `{"sound": id}` or
-/// `{"folder": id}`.
+/// The entry a JSON object names: `{"symbol": id}`, `{"bitmap": id}`, `{"sound": id}`,
+/// `{"data": id}` (a data table, ADR 0118) or `{"folder": id}`.
 pub(crate) fn entry_of(v: &Value) -> Result<LibraryEntry> {
     let id = |k: &str| v.get(k).and_then(Value::as_u64);
-    match (id("symbol"), id("bitmap"), id("sound"), id("folder")) {
-        (Some(i), None, None, None) => Ok(LibraryEntry::Item(LibraryItem::Symbol(SymbolId(i)))),
-        (None, Some(i), None, None) => Ok(LibraryEntry::Item(LibraryItem::Bitmap(BitmapId(i)))),
-        (None, None, Some(i), None) => Ok(LibraryEntry::Item(LibraryItem::Sound(SoundId(i)))),
-        (None, None, None, Some(i)) => Ok(LibraryEntry::Folder(FolderId(i))),
-        _ => Err(EngineError::Param("name one Library entry: {\"symbol\" | \"bitmap\" | \"sound\" | \"folder\": id}".into())),
+    match (id("symbol"), id("bitmap"), id("sound"), id("data"), id("folder")) {
+        (Some(i), None, None, None, None) => Ok(LibraryEntry::Item(LibraryItem::Symbol(SymbolId(i)))),
+        (None, Some(i), None, None, None) => Ok(LibraryEntry::Item(LibraryItem::Bitmap(BitmapId(i)))),
+        (None, None, Some(i), None, None) => Ok(LibraryEntry::Item(LibraryItem::Sound(SoundId(i)))),
+        (None, None, None, Some(i), None) => Ok(LibraryEntry::Item(LibraryItem::Data(anicraft_doc::DataId(i)))),
+        (None, None, None, None, Some(i)) => Ok(LibraryEntry::Folder(FolderId(i))),
+        _ => Err(EngineError::Param("name one Library entry: {\"symbol\" | \"bitmap\" | \"sound\" | \"data\" | \"folder\": id}".into())),
     }
 }
 
@@ -52,6 +53,7 @@ pub fn entry_json(e: LibraryEntry) -> Value {
         LibraryEntry::Item(LibraryItem::Symbol(i)) => json!({"symbol": i.0}),
         LibraryEntry::Item(LibraryItem::Bitmap(i)) => json!({"bitmap": i.0}),
         LibraryEntry::Item(LibraryItem::Sound(i)) => json!({"sound": i.0}),
+        LibraryEntry::Item(LibraryItem::Data(i)) => json!({"data": i.0}),
         LibraryEntry::Folder(f) => json!({"folder": f.0}),
     }
 }
@@ -81,6 +83,7 @@ fn describe(e: LibraryEntry) -> String {
         LibraryEntry::Item(LibraryItem::Symbol(i)) => format!("symbol {}", i.0),
         LibraryEntry::Item(LibraryItem::Bitmap(i)) => format!("bitmap {}", i.0),
         LibraryEntry::Item(LibraryItem::Sound(i)) => format!("sound {}", i.0),
+        LibraryEntry::Item(LibraryItem::Data(i)) => format!("data table {}", i.0),
         LibraryEntry::Folder(f) => format!("folder {}", f.0),
     }
 }
@@ -158,6 +161,13 @@ fn items(s: &mut Session, _: &Value) -> Result<Value> {
                         v["seconds"] = json!(x.seconds());
                     }
                 }
+                LibraryItem::Data(id) => {
+                    if let Some(t) = d.data_table(id) {
+                        v["kind"] = json!("data");
+                        v["rows"] = json!(t.rows());
+                        v["columns"] = json!(t.columns.len());
+                    }
+                }
             }
             v
         })
@@ -202,6 +212,16 @@ pub(crate) fn rename(s: &mut Session, p: &Value) -> Result<Value> {
         }
         LibraryEntry::Item(LibraryItem::Sound(id)) => {
             if let Some(x) = d.sounds.iter_mut().find(|x| x.id == id) {
+                Arc::make_mut(x).name = name.clone();
+            }
+        }
+        LibraryEntry::Item(LibraryItem::Data(id)) => {
+            // Commands name a table by its name, so no two tables share one, whatever folder
+            // they are in (ADR 0118).
+            if d.data.tables.iter().any(|t| t.id != id && t.name.to_lowercase() == name.to_lowercase()) {
+                return Err(EngineError::Param(format!("another data table is already named “{name}”")));
+            }
+            if let Some(x) = Arc::make_mut(&mut d.data).tables.iter_mut().find(|x| x.id == id) {
                 Arc::make_mut(x).name = name.clone();
             }
         }
@@ -319,7 +339,7 @@ fn strip_in(tl: &mut Timeline, gone: &HashSet<LibraryItem>, depth: usize) -> usi
 }
 
 /// Deletes `items` and `folders` from the Library and every use of the items from the movie.
-fn remove(s: &mut Session, items: &[LibraryItem], folders: &[FolderId]) -> Value {
+pub(crate) fn remove(s: &mut Session, items: &[LibraryItem], folders: &[FolderId]) -> Value {
     let gone: HashSet<LibraryItem> = items.iter().copied().collect();
     let mut uses = 0;
     if !gone.is_empty() {
@@ -331,6 +351,14 @@ fn remove(s: &mut Session, items: &[LibraryItem], folders: &[FolderId]) -> Value
         s.doc.library.retain(|x| !gone.contains(&LibraryItem::Symbol(x.id)));
         s.doc.bitmaps.retain(|x| !gone.contains(&LibraryItem::Bitmap(x.id)));
         s.doc.sounds.retain(|x| !gone.contains(&LibraryItem::Sound(x.id)));
+        // A data table goes with the bindings that read it (ADR 0118): each counts as a use.
+        if s.doc.data.tables.iter().any(|t| gone.contains(&LibraryItem::Data(t.id))) {
+            let data = Arc::make_mut(&mut s.doc.data);
+            data.tables.retain(|t| !gone.contains(&LibraryItem::Data(t.id)));
+            let before = data.bindings.len();
+            data.bindings.retain(|b| !gone.contains(&LibraryItem::Data(b.table)));
+            uses += before - data.bindings.len();
+        }
         for sym in &mut s.doc.library {
             if strip_needed(&sym.timeline, &gone) {
                 uses += strip(&mut Arc::make_mut(sym).timeline, &gone);
@@ -348,6 +376,14 @@ fn remove(s: &mut Session, items: &[LibraryItem], folders: &[FolderId]) -> Value
         let t = Arc::make_mut(&mut s.doc.library_tree);
         t.placed.retain(|i, f| !gone.contains(i) && !dead.contains(f));
         t.folders.retain(|f| !dead.contains(&f.id));
+        // (A data table keeps its own folder; one left in a deleted folder goes to the top.)
+        if s.doc.data.tables.iter().any(|x| x.folder.is_some_and(|f| dead.contains(&f))) {
+            for x in &mut Arc::make_mut(&mut s.doc.data).tables {
+                if x.folder.is_some_and(|f| dead.contains(&f)) {
+                    Arc::make_mut(x).folder = None;
+                }
+            }
+        }
         // A folder whose parent went (it was named on its own) goes to the top level.
         let ids: HashSet<FolderId> = t.folders.iter().map(|f| f.id).collect();
         for f in &mut t.folders {

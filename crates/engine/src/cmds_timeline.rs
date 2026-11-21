@@ -10,10 +10,10 @@ pub fn specs() -> Vec<CommandSpec> {
     let c = |id, label, menu, shortcut, params, mutates, run| CommandSpec { id, label, menu, shortcut, params, mutates, run };
     vec![
         c("timeline.insert_frame", "Frame", "Insert/Timeline", Some("F5"), "{layer? | layers?: [..] | all_layers?: true (every layer with frames at or after the frame, as F5 with no frame selection; the active layer when none has), frame?, count?, advance?: true (the playhead moves onto the last frame inserted, as the key does in the editor)}", true, insert_frame as crate::RunFn),
-        c("timeline.remove_frame", "Remove Frame", "Insert/Timeline", Some("Shift+F5"), "{layer? | layers?: [..], frame?, count?}", true, remove_frame),
+        c("timeline.remove_frame", "Remove Frame", "Insert/Timeline", Some("Shift+F5"), "{layer? | layers?: [..] | all_layers?: true (every layer with frames at or after the frame, as Shift+F5 with no frame selection: the layers stay in step), frame?, count?}", true, remove_frame),
         c("timeline.insert_keyframe", "Keyframe", "Insert/Timeline", Some("F6"), "{layer? | layers?: [..], frame?, count? (every frame of the range becomes a keyframe), advance?: true (on a keyframe the new key goes on the next frame, and the playhead moves onto it, as the key does in the editor)}", true, insert_keyframe),
         c("timeline.insert_blank_keyframe", "Blank Keyframe", "Insert/Timeline", Some("F7"), "{layer? | layers?: [..], frame?, count? (every frame of the range becomes a blank keyframe; keyframes already there are kept), advance?: true (on a keyframe the blank key goes on the next frame instead of clearing it, and the playhead moves onto it)}", true, insert_blank_keyframe),
-        c("timeline.clear_keyframe", "Clear Keyframe", "Insert/Timeline", Some("Shift+F6"), "{layer? | layers?: [..], frame?, count?}", true, clear_keyframe),
+        c("timeline.clear_keyframe", "Clear Keyframe", "Insert/Timeline", Some("Shift+F6"), "{layer? | layers?: [..] | all_layers?: true (every layer with a keyframe there, as Shift+F6 with no frame selection), frame?, count?}", true, clear_keyframe),
         c("timeline.move_keyframes", "Move Keyframes", "", None, "{layer? | layers?: [..], from, to?, by, layer_by? (rows down; negative = up)}", true, move_keyframes),
         c("timeline.move_spans", "Move Spans", "", None, "{layer? | layers?: [..], from, to?, by, layer_by? (rows down; negative = up), copy?: true (Alt-drag: the frames stay where they were too)}: the spans starting in from..=to move whole, keeping their lengths and tweens (as dragging a tween span in Animate), replacing what they land on; the frames they leave are empty", true, move_spans),
         c("timeline.create_motion_tween", "Create Motion Tween", "Insert", None, "{layer?, frame?} (several objects on the key become one graphic symbol; a one-frame span grows to a second)", true, crate::cmds_motion::create),
@@ -301,7 +301,7 @@ fn insert_frame(s: &mut Session, p: &Value) -> Result<Value> {
 /// The layers F5 with no frame selection extends: every layer of the timeline with frames at or
 /// after `frame` (folders have none). When no layer reaches that far, the active layer, so F5
 /// past the end still lengthens what you are working on.
-fn layers_at_or_after(s: &Session, frame: u32) -> Vec<LayerId> {
+pub(crate) fn layers_at_or_after(s: &Session, frame: u32) -> Vec<LayerId> {
     let tl = s.timeline();
     let ids: Vec<LayerId> = tl.layers.iter().filter(|l| l.kind != LayerKind::Folder && l.end_frame() > frame).map(|l| l.id).collect();
     if ids.is_empty() { vec![s.layer] } else { ids }
@@ -344,16 +344,35 @@ pub(crate) fn insert_frame_at(layer: &mut Layer, frame: u32) -> Result<()> {
     Ok(())
 }
 
+/// The layers Shift+F5 and Shift+F6 act on: with `all_layers` (the key with no frame selection,
+/// #438) every layer with frames at or after `frame`, as F5 extends them; else the target layers.
+pub(crate) fn removal_layers(s: &Session, p: &Value, frame: u32) -> Result<Vec<LayerId>> {
+    if opt_bool(p, "all_layers")?.unwrap_or(false) { Ok(layers_at_or_after(s, frame)) } else { target_layers(s, p) }
+}
+
 /// Shift+F5 over a range: removes up to `count` frames on each target layer. Layers that run
-/// out of frames stop early; it fails only when nothing could be removed.
+/// out of frames stop early; it fails only when nothing could be removed. With `all_layers`
+/// every layer that reaches the frame loses them, so the layers stay in step: a layer with no
+/// frame there (a gap, or frames that start later) closes up by an empty frame.
 pub(crate) fn remove_frame(s: &mut Session, p: &Value) -> Result<Value> {
     let (_, frame) = target(s, p)?;
     let count = count_param(p)?;
+    let all = opt_bool(p, "all_layers")?.unwrap_or(false);
     let mut removed = 0u32;
     let mut first_err = None;
-    for id in target_layers(s, p)? {
+    for id in removal_layers(s, p, frame)? {
         let layer = s.layer_mut(Some(id))?;
         for _ in 0..count {
+            if all && layer.keyframe_index_at(frame).is_none() {
+                // An empty frame under the playhead: what follows moves one frame earlier.
+                if layer.end_frame() <= frame + 1 {
+                    break;
+                }
+                shift_after(layer, frame + 1, -1);
+                layer.normalize();
+                removed += 1;
+                continue;
+            }
             match remove_frame_at(layer, frame) {
                 Ok(()) => removed += 1,
                 Err(e) => {
@@ -365,7 +384,17 @@ pub(crate) fn remove_frame(s: &mut Session, p: &Value) -> Result<Value> {
     }
     match (removed, first_err) {
         (0, Some(e)) => Err(e),
-        _ => Ok(json!({"removed": removed, "frames": s.frame_count()})),
+        _ => {
+            let frames = s.frame_count();
+            let mut out = json!({"removed": removed, "frames": frames});
+            // The last frames went from under the playhead: it steps back onto the new last
+            // frame, so holding Shift+F5 keeps shortening the timeline as F5 lengthens it.
+            if all && s.frame >= frames {
+                s.set_frame(frames.saturating_sub(1));
+                out["playhead"] = json!(s.frame);
+            }
+            Ok(out)
+        }
     }
 }
 
@@ -532,7 +561,7 @@ fn clear_keyframe(s: &mut Session, p: &Value) -> Result<Value> {
     let (_, frame) = target(s, p)?;
     let count = count_param(p)?;
     let mut cleared = 0;
-    for id in target_layers(s, p)? {
+    for id in removal_layers(s, p, frame)? {
         let layer = s.layer_mut(Some(id))?;
         let starts: Vec<u32> = layer.keyframes.iter().map(|k| k.start).filter(|&f| f >= frame && f - frame < count).collect();
         // Last first, so each removal merges into a span that is still there.

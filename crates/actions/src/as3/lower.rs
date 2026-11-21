@@ -349,6 +349,10 @@ impl<'a> Lower<'a> {
             self.note(pos, "keys go to the stage here: listen with `stage.addEventListener(KeyboardEvent.KEY_DOWN, …)`; this listener is ignored");
             return None;
         }
+        if event == ListenEvent::Change && (at.base == Base::Stage || (at.base == Base::This && at.path.is_this())) {
+            self.problem(pos, "`Event.CHANGE` comes from an input text field: listen on the field, as in `name_txt.addEventListener(Event.CHANGE, onChange)`");
+            return None;
+        }
         if at.base == Base::Stage && event.mouse().is_some() {
             self.problem(pos, "mouse listeners on the stage aren't supported yet (on buttons and movie clips they are)");
             return None;
@@ -414,6 +418,7 @@ impl<'a> Lower<'a> {
                     ("MouseEvent", "ROLL_OVER" | "MOUSE_OVER") => Some(ListenEvent::Over),
                     ("MouseEvent", "ROLL_OUT" | "MOUSE_OUT") => Some(ListenEvent::Out),
                     ("Event", "ENTER_FRAME") => Some(ListenEvent::EnterFrame),
+                    ("Event", "CHANGE") => Some(ListenEvent::Change),
                     ("KeyboardEvent", "KEY_DOWN") => Some(ListenEvent::KeyDown),
                     ("KeyboardEvent", "KEY_UP") => Some(ListenEvent::KeyUp),
                     _ => None,
@@ -429,6 +434,7 @@ impl<'a> Lower<'a> {
                     "rollOver" | "mouseOver" => Some(ListenEvent::Over),
                     "rollOut" | "mouseOut" => Some(ListenEvent::Out),
                     "enterFrame" => Some(ListenEvent::EnterFrame),
+                    "change" => Some(ListenEvent::Change),
                     "keyDown" => Some(ListenEvent::KeyDown),
                     "keyUp" => Some(ListenEvent::KeyUp),
                     _ => None,
@@ -440,7 +446,7 @@ impl<'a> Lower<'a> {
             }
         };
         if key.is_none() {
-            self.problem(e.pos, format!("listening for {name} isn't supported yet (mouse CLICK, MOUSE_DOWN, MOUSE_UP, ROLL_OVER and ROLL_OUT, Event.ENTER_FRAME and KeyboardEvent.KEY_DOWN and KEY_UP are)"));
+            self.problem(e.pos, format!("listening for {name} isn't supported yet (mouse CLICK, MOUSE_DOWN, MOUSE_UP, ROLL_OVER and ROLL_OUT, Event.ENTER_FRAME, Event.CHANGE on input text fields, and KeyboardEvent.KEY_DOWN and KEY_UP are)"));
         }
         key
     }
@@ -649,9 +655,10 @@ impl<'a> Lower<'a> {
                 Some(LValue::Var { n: n.clone() })
             }
             E::Member(o, m) if m == "text" => Some(LValue::Text { at: self.field_place(o, u)? }),
+            E::Member(o, m) if matches!(m.as_str(), "htmlText" | "maxChars" | "restrict") => Some(LValue::Field { at: self.field_place(o, u)?, p: Prop::from_member(m)? }),
             E::Member(o, m) => {
                 let Some(p) = Prop::from_member(m) else {
-                    self.problem(e.pos, format!("setting `{m}` isn't supported yet (x, y, alpha, visible, rotation, scaleX, scaleY and a text field's text are)"));
+                    self.problem(e.pos, format!("setting `{m}` isn't supported yet (x, y, alpha, visible, rotation, scaleX, scaleY and a text field's text, htmlText, maxChars and restrict are)"));
                     return None;
                 };
                 let Some(p) = p.settable() else {
@@ -863,10 +870,10 @@ impl<'a> Lower<'a> {
             return None;
         }
         let Some(p) = Prop::from_member(m) else {
-            self.problem(e.pos, format!("reading `{m}` isn't supported yet (x, y, alpha, visible, rotation, scaleX, scaleY, currentFrame, totalFrames, currentLabel, mouseX, mouseY, name, and a text field's text and length are)"));
+            self.problem(e.pos, format!("reading `{m}` isn't supported yet (x, y, alpha, visible, rotation, scaleX, scaleY, currentFrame, totalFrames, currentLabel, mouseX, mouseY, name, and a text field's text, htmlText, length, maxChars and restrict are)"));
             return None;
         };
-        let at = if matches!(p, Prop::Text | Prop::Length) { self.field_place(o, u)? } else { self.place(o, u)? };
+        let at = if p.is_field() { self.field_place(o, u)? } else { self.place(o, u)? };
         if at.base == Base::Stage && !matches!(p, Prop::MouseX | Prop::MouseY) {
             self.problem(e.pos, format!("`stage.{m}` isn't supported yet"));
             return None;

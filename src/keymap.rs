@@ -7,7 +7,7 @@
 //! ones that open this editor, the palette and preferences, quitting, playing and cancelling.
 //! A chord is written in registry notation, modifiers in a fixed order: `Ctrl+Alt+Shift+K`.
 
-use crate::app::{Tool, VIEW_SHORTCUTS};
+use crate::app::{Tool, VIEW_SHORTCUTS, VIEW_UNBOUND};
 use anicraft_engine::{SHORTCUT_ALIASES, commands};
 use egui::{Key, Modifiers};
 use std::cell::RefCell;
@@ -89,6 +89,18 @@ fn view_label(id: &str) -> &'static str {
         "view.find_next" => tr_noop!("Find Next"),
         "view.find_prev" => tr_noop!("Find Previous"),
         "view.movie_explorer" => tr_noop!("Movie Explorer"),
+        "view.panel.properties" => tr_noop!("Properties Panel"),
+        "view.panel.align" => tr_noop!("Align Panel"),
+        "view.panel.colour" => tr_noop!("Colour Panel"),
+        "view.panel.library" => tr_noop!("Library Panel"),
+        "view.panel.history" => tr_noop!("History Panel"),
+        "view.panel.layer_depth" => tr_noop!("Layer Depth Panel"),
+        "view.panel.timeline" => tr_noop!("Timeline Panel"),
+        "view.panel.motion_editor" => tr_noop!("Motion Editor Panel"),
+        "view.panel.output" => tr_noop!("Output Panel"),
+        "view.panel.swatches" => tr_noop!("Swatches Panel"),
+        "view.panel.tools" => tr_noop!("Tools Panel"),
+        "view.hide_panels" => tr_noop!("Hide Panels / Show Panels"),
         "view.close_document" => tr_noop!("Close Document"),
         "view.close_all_documents" => tr_noop!("Close All Documents"),
         "view.next_document" => tr_noop!("Next Document"),
@@ -162,7 +174,7 @@ pub fn actions() -> Vec<Action> {
         .collect();
     v.extend(Tool::ALL.into_iter().map(|t| Action { id: tool_id(t), label: t.label(), group: tr_noop!("Tools"), defaults: t.shortcut().into_iter().collect() }));
     let mut views: Vec<&str> = Vec::new();
-    for (_, id) in VIEW_SHORTCUTS {
+    for id in VIEW_SHORTCUTS.iter().map(|(_, id)| id).chain(VIEW_UNBOUND) {
         if !views.contains(id) {
             views.push(id);
         }
@@ -441,6 +453,15 @@ mod tests {
         assert_eq!(m.keys("view.brush_smaller"), ["["]);
         assert_eq!(m.keys("view.brush_larger"), ["]"]);
         assert_eq!(m.primary("view.onion"), Some("Alt+Shift+O"));
+        // #456: every panel is an action, with Animate's key where it is free.
+        for p in crate::dock::Panel::ALL {
+            assert!(m.actions.iter().any(|a| a.id == p.action() && a.label != "View action"), "{p:?} has no action");
+            assert_eq!(crate::dock::Panel::from_action(p.action()), Some(p));
+        }
+        assert_eq!(m.primary("view.panel.library"), Some("Ctrl+L"));
+        assert_eq!(m.primary("view.panel.timeline"), Some("Ctrl+Alt+T"));
+        assert_eq!(m.primary("view.panel.align"), None, "Ctrl+K is the command palette");
+        assert_eq!(m.primary("view.hide_panels"), Some("F4"));
         assert_eq!(m.owner("ctrl+z").map(|a| a.id), None, "chords are case-sensitive registry names");
         assert_eq!(m.owner("Ctrl+Shift+Z").map(|a| a.id), Some("modify.remove_transform"));
         let mut all: Vec<String> = m.actions.iter().flat_map(|a| m.keys(a.id).to_vec()).collect();

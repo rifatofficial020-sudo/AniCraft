@@ -216,7 +216,7 @@ fn set_properties(s: &mut Session, p: &Value) -> Result<Value> {
 fn properties(s: &Session, id: LayerId) -> Result<Value> {
     let l = s.timeline().layer(id).ok_or_else(|| EngineError::State(format!("no layer with id {}", id.0)))?;
     let ty = crate::cmds_timeline::layer_type_json(s, id).get("type").cloned().unwrap_or(Value::Null);
-    Ok(json!({
+    let mut out = json!({
         "layer": id.0,
         "name": l.name,
         "type": ty,
@@ -228,7 +228,12 @@ fn properties(s: &Session, id: LayerId) -> Result<Value> {
         "visible": l.visible,
         "locked": l.locked,
         "onion": l.onion,
-    }))
+    });
+    // A reference video (ADR 0116), on the layers that have one.
+    if l.video.is_some() {
+        out["video"] = crate::cmds_video::video_json(l);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

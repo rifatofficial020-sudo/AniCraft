@@ -28,7 +28,7 @@ pub fn specs() -> Vec<CommandSpec> {
             true,
             draw_freehand,
         ),
-        c("path.move_points", "Move Points", "", None, "{id, points: [[cmd, slot], ..], dx, dy, smooth?: bool} (a handle moved alone at a smooth anchor turns the other one with it, keeping its length, unless smooth is false: Alt breaks the pair)", true, move_points),
+        c("path.move_points", "Move Points", "", None, "{id (a shape, or text on a path: the path it follows, ADR 0107), points: [[cmd, slot], ..], dx, dy, smooth?: bool} (a handle moved alone at a smooth anchor turns the other one with it, keeping its length, unless smooth is false: Alt breaks the pair)", true, move_points),
         c("path.add_point", "Add Anchor Point", "", None, "{id, x, y, slop?}", true, add_point),
         c("path.delete_points", "Delete Anchor Points", "", None, "{id, cmds: [..]}", true, delete_points),
         c("path.convert_point", "Convert Anchor Point", "", None, "{id, cmd, smooth: bool}", true, convert_point),
@@ -126,7 +126,7 @@ fn draw_freehand(s: &mut Session, p: &Value) -> Result<Value> {
 // ----- point editing ----------------------------------------------------------------------
 
 /// Runs `edit` on shape element `id` (param `id`) in the editable keyframe (copy-on-write), with
-/// its transform. The shape of a shape armature is reshaped at rest instead, keeping its binding
+/// its transform; on text on a path, on the path the text follows (ADR 0107). The shape of a shape armature is reshaped at rest instead, keeping its binding
 /// (ADR 0090).
 fn edit_shape<T>(s: &mut Session, p: &Value, edit: impl FnOnce(&mut Shape, Affine) -> Result<T>) -> Result<T> {
     let id = ElementId(opt_u64(p, "id")?.ok_or_else(|| EngineError::Param("param 'id' is required".into()))?);
@@ -139,10 +139,23 @@ fn edit_shape<T>(s: &mut Session, p: &Value, edit: impl FnOnce(&mut Shape, Affin
     let kf = s.editable_keyframe()?;
     let el: &mut Element = kf.elements_mut_where(|e| e == id).into_iter().next().ok_or_else(|| EngineError::State(format!("no element {}", id.0)))?;
     let m = el.transform;
+    // Text on a path: the points of the path it follows (its own copy, ADR 0107). The glyphs
+    // are set along the edited path, and the block's box moves so nothing else does.
+    if let ElementKind::Text(t) = &el.kind
+        && let Some(on) = &t.on_path
+    {
+        let mut sh = Shape { path: Arc::new(on.path.clone()), fill: None, stroke: None, fill_rule: anicraft_geom::FillRule::NonZero, merge: false, warp: None };
+        let out = edit(&mut sh, m)?;
+        let block = anicraft_doc::TextBlock { on_path: Some(anicraft_doc::TextPath { path: Path::clone(&sh.path), ..on.clone() }), ..(**t).clone() };
+        let (block, _, shift) = crate::cmds_text::lay_out_block(&block)?;
+        el.transform = m.mul(&Affine::translate(shift.x, shift.y));
+        el.kind = ElementKind::Text(Arc::new(block));
+        return Ok(out);
+    }
     match &mut el.kind {
         ElementKind::Shape(sh) => edit(sh, m),
         ElementKind::Symbol { .. } => Err(EngineError::State("symbol instances have no points to edit (double-click to edit the symbol)".into())),
-        ElementKind::Text(_) => Err(EngineError::State("text has no points to edit; break it apart (Ctrl+B) to edit its outlines".into())),
+        ElementKind::Text(_) => Err(EngineError::State("text has no points to edit; break it apart (Ctrl+B) to edit its outlines, or attach it to a path and edit the path".into())),
         ElementKind::Camera => Err(EngineError::State("the camera has no points to edit".into())),
         ElementKind::Group { .. } => Err(EngineError::State("a group has no points of its own (double-click it to edit what is inside)".into())),
     }

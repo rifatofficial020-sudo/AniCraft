@@ -77,6 +77,12 @@ literature on polygon and Bézier blending. Nothing was copied.
    the next keyframe's `shapeHints`. Points within 2 px of an edge snap onto it. Hints past
    `z`, without a position or without an end are reported, never fatal. If real files turn out
    to use another layout, only this reader changes.
+   *Update (2026-11-18):* files Animate saves use another layout, a `<morphHintsList>` on the
+   tween's start keyframe with one `<MorphHint startPoint="x, y" endPoint="x, y" key="0"/>` per
+   hint in letter order; coordinates are decimal or `#` hex fixed point in units of 256 twips
+   (observed: they land exactly on the shapes' edge vertices). The importer reads that list
+   when a frame has no `shapeHints` (`crates/xfl/src/morph_hints.rs`); both map to the same
+   hints.
 
 ## Consequences
 

@@ -53,6 +53,7 @@ pub const PAGES: &[Page] = &[
     page!("text.md"),
     page!("images-and-sound.md"),
     page!("interactivity.md"),
+    page!("data-driven-animation.md"),
     page!("exporting-and-publish.md"),
     page!("opening-animate-files.md"),
     page!("preferences-shortcuts-accessibility.md"),
@@ -79,6 +80,8 @@ pub const IMAGES: &[(&str, &[u8])] = &[
     image!("images/preferences.png"),
     image!("images/audio-to-keyframes.png"),
     image!("images/lip-sync.png"),
+    image!("images/data-chart.png"),
+    image!("images/data-table.png"),
 ];
 
 const STYLE: &str = include_str!("style.css");
@@ -179,9 +182,14 @@ fn heading_text(rest: &[Event]) -> String {
 
 fn unique_slug(seen: &mut BTreeMap<String, usize>, text: &str) -> String {
     let base = slug(text);
-    let n = seen.entry(base.clone()).or_insert(0);
-    let id = if *n == 0 { base } else { format!("{base}-{n}") };
-    *n += 1;
+    let mut id = base.clone();
+    while seen.contains_key(&id) {
+        let n = seen.entry(base.clone()).or_insert(0);
+        *n += 1;
+        id = format!("{base}-{n}");
+    }
+    // Reserve generated ids too: a literal "Foo-1" must not reuse the second "Foo".
+    seen.insert(id.clone(), 0);
     id
 }
 

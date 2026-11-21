@@ -39,6 +39,13 @@ fn norm(a: P) -> P {
 /// A smooth path through a freehand stroke: cubic segments within `tolerance` of the points,
 /// with corners kept sharp. Fewer than two distinct points give a path with at most a `MoveTo`.
 pub fn fit_curve(points: &[Vec2], tolerance: f32, corner_window: f32, closed: bool) -> Path {
+    fit_curve_with(points, tolerance, corner_window, closed, 60.0)
+}
+
+/// [`fit_curve`] with the turn that makes a corner chosen: `corner_angle` degrees (clamped to
+/// 1..=179) over `corner_window`; a smaller angle keeps more corners.
+pub fn fit_curve_with(points: &[Vec2], tolerance: f32, corner_window: f32, closed: bool, corner_angle: f32) -> Path {
+    let cos_thresh = if corner_angle.is_finite() { f64::from(corner_angle.clamp(1.0, 179.0)).to_radians().cos() } else { 60f64.to_radians().cos() };
     let tol = if tolerance.is_finite() && tolerance > 0.0 { f64::from(tolerance) } else { 1.0 };
     let window = if corner_window.is_finite() && corner_window > 0.0 { f64::from(corner_window) } else { 3.0 };
     let mut lp: Vec<P> = Vec::with_capacity(points.len());
@@ -61,7 +68,7 @@ pub fn fit_curve(points: &[Vec2], tolerance: f32, corner_window: f32, closed: bo
         }
         return path;
     }
-    let segs = if closed { fit_closed(&lp, tol, window) } else { fit_open(&lp, tol, window) };
+    let segs = if closed { fit_closed(&lp, tol, window, cos_thresh) } else { fit_open(&lp, tol, window, cos_thresh) };
     // A closed loop with corners starts at its first corner, not necessarily at the first point.
     if let (Some(s), Some(PathCmd::MoveTo(m))) = (segs.first(), path.cmds.first_mut()) {
         *m = v(s[0]);
@@ -101,9 +108,8 @@ fn walk(lp: &[P], i: usize, window: f64, fwd: bool, closed: bool) -> P {
 }
 
 /// Indices of corner points (never an open stroke's ends).
-fn corners(lp: &[P], window: f64, closed: bool) -> Vec<usize> {
+fn corners(lp: &[P], window: f64, closed: bool, cos_thresh: f64) -> Vec<usize> {
     let n = lp.len();
-    let cos_thresh = 60f64.to_radians().cos();
     let interior = |i: usize| closed || (i > 0 && i + 1 < n);
     let turn: Vec<f64> = (0..n)
         .map(|i| {
@@ -151,10 +157,10 @@ fn corners(lp: &[P], window: f64, closed: bool) -> Vec<usize> {
     out
 }
 
-fn fit_open(lp: &[P], tol: f64, window: f64) -> Vec<[P; 4]> {
+fn fit_open(lp: &[P], tol: f64, window: f64, cos_thresh: f64) -> Vec<[P; 4]> {
     let n = lp.len();
     let mut cuts = vec![0];
-    cuts.extend(corners(lp, window, false));
+    cuts.extend(corners(lp, window, false, cos_thresh));
     cuts.push(n - 1);
     let mut segs = Vec::new();
     for w in cuts.windows(2) {
@@ -167,9 +173,9 @@ fn fit_open(lp: &[P], tol: f64, window: f64) -> Vec<[P; 4]> {
     segs
 }
 
-fn fit_closed(lp: &[P], tol: f64, window: f64) -> Vec<[P; 4]> {
+fn fit_closed(lp: &[P], tol: f64, window: f64, cos_thresh: f64) -> Vec<[P; 4]> {
     let n = lp.len();
-    let cs = corners(lp, window, true);
+    let cs = corners(lp, window, true, cos_thresh);
     let mut segs = Vec::new();
     if cs.is_empty() {
         // A smooth loop: start at 0 with one tangent across the seam.
@@ -367,6 +373,24 @@ mod tests {
         let path = fit_curve(&pts, 0.5, 3.0, false);
         assert!(path.anchors().iter().any(|(_, a)| a.distance(Vec2::new(0.0, 50.0)) < 1e-3), "an anchor at the corner");
         assert!(max_dist(&path, &pts) <= 0.55);
+    }
+
+    #[test]
+    fn the_corner_angle_decides_which_turns_stay_sharp() {
+        let mut pts: Vec<Vec2> = (0..=50).map(|i| Vec2::new(i as f32, 0.0)).collect();
+        pts.extend((1..=50).map(|i| Vec2::new(50.0 + i as f32 * 0.6, i as f32 * 0.8)));
+        let sharp_turn = |angle: f32| {
+            let path = fit_curve_with(&pts, 0.5, 3.0, false, angle);
+            path.cmds.windows(2).any(|w| match (w[0], w[1]) {
+                (PathCmd::CubicTo(_, c2, p), PathCmd::CubicTo(c1, _, _)) => {
+                    p.distance(Vec2::new(50.0, 0.0)) < 1e-3 && (p - c2).normalized().cross((c1 - p).normalized()).abs() > 0.1
+                }
+                _ => false,
+            })
+        };
+        assert!(sharp_turn(40.0), "a 53° turn is a corner at 40°");
+        assert!(!sharp_turn(85.0), "and smoothed at 85°");
+        assert_eq!(fit_curve_with(&pts, 0.5, 3.0, false, 60.0), fit_curve(&pts, 0.5, 3.0, false), "fit_curve is 60°");
     }
 
     #[test]

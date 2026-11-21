@@ -238,10 +238,14 @@ stroke's frame and the fill behind it), or in the drawing tool's options in Prop
 **Fill** swatch and its on/off checkbox, and the **Stroke** swatch, its checkbox and its
 width. The Pencil and the Line tool only draw lines, so they show no fill.
 
-Click any colour swatch to open the colour picker. **Swatches**, the default, shows the 216
-web-safe colours with greys and primaries beside them; a shade or highlight of a colour is
-usually one cell away. The colours you mix or type are kept in the row below for this session.
-**Mixer** sets any colour by hue, saturation and brightness . Under it, the **Alpha**
+Click any colour swatch to open the colour picker. Along its top are the colour and its
+**hex**; they show the swatch under the pointer as you move over the palette, so you can read
+a colour before you click it. The palette, which opens first, is the 216 web-safe colours in
+the order Animate has them (in each block green grows to the right and blue downwards), with
+greys and primaries beside them; a shade or highlight of a colour is usually one cell away.
+The colours you mix or type are kept in the row below for this session. The button at the top
+right, a colour wheel, opens the **mixer**, which sets any colour by hue, saturation and
+brightness; the same button, now a grid of swatches, goes back. Under it, the **Alpha**
 row sets how clear a solid fill or a stroke is, from 0 % (clear) to 100 % (opaque). A clear
 fill is still a fill: you can select it and erase it; **None** is no fill at all. Each stop of
 a gradient has its own alpha, so a gradient can fade out. The hex field shows the colour as
@@ -317,7 +321,7 @@ A gradient shows as a bar with its colour stops under it:
 * **Click the bar** to add a stop there. **Drag a stop** to move it, or drag it down off the
   bar to remove it. A gradient has 2 to 15 stops.
 * Click a stop to pick it. Its **position** and **Remove** show under the bar, and the colour
-  picker below them (Swatches, Mixer, the **hex** field and **alpha**) sets its colour and
+  picker below them (the **hex** field, the swatches or the mixer, and **alpha**) sets its colour and
   opacity. Type `#rrggbbaa` for a colour with opacity.
 * From the keyboard, **Tab** to a stop, move it with the **arrow keys** (**Shift** for bigger
   steps) and press **Delete** to remove it. The bar itself adds a stop in the widest gap.

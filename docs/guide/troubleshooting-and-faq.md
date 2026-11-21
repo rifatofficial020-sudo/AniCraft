@@ -107,6 +107,17 @@ variable `ANICRAFT_FFMPEG` to the full path of the `ffmpeg` program. The web ver
 ffmpeg at all: export an animated GIF, animated PNG or WebP, a PNG sequence or an HTML page
 instead. See [Exporting and publishing](exporting-and-publish.md).
 
+## Importing a video doesn't work
+
+**File › Import › Import Video…** reads video with ffmpeg, which you install yourself (AniCraft
+has no video decoder of its own). If the window says ffmpeg could not be started, install ffmpeg
+so it is on your `PATH`, or set the environment variable `ANICRAFT_FFMPEG` to the full path of
+the `ffmpeg` program, then import again. If it says the file has no video ffmpeg can read, the
+file is damaged or in a format your ffmpeg wasn't built with.
+
+A reference layer that shows only an outline has lost its file: open **Layer Properties** and
+choose **Relink…**. See [Importing video](images-and-sound.md#importing-video).
+
 ## AniCraft closed unexpectedly
 
 Your unsaved work is probably safe. AniCraft keeps a recovery copy in the background (every
@@ -262,4 +273,4 @@ Not yet. The interface is ready for translation, but it is in English only today
 
 Yes, if you want it to. `anicraft-cli mcp` lets an assistant that supports the Model Context
 Protocol draw, animate and export through AniCraft's commands. It is never on unless you set it
-up. See [Working headless](working-headless.md).
+up, and it reads and writes files only in the folders you name when you do. See [Working headless](working-headless.md).

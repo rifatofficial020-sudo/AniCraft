@@ -171,6 +171,7 @@ const MAX_SYMBOLS: usize = 20_000;
 const MAX_LAYERS: usize = 5_000;
 const MAX_FRAME: u32 = 100_000;
 const MAX_BITMAPS: usize = 10_000;
+pub(crate) const MAX_BITMAP_PIXELS: u64 = 256 * 1024 * 1024;
 const MAX_SOUNDS: usize = 10_000;
 const MAX_VIDEOS: usize = 10_000;
 
@@ -252,6 +253,10 @@ struct Builder<'a> {
     language: Language,
     /// Library item name → bitmap id, for the bitmaps that could be read.
     bitmaps: HashMap<String, BitmapId>,
+    /// Total decoded pixels kept across imported bitmaps and video stills.
+    bitmap_pixels: u64,
+    /// Maximum decoded pixels kept across one import.
+    bitmap_pixel_budget: u64,
     /// Library item name → sound id, for the sounds whose file is in the package (ADR 0057).
     sounds: HashMap<String, anicraft_doc::SoundId>,
     /// Library item name -> the still of its first frame, for every video item (`None` when the
@@ -379,8 +384,10 @@ pub(crate) fn stroke(def: &X, bitmaps: &HashMap<String, BitmapId>, report: &mut 
         _ => Join::Round,
     };
     let miter_limit = native.miter_limit().unwrap_or(anicraft_doc::stroke_style::DEFAULT_MITER_LIMIT);
+    // Animate leaves out `dash1` and `dash2` at its defaults, 6 and 6 px: the same strokes
+    // saved by Flash 8–CS4 store both lengths, 6 and 6 where the XFL has neither.
     let dash = match native.kind() {
-        NativeStroke::Dashed => Dash::dashed(native.dash1().unwrap_or(6.0), native.dash2().unwrap_or(3.0)),
+        NativeStroke::Dashed => Dash::dashed(native.dash1().unwrap_or(6.0), native.dash2().unwrap_or(6.0)),
         NativeStroke::Dotted => Dash::dotted(native.dot_space().unwrap_or(3.0)),
         NativeStroke::Solid => None,
         _ => {
@@ -772,7 +779,7 @@ impl<'a> Builder<'a> {
                 }
                 // Shape hints sit on both keyframes of a shape tween; they are paired up below.
                 let shape_hints = craft_xfl::shape_hints::ShapeHints::new(f);
-                if !shape_hints.is_empty() {
+                if !shape_hints.is_empty() || crate::morph_hints::list(f).next().is_some() {
                     raw_hints.insert(start, self.raw_hints(f));
                 }
                 // Frame scripts are kept verbatim (ADR 0013 tier 1); those in the subset run.
@@ -899,20 +906,26 @@ impl<'a> Builder<'a> {
     /// hint; it gives its point on this keyframe as `x`/`y` (or `startPoint="x, y"`, or
     /// `startX`/`startY`), and may carry its end point too (`endPoint`, or `endX`/`endY`);
     /// otherwise the end comes from the same hint on the next keyframe. Points are in pixels.
-    /// The order is `index` (or a letter `name`), else the order in the file.
+    /// The order is `index` (or a letter `name`), else the order in the file. Without
+    /// `shapeHints`, Animate's own `morphHintsList` is read (`morph_hints`).
     fn raw_hints(&mut self, frame: &X) -> Vec<RawHint> {
+        const MAX_LISTED: usize = anicraft_doc::MAX_SHAPE_HINTS * 4;
         let hints = craft_xfl::shape_hints::ShapeHints::new(frame);
-        let to_vec = |point: Option<craft_xfl::shape_hints::Point>| {
-            point.map(|point| Vec2::new(point.x, point.y)).filter(|point| point.x.abs() < 1e6 && point.y.abs() < 1e6)
+        let to_vec = |point: Option<craft_xfl::shape_hints::Point>| point.map(|point| Vec2::new(point.x, point.y));
+        let listed: Vec<(Option<usize>, Option<Vec2>, Option<Vec2>)> = if hints.is_empty() {
+            crate::morph_hints::list(frame).take(MAX_LISTED).map(|hint| (None, hint.start, hint.end)).collect()
+        } else {
+            hints.iter().take(MAX_LISTED).map(|hint| (hint.index(), to_vec(hint.start_point()), to_vec(hint.end_point()))).collect()
         };
+        let in_range = |point: Option<Vec2>| point.filter(|point| point.x.abs() < 1e6 && point.y.abs() < 1e6);
         let mut out: Vec<RawHint> = Vec::new();
-        for (n, hint) in hints.iter().enumerate().take(anicraft_doc::MAX_SHAPE_HINTS * 4) {
-            let order = hint.index().unwrap_or(n);
-            let Some(here) = to_vec(hint.start_point()) else {
+        for (n, (index, here, end)) in listed.into_iter().enumerate() {
+            let order = index.unwrap_or(n);
+            let Some(here) = in_range(here) else {
                 self.report.skip("shape hints without a position");
                 continue;
             };
-            out.push(RawHint { order, here, end: to_vec(hint.end_point()) });
+            out.push(RawHint { order, here, end: in_range(end) });
         }
         out.sort_by_key(|h| h.order);
         if out.len() > anicraft_doc::MAX_SHAPE_HINTS {
@@ -959,6 +972,10 @@ impl<'a> Builder<'a> {
     fn register_bitmaps(&mut self, root: &X) -> Result<(), XflError> {
         for item in craft_xfl::media::Catalog::new(root).bitmaps().take(MAX_BITMAPS) {
             let Some(name) = item.name().filter(|n| !self.bitmaps.contains_key(*n)) else { continue };
+            if self.bitmap_pixels >= self.bitmap_pixel_budget {
+                self.report.skip("bitmaps past the import pixel budget");
+                continue;
+            }
             let mut candidates = Vec::new();
             if let Some(href) = item.href() {
                 candidates.push(craft_xfl::media::library_member(href));
@@ -988,6 +1005,12 @@ impl<'a> Builder<'a> {
             }
             match bitmap {
                 Some(mut b) => {
+                    let pixels = u64::from(b.width).saturating_mul(u64::from(b.height));
+                    if self.bitmap_pixels.saturating_add(pixels) > self.bitmap_pixel_budget {
+                        self.report.skip("bitmaps past the import pixel budget");
+                        continue;
+                    }
+                    self.bitmap_pixels += pixels;
                     b.id = BitmapId(self.doc.alloc_id());
                     // Animate leaves out the default (smoothing on in current versions).
                     b.smoothing = item.allow_smoothing().unwrap_or(true);
@@ -1113,17 +1136,24 @@ impl<'a> Builder<'a> {
             let length = seconds.map(|s| format!(", {:.1} s", s.min(1.0e7))).unwrap_or_default();
             let id = match still {
                 Some(mut b) => {
-                    b.id = BitmapId(self.doc.alloc_id());
-                    let id = b.id;
-                    let folder = name.rsplit_once('/').map(|(f, _)| f);
-                    let path = match folder {
-                        Some(f) => format!("{f}/{}", b.name),
-                        None => b.name.clone(),
-                    };
-                    self.place_in_folder(&path, anicraft_doc::LibraryItem::Bitmap(id));
-                    self.doc.bitmaps.push(Arc::new(b));
-                    self.report.skip_named("videos (first frame kept as a still)", format!("{shown}: Screen Video{length}"));
-                    Some(id)
+                    let pixels = u64::from(b.width).saturating_mul(u64::from(b.height));
+                    if self.bitmap_pixels.saturating_add(pixels) > self.bitmap_pixel_budget {
+                        self.report.skip("bitmaps past the import pixel budget");
+                        None
+                    } else {
+                        self.bitmap_pixels += pixels;
+                        b.id = BitmapId(self.doc.alloc_id());
+                        let id = b.id;
+                        let folder = name.rsplit_once('/').map(|(f, _)| f);
+                        let path = match folder {
+                            Some(f) => format!("{f}/{}", b.name),
+                            None => b.name.clone(),
+                        };
+                        self.place_in_folder(&path, anicraft_doc::LibraryItem::Bitmap(id));
+                        self.doc.bitmaps.push(Arc::new(b));
+                        self.report.skip_named("videos (first frame kept as a still)", format!("{shown}: Screen Video{length}"));
+                        Some(id)
+                    }
                 }
                 None => {
                     let why = match (format, unreadable) {
@@ -1378,6 +1408,15 @@ pub fn import_with_fonts(read: &Reader<'_>, fonts: &Fonts) -> Result<(Document, 
 }
 
 fn import_from<'a>(read: &'a Reader<'a>, fonts: Option<&'a Fonts>) -> Result<(Document, Report), XflError> {
+    import_from_with_budget(read, fonts, MAX_BITMAP_PIXELS)
+}
+
+#[cfg(test)]
+pub(crate) fn import_with_bitmap_budget(read: &Reader<'_>, bitmap_pixel_budget: u64) -> Result<(Document, Report), XflError> {
+    import_from_with_budget(read, None, bitmap_pixel_budget)
+}
+
+fn import_from_with_budget<'a>(read: &'a Reader<'a>, fonts: Option<&'a Fonts>, bitmap_pixel_budget: u64) -> Result<(Document, Report), XflError> {
     let bytes = read("DOMDocument.xml")?.ok_or_else(|| XflError::NotXfl("no DOMDocument.xml".into()))?;
     let parsed = craft_xfl::document::Document::parse(&bytes).map_err(xml::from_craft_error)?;
     let (schema, xml_root) =
@@ -1393,6 +1432,8 @@ fn import_from<'a>(read: &'a Reader<'a>, fonts: Option<&'a Fonts>) -> Result<(Do
         pending: Vec::new(),
         language: Language::ActionScript3,
         bitmaps: HashMap::new(),
+        bitmap_pixels: 0,
+        bitmap_pixel_budget,
         sounds: HashMap::new(),
         videos: HashMap::new(),
         report: Report::default(),
@@ -1517,18 +1558,45 @@ pub fn import_path(path: &std::path::Path) -> Result<(Document, Report), XflErro
         return import_fla(&std::fs::read(path)?);
     }
     let dir = if meta.is_dir() { path.to_path_buf() } else { path.parent().map(std::path::Path::to_path_buf).unwrap_or_default() };
+    let base = if dir.as_os_str().is_empty() { std::path::Path::new(".") } else { dir.as_path() };
+    let canon_dir = std::fs::canonicalize(base)?;
     let read = |p: &str| -> Result<Option<Vec<u8>>, XflError> {
         // Only plain relative paths inside the package.
-        if p.split('/').any(|c| c == ".." || c.is_empty()) || p.contains(':') {
+        // Backslash too: Windows treats it as a separator, so `..\x` would leave the package.
+        let parts: Vec<&str> = p.split(['/', '\\']).collect();
+        if parts.is_empty() || p.contains(':') || p.contains('\0') || parts.iter().any(|c| c.is_empty() || *c == "." || *c == "..") {
             return Ok(None);
         }
-        let full = dir.join(p);
-        match std::fs::read(&full) {
-            Ok(b) if b.len() <= xml::MAX_INPUT => Ok(Some(b)),
-            Ok(_) => Err(XflError::NotXfl(format!("{p} is too large"))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
+        // Regular directories and files only at every component (neither an intermediate directory
+        // symlink nor a symlinked file can escape the package or open /dev/zero), and never more
+        // than the cap is read, however big the file claims to be.
+        let mut full = base.to_path_buf();
+        for (i, part) in parts.iter().enumerate() {
+            full.push(part);
+            let m = match std::fs::symlink_metadata(&full) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e.into()),
+            };
+            let is_last = i + 1 == parts.len();
+            if (is_last && !m.is_file()) || (!is_last && !m.is_dir()) {
+                return Ok(None);
+            }
         }
+        let canon_full = match std::fs::canonicalize(&full) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        if !canon_full.starts_with(&canon_dir) {
+            return Ok(None);
+        }
+        let mut b = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(std::fs::File::open(&full)?, xml::MAX_INPUT as u64 + 1), &mut b)?;
+        if b.len() > xml::MAX_INPUT {
+            return Err(XflError::NotXfl(format!("{p} is too large")));
+        }
+        Ok(Some(b))
     };
     import_with(&read)
 }

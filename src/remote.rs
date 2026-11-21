@@ -130,7 +130,9 @@ impl mcp::Host for Live<'_> {
         if self.0.s.revision != revision {
             self.0.start = None;
         }
-        self.0.announce(id, &v, selected);
+        // The window's own follow-up (its settings, Open Recent) is not the assistant's file
+        // access: the automation roots apply to the command above only (ADR 0124).
+        anicraft_engine::access::unconfined(|| self.0.announce(id, &v, selected));
         Ok(v)
     }
 }

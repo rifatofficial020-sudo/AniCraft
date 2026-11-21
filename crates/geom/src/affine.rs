@@ -101,15 +101,16 @@ impl Affine {
     pub fn decompose(&self) -> Decomposed {
         let [a, b, c, d, e, f] = self.m;
         let sx = (a * a + b * b).sqrt();
-        let rotation = b.atan2(a);
         let det = a * d - b * c;
-        let (sy, skew) = if sx > 1e-12 {
+        let (rotation, sy, skew) = if sx > 1e-12 {
             let sy = det / sx;
             // col1 · col2 = sx · sy · skew
             let skew = if det.abs() > 1e-12 { (a * c + b * d) / det } else { 0.0 };
-            (sy, skew)
+            (b.atan2(a), sy, skew)
         } else {
-            ((c * c + d * d).sqrt(), 0.0)
+            // Degenerate first column: take the rotation from the second column, which
+            // `compose` maps to (-sin r, cos r) · sy.
+            ((-c).atan2(d), (c * c + d * d).sqrt(), 0.0)
         };
         Decomposed { tx: e, ty: f, sx, sy, rotation, skew }
     }
@@ -147,12 +148,13 @@ impl Decomposed {
     /// Component-wise interpolation; rotation takes the shortest arc.
     pub fn lerp(&self, o: &Decomposed, t: f32) -> Decomposed {
         let mut dr = o.rotation - self.rotation;
-        let tau = std::f32::consts::TAU;
-        while dr > std::f32::consts::PI {
-            dr -= tau;
-        }
-        while dr < -std::f32::consts::PI {
-            dr += tau;
+        if dr.is_finite() {
+            let pi = std::f32::consts::PI;
+            if dr > pi || dr < -pi {
+                dr = (dr + pi).rem_euclid(std::f32::consts::TAU) - pi;
+            }
+        } else {
+            dr = 0.0;
         }
         Decomposed {
             tx: crate::lerp(self.tx, o.tx, t),
@@ -171,6 +173,14 @@ mod tests {
 
     fn close(a: &Affine, b: &Affine) -> bool {
         a.m.iter().zip(b.m.iter()).all(|(x, y)| (x - y).abs() < 1e-4)
+    }
+
+    #[test]
+    fn decompose_roundtrip_zero_sx() {
+        for m in [[0.0, 0.0, -1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0, 3.0, 4.0], [0.0, 0.0, 2.0, -3.0, 1.0, 1.0]] {
+            let m = Affine { m };
+            assert!(close(&m.decompose().compose(), &m), "{:?}", m.decompose().compose());
+        }
     }
 
     #[test]
@@ -221,5 +231,23 @@ mod tests {
     fn apply_order() {
         let m = Affine::translate(10.0, 0.0).mul(&Affine::scale(2.0, 2.0));
         assert_eq!(m.apply(Vec2::new(1.0, 1.0)), Vec2::new(12.0, 2.0));
+    }
+
+    #[test]
+    fn lerp_huge_rotation_terminates() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let a = Decomposed::default();
+            let r: Vec<f32> = [1e9_f32, f32::INFINITY, f32::NAN]
+                .iter()
+                .map(|&rot| a.lerp(&Decomposed { rotation: rot, ..Default::default() }, 0.5).rotation)
+                .collect();
+            let _ = tx.send(r);
+        });
+        let r = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("lerp did not terminate");
+        assert!(r.iter().all(|x| x.is_finite()), "{r:?}");
+        let d = Decomposed { rotation: 3.0, ..Default::default() };
+        let e = Decomposed { rotation: -3.0, ..Default::default() };
+        assert!((d.lerp(&e, 0.5).rotation - std::f32::consts::PI).abs() < 1e-5);
     }
 }

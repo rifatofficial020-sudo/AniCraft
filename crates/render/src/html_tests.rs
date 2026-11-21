@@ -212,9 +212,26 @@ fn snapshot(st: &PlayerState) -> Value {
         "stage": st.stage.iter().map(|x| json!([x.event.key(), ids(&x.owner), x.function])).collect::<Vec<_>>(),
         "vars": st.vars.iter().map(|(p, v)| json!([ids(p), v.iter().map(|(k, v)| json!([k, format!("{}:{}", kind(v), v.text())])).collect::<Vec<_>>()])).collect::<Vec<_>>(),
         "hover": st.hover.as_deref().map(ids), "pressed": st.pressed.as_deref().map(ids), "down": st.down,
-        "fields": st.fields.iter().map(|(p, f)| json!([ids(p), f.text, f.caret, f.anchor])).collect::<Vec<_>>(),
+        "fields": st.fields.iter().map(|(p, f)| json!([ids(p), f.text, f.caret, f.anchor, f.rich.as_ref().map(|r| json!([r.runs.iter().map(run_json).collect::<Vec<_>>(), r.paragraphs.iter().map(|q| align_json(q.align)).collect::<Vec<_>>()])), f.max_chars, f.restrict])).collect::<Vec<_>>(),
         "focus": st.focus.as_deref().map(ids), "selecting": st.selecting, "shift": st.shift,
     })
+}
+
+/// A styled run in the shape of the JS player's snapshot.
+fn run_json(r: &anicraft_doc::TextRun) -> Value {
+    let s = &r.style;
+    let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    // Whole numbers as JSON writes them from JavaScript (14, not 14.0).
+    let n = |v: f32| if v.fract() == 0.0 { json!(v as i64) } else { json!(f64::from(v)) };
+    json!([r.chars, s.font, n(s.size), s.bold, s.italic, [b(s.color.r), b(s.color.g), b(s.color.b)], n(s.letter_spacing), s.underline, s.url])
+}
+
+fn align_json(a: anicraft_doc::TextAlign) -> &'static str {
+    match a {
+        anicraft_doc::TextAlign::Left => "left",
+        anicraft_doc::TextAlign::Center => "center",
+        anicraft_doc::TextAlign::Right => "right",
+    }
 }
 
 /// A script value's kind, as the JS snapshot tags it.
@@ -984,6 +1001,215 @@ fn the_js_player_runs_text_fields_like_the_rust_player() {
         assert!(lines.iter().any(|l| l == want), "the fields movie never wrote {want:?}: {lines:?}");
     }
     assert!(lines.iter().any(|l| l.starts_with("Listener onKey stopped: line ") && l.ends_with("no instance named “name_txt” here")), "{lines:?}");
+}
+
+/// The fields movie with the rest of the field API (ADR 0107): `htmlText` set (with hostile
+/// markup) and read back, on a touched and an untouched field with authored runs; `maxChars` and
+/// `restrict`; a change listener and the input field's change actions; wrong-kind messages.
+fn html_fields_doc() -> Document {
+    use anicraft_doc::{CharStyle, TextField, TextKind, TextRun};
+    let mut d = Document { stage: anicraft_doc::Stage { width: 200, height: 100, fps: 24.0, background: Rgba::hex(0xffffff) }, ..Document::default() };
+    d.library = vec![symbol(100, SymbolKind::MovieClip, vec![layer(101, vec![kf(0, 1, vec![rect(1001, 0.0, 0.0, 20.0, 20.0, 0x884422)], vec![], "")])])];
+    let mut name = TextField::new(TextKind::Input);
+    name.on_change = vec![Action::Trace { message: "edited".into() }];
+    // A field with authored runs: "Styled" in two styles and two paragraphs.
+    let mut styled = field_el(53, "styled_txt", Vec2::new(10.0, 70.0), (120.0, 20.0), "Sty\nled", Some(TextField::new(TextKind::Dynamic)));
+    if let ElementKind::Text(t) = &mut Arc::make_mut(&mut styled).kind {
+        let t = Arc::make_mut(t);
+        let base = t.char_style();
+        let red = CharStyle { color: Rgba::hex(0xcc0000), italic: true, size: 13.3, letter_spacing: -0.755, underline: true, url: "https://example.com/?a=1&b=\"2\"".into(), ..base.clone() };
+        let (left, right) = (anicraft_doc::ParagraphStyle::default(), anicraft_doc::ParagraphStyle { align: anicraft_doc::TextAlign::Right, ..Default::default() });
+        t.set_styles(vec![TextRun { chars: 2, style: base }, TextRun { chars: 5, style: red }], vec![left, right]);
+    }
+    let fields = vec![field_el(50, "score_txt", Vec2::new(10.0, 10.0), (100.0, 20.0), "Score", Some(TextField::new(TextKind::Dynamic))), field_el(51, "name_txt", Vec2::new(10.0, 40.0), (120.0, 20.0), "", Some(name)), inst(52, 100, "door", Affine::translate(150.0, 60.0), vec![]), styled];
+    let mut scripts = layer(1, (0..7).map(|f| kf(f, 1, vec![], vec![], "")).collect());
+    let main = "import flash.events.*;\n\
+        var n:int = 0;\n\
+        trace(score_txt.htmlText);\n\
+        trace(styled_txt.htmlText);\n\
+        trace(name_txt.htmlText, name_txt.maxChars, name_txt.restrict);\n\
+        score_txt.htmlText = \"<p align=\\\"right\\\">A <b>b<i>c</i></b> &lt;&amp;&#65;&bogus; <font face=\\\"Georgia\\\" size=\\\"+3.5\\\" color=\\\"#Ff8000\\\" letterspacing=\\\"1.25\\\">d</font></p><script>x()</script><a href=\\\"JaVaScript:1\\\">e</a><a href=\\\"page.html?x=1\\\"><u>f</u></a><br>g<unknown>h</p>\";\n\
+        trace(score_txt.text);\n\
+        trace(score_txt.htmlText);\n\
+        trace(score_txt.length);\n\
+        name_txt.maxChars = 6.7;\n\
+        name_txt.restrict = \"A-Z^Q 0-9\\\\-\";\n\
+        trace(name_txt.maxChars, name_txt.restrict);\n\
+        name_txt.htmlText = \"<b>AB</b>\";\n\
+        name_txt.addEventListener(Event.CHANGE, onChange);\n\
+        name_txt.addEventListener(\"change\", function (e:Event):void { trace(\"inline \" + (e.target == name_txt)); });\n\
+        door.addEventListener(Event.CHANGE, onChange);\n\
+        function onChange(e:Event):void { n++; trace(n + \" \" + e.target.text + \" \" + e.currentTarget.htmlText); score_txt.htmlText = \"<i>\" + name_txt.text + \"</i>\"; }";
+    let frames = [main, "", "", "door.htmlText = \"x\";", "trace(root.maxChars);", "score_txt.htmlText = null;", "stop();"];
+    {
+        let l = Arc::make_mut(&mut scripts);
+        for (k, src) in l.keyframes.iter_mut().zip(frames) {
+            if !src.is_empty() {
+                as3(k, src);
+            }
+        }
+    }
+    d.timeline_mut(0).layers = vec![scripts, layer(2, vec![kf(0, 7, fields, vec![], "")])];
+    d.sanitize();
+    d
+}
+
+#[test]
+fn the_js_player_runs_html_text_change_events_and_limits_like_the_rust_player() {
+    let doc = html_fields_doc();
+    let m = movie(&doc, &HtmlOptions::default());
+    assert_eq!(m.report.get(KEPT_SCRIPTS), None, "every script runs: {:?}", m.report);
+    let name = at(30.0, 50.0);
+    let mut script: Vec<(Vec<Event>, Vec<Event>)> = (0..6).map(|_| (vec![], vec![])).collect();
+    // The movie stops on frame 7. Click the input field and type: only capitals but Q go in
+    // (what follows the `^` is refused: Q, spaces, digits and hyphens), six characters at most;
+    // then delete, select all and replace.
+    script.push((vec![Event::Down(name), Event::Up(name)], vec![]));
+    script.push((vec![Event::Char('c'), Event::Char('C'), Event::Char('Q'), Event::Char('-'), Event::Char('7')], vec![Event::Char('X'), Event::Char('Y'), Event::Char('Z')]));
+    script.push((vec![Event::KeyDown(8), Event::KeyDown(37), Event::KeyDown(13)], vec![Event::SelectAll, Event::Char('!'), Event::Char('W')]));
+    script.push((vec![], vec![]));
+    let lines = compare(&doc, &script);
+    let base = "<font face=\"Inter\" size=\"14\" color=\"#112233\" letterspacing=\"0.5\">";
+    for want in [
+        format!("<p align=\"center\">{base}<b>Score</b></font></p>"),
+        format!("<p align=\"left\">{base}<b>St</b></font><font face=\"Inter\" size=\"13.3\" color=\"#cc0000\" letterspacing=\"-0.75\"><a href=\"https://example.com/?a=1&amp;b=&quot;2&quot;\"><b><i><u>y</u></i></b></a></font></p><p align=\"right\"><font face=\"Inter\" size=\"13.3\" color=\"#cc0000\" letterspacing=\"-0.75\"><a href=\"https://example.com/?a=1&amp;b=&quot;2&quot;\"><b><i><u>led</u></i></b></a></font></p>"),
+        "<p align=\"center\"></p> 0 null".to_string(),
+        "A bc <&A&bogus; d\nef\ngh".to_string(),
+        "23".to_string(),
+        "6 A-Z^Q 0-9\\-".to_string(),
+        "edited".to_string(),
+        "1 ABC <p align=\"center\"><font face=\"Inter\" size=\"14\" color=\"#112233\" letterspacing=\"0.5\"><b>ABC</b></font></p>".to_string(),
+        "inline true".to_string(),
+        "4 ABCXYZ <p align=\"center\"><font face=\"Inter\" size=\"14\" color=\"#112233\" letterspacing=\"0.5\"><b>ABCXYZ</b></font></p>".to_string(),
+        "Listen for change (door): “door” is a movie clip; only text fields send change events".to_string(),
+        "Script on frame 4 of the main timeline stopped: line 1: “door” is a movie clip, not a text field".to_string(),
+        "Script on frame 5 of the main timeline stopped: line 1: the main timeline isn't a text field".to_string(),
+        "Script on frame 6 of the main timeline stopped: line 1: `htmlText` is set to text, not null".to_string(),
+    ] {
+        assert!(lines.contains(&want), "the movie never wrote {want:?}: {lines:#?}");
+    }
+    // The hostile markup left nothing behind in what the field reads back.
+    let html = lines.iter().find(|l| l.starts_with("<p align=\"right\">")).expect("htmlText read back");
+    assert!(!html.to_lowercase().contains("script") && html.contains("<a href=\"page.html?x=1\"><b><u>f</u></b></a>") && html.contains("size=\"17.5\" color=\"#ff8000\" letterspacing=\"1.25\"><b>d</b></font>"), "{html}");
+    // Six characters at most, one change per edit, every one heard by both listeners and the
+    // field's own actions.
+    assert_eq!(lines.iter().filter(|l| l.as_str() == "edited").count(), lines.iter().filter(|l| l.starts_with("inline")).count());
+    assert!(lines.iter().any(|l| l.starts_with("6 W ")), "a deletion, then select all and one edit (the `!` is refused and deletes nothing): {lines:#?}");
+}
+
+/// Small deterministic generator (xorshift).
+fn rng(seed: &mut u64) -> u64 {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 7;
+    *seed ^= *seed << 17;
+    *seed
+}
+
+#[test]
+fn the_js_html_text_reader_and_writer_match_rust_on_any_input() {
+    use anicraft_doc::html_text;
+    let doc = html_fields_doc();
+    let m = movie(&doc, &HtmlOptions::default());
+    let mut js = Js::new(&m);
+    js.ctx
+        .eval(Source::from_bytes(
+            "function RT(html) { var b = { font: 'Arial', size: 12, bold: false, italic: false, color: [0, 0, 0], ls: 0, u: false, url: '' }; var p = AniCraft.htmlText.parse(html, b, { al: 'left' }); \
+             return [p.text, p.runs.map(function (r) { return [r.n, r.s.font, r.s.size, r.s.bold, r.s.italic, r.s.color, r.s.ls, r.s.u, r.s.url]; }), p.paras.map(function (q) { return q.al; }), AniCraft.htmlText.write(p.text, p.runs, p.paras)]; }",
+        ))
+        .unwrap();
+    const PIECES: [&str; 52] = [
+        "<", ">", "</", "/>", "&", ";", "#", "\"", "'", "=", " ", "\n", "\r", "\t", "\u{0}", "\u{85}", "\u{a0}", "\u{2028}", "a", "Zz", "é", "😀", "K", "<b>", "</b>", "<i>", "</I>", "<u>", "</u>", "<font size=\"+3\" color=\"#ff00ff\">", "<FONT SIZE=-2.5 face='Geo\"rgia' letterspacing=\"1e3\">", "<font size=\"13.333\">",
+        "</font>", "<a href=\"javascript:x\">", "<a href=\" java\tscript:x\">", "<a href=\"http://a.b/?q=<1>\">", "</a>", "<p align=\"right\">", "<p ALIGN=center >", "</p>", "<br>", "<br/>", "<script>", "</script>", "<style>", "<!--", "-->", "&lt;", "&#x41;", "&#99999999;", "&#xD800;", "&#10;",
+    ];
+    let base = anicraft_doc::CharStyle { font: "Arial".into(), size: 12.0, color: Rgba::BLACK, ..Default::default() };
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    for round in 0..400 {
+        let n = (rng(&mut seed) % 30) as usize;
+        let html: String = (0..n).map(|_| PIECES[(rng(&mut seed) % PIECES.len() as u64) as usize]).collect();
+        let p = html_text::parse(&html, &base, &anicraft_doc::ParagraphStyle::default());
+        let want = json!([p.text, p.styles.runs.iter().map(run_json).collect::<Vec<_>>(), p.styles.paragraphs.iter().map(|q| align_json(q.align)).collect::<Vec<_>>(), html_text::write(&p.text, &p.styles)]);
+        let got = js.eval(&format!("RT({})", Value::String(html.clone())));
+        assert_eq!(got, want, "round {round}: {html:?}");
+    }
+    // `restrict` reads the same in both.
+    for (r, text) in [("A-Z 0-9", "Ab 9-z"), ("^a-z", "aBc1"), ("A-Z^Q", "PQR"), ("0-9\\-", "1-2a"), ("", "abc"), ("abc-", "a-c"), ("z-a", "amz"), ("é-ü😀", "é😀a"), ("\\", "\\a"), ("^", "x")] {
+        let want: String = text.chars().filter(|c| anicraft_doc::field::allowed(r, *c)).collect();
+        let got = js.eval(&format!("Array.from({}).filter(function (c) {{ return AniCraft.restrictAllows({}, c); }}).join('')", Value::String(text.into()), Value::String(r.into())));
+        assert_eq!(got, json!(want), "{r:?} on {text:?}");
+    }
+}
+
+/// Embedded glyphs (ADR 0107): the faces handed to the export reach the page with their
+/// advances and outlines, and the page's layout measures and places text with them, falling
+/// back to the browser's fonts for a stretch with a character the face lacks.
+#[test]
+fn embedded_glyphs_reach_the_page_and_its_layout_uses_them() {
+    use crate::html::EmbeddedFace;
+    let doc = html_fields_doc();
+    // A face for the fields' own style (Inter, bold): A and B 600 wide, a space 250, at 1000.
+    let glyph = |c: char, adv: f32| (c, adv, Arc::new(if c == ' ' { Path::new() } else { Path::rect(50.0, -700.0, 500.0, 700.0) }));
+    let face = EmbeddedFace { family: "Inter".into(), bold: true, italic: false, ascent: 900.0, line_height: 1200.0, glyphs: vec![glyph('A', 600.0), glyph('B', 600.0), glyph(' ', 250.0)] };
+    let empty = EmbeddedFace { family: "Nothing".into(), ..EmbeddedFace::default() };
+    let hostile = EmbeddedFace { family: "Bad".into(), ascent: f32::NAN, glyphs: vec![glyph('x', 1.0)], ..EmbeddedFace::default() };
+    let plain = movie(&doc, &HtmlOptions::default());
+    assert!(plain.json.get("fonts").is_none(), "pages without embedded glyphs are as before");
+    let m = movie(&doc, &HtmlOptions { fonts: vec![face, empty, hostile], ..HtmlOptions::default() });
+    let fonts = m.json["fonts"].as_array().expect("fonts");
+    assert_eq!(fonts.len(), 1, "faces without glyphs or with broken metrics are left out: {fonts:?}");
+    assert_eq!((fonts[0]["f"].as_str(), fonts[0]["b"].as_bool(), fonts[0]["a"].as_f64(), fonts[0]["lh"].as_f64()), (Some("Inter"), Some(true), Some(900.0), Some(1200.0)));
+    let a = &fonts[0]["g"]["A"];
+    assert_eq!(a[0], 600.0);
+    let path = a[1].as_u64().unwrap() as usize;
+    assert_eq!(fonts[0]["g"]["B"][1].as_u64(), Some(path as u64), "the same outline is stored once");
+    assert_eq!(m.json["paths"].as_array().unwrap().len(), m.paths.len(), "the page's paths include the glyphs");
+    assert!(m.json["paths"][path].as_str().unwrap().contains("-700"), "{}", m.json["paths"][path]);
+    // The page's layout: the dynamic field (100 wide, centred, 14 px, letter spacing 0.5).
+    let mut js = Js::new(&m);
+    js.ctx
+        .eval(Source::from_bytes(
+            "function L(text, html, multiline) { var tf = Object.assign({}, FIELD); if (multiline) tf.ln = 'multiline'; \
+               var styles = html === null ? AniCraft.fieldStyles({ text: text, rich: null }, tf) : (function () { var p = AniCraft.htmlText.parse(html, AniCraft.fieldStyles({ text: '', rich: null }, tf).runs[0].s, { al: tf.al }); text = p.text; return { runs: p.runs, paras: p.paras }; })(); \
+               return AniCraft.fieldLayout(tf, text, styles, P.M.fonts, function (st, t) { return Array.from(t).length * st.size * 0.5; }).map(function (l) { return [l.top, l.base, l.h, l.w, l.segs.map(function (s) { return [s.text, s.x, s.w, s.face !== null, s.st.bold, s.st.size]; })]; }); }",
+        ))
+        .unwrap();
+    // The field's exported settings, found in the movie's data.
+    fn find_tf(v: &Value) -> Option<&Value> {
+        match v {
+            Value::Object(o) => o.get("tf").filter(|t| t["k"] == "dynamic" && t["t"] == "Score").or_else(|| o.values().find_map(find_tf)),
+            Value::Array(a) => a.iter().find_map(find_tf),
+            _ => None,
+        }
+    }
+    let tf = find_tf(&m.json).expect("the dynamic field").clone();
+    js.ctx.eval(Source::from_bytes(&format!("var FIELD = {tf};"))).unwrap();
+    // "AB A": glyph advances 600 × 14 / 1000 + 0.5 each, the space 250 × 14 / 1000 + 0.5.
+    let lines = js.eval("L('AB A', null, false)");
+    let w = 3.0 * (8.4 + 0.5) + (3.5 + 0.5);
+    let near = |v: &Value, want: f64| (v.as_f64().unwrap() - want).abs() < 1e-6;
+    assert_eq!(lines.as_array().unwrap().len(), 1);
+    assert!(near(&lines[0][3], w) && near(&lines[0][0], 2.0) && near(&lines[0][1], 2.0 + 0.9 * 14.0) && near(&lines[0][2], 1.2 * 14.0 + 2.0), "{lines}");
+    assert_eq!(lines[0][4].as_array().unwrap().len(), 1, "one stretch: {lines}");
+    assert!(lines[0][4][0][3] == true && near(&lines[0][4][0][1], (100.0 - w) / 2.0), "embedded and centred: {lines}");
+    // A character the face lacks: that word is the browser's (measured by it), the rest embedded.
+    let lines = js.eval("L('AB xy', null, false)");
+    let segs = lines[0][4].as_array().unwrap();
+    assert_eq!(segs.iter().map(|s| (s[0].as_str().unwrap(), s[3].as_bool().unwrap())).collect::<Vec<_>>(), vec![("AB ", true), ("xy", false)], "{lines}");
+    assert!(near(&segs[1][2], 2.0 * 14.0 * 0.5));
+    // Styled text wraps at spaces across runs; each line makes room for its tallest stretch,
+    // and paragraphs align on their own.
+    let lines = js.eval("L('', '<p align=\"right\">AB AB AB AB <font size=\"28\">AB</font> AB</p>last<br>', true)");
+    let rows = lines.as_array().unwrap();
+    assert_eq!(rows.len(), 4, "two wrapped lines, a line and an empty one: {lines}");
+    assert_eq!(rows[0][4].as_array().unwrap().iter().map(|s| s[0].as_str().unwrap()).collect::<String>(), "AB AB AB AB", "{lines}");
+    assert!(rows[1][4].as_array().unwrap().iter().any(|s| s[5] == 28.0) && near(&rows[1][2], 1.2 * 28.0 + 2.0), "{lines}");
+    let right_edge = |row: &Value| row[4].as_array().unwrap().last().map(|s| s[1].as_f64().unwrap() + s[2].as_f64().unwrap()).unwrap();
+    assert!((right_edge(&rows[0]) - 98.0).abs() < 1e-6 && (right_edge(&rows[1]) - 98.0).abs() < 1e-6, "right-aligned: {lines}");
+    assert_eq!(rows[2][4][0][0], "last");
+    assert!(near(&rows[2][0], rows[1][0].as_f64().unwrap() + rows[1][2].as_f64().unwrap()), "lines stack: {lines}");
+    assert_eq!(rows[3][4].as_array().unwrap().len(), 0);
+    // Empty text is one empty line; a very long text is capped.
+    assert_eq!(js.eval("L('', null, false)").as_array().unwrap().len(), 1);
+    assert_eq!(js.eval("L(Array(3000).join('\\n'), null, false)").as_array().unwrap().len(), 1000);
 }
 
 #[test]

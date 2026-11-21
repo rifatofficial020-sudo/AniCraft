@@ -18,7 +18,9 @@ The timeline sits under the stage. From left to right, its header holds:
   Loop playback;
 * the onion skin buttons and their options menu;
 * the camera button;
-* the current frame number, the frame rate and the time at the playhead;
+* the current frame number and the frame rate, which are fields (click the frame number and
+  type a frame to go there, or drag it to scrub; a number past the end goes to the last
+  frame), and the time at the playhead;
 * the **Insert frame**, **Insert keyframe** and **Insert blank keyframe** buttons (a frame, a
   filled dot and a hollow dot, each with a plus), and a tween menu.
 
@@ -269,9 +271,9 @@ To see the movie with its buttons and scripts working, use **Control › Test Mo
 
 ### Frame rate
 
-The header shows the frame rate. To change it, click an empty part of the stage so nothing is
-selected, then set **Properties › Document › Frame rate** (1 to 120 fps; fractional rates such
-as 29.97 work too).
+The header shows the frame rate. To change it, click it there and type a new one, or drag it
+(1 to 120 fps; fractional rates such as 29.97 work too). It is the same value as
+**Properties › Document › Frame rate**, which shows when nothing is selected.
 
 ### Zooming the frames
 

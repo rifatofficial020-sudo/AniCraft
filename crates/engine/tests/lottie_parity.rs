@@ -208,6 +208,57 @@ fn the_xfl_corpus_plays_as_evaluated() {
     println!("LOTTIE corpus: eased {eased} bytes, frame by frame {frames} bytes");
 }
 
+#[test]
+fn scalar_and_array_tangents_match_prior_consumer_output() {
+    // Fractional timestamp rounding parity is covered by #499 (`shared_keys_keep_legacy_fractional_times_and_playback`).
+    let doc = tweens_movie();
+    let last = doc.frame_count().saturating_sub(1);
+    let eased = to_lottie_keyed(&doc, "tangents", 0, last, true, LottieKeys::Eased);
+    let current: Value = serde_json::from_str(&eased.json).unwrap();
+
+    // Verify current export writes array tangents (o.x / i.x) while matching prior scalar-tangent playback.
+    let mut saw_array_tangent = false;
+    fn to_scalar_tangents(v: &mut Value, saw_array: &mut bool) {
+        match v {
+            Value::Object(map) => {
+                for (k, val) in map.iter_mut() {
+                    if (k == "o" || k == "i")
+                        && let Some(obj) = val.as_object_mut()
+                    {
+                        for axis in ["x", "y"] {
+                            if let Some(arr) = obj.get(axis).and_then(Value::as_array)
+                                && arr.len() == 1
+                            {
+                                *saw_array = true;
+                                let scalar = arr[0].clone();
+                                obj.insert(axis.to_string(), scalar);
+                            }
+                        }
+                    } else {
+                        to_scalar_tangents(val, saw_array);
+                    }
+                }
+            }
+            Value::Array(arr) => {
+                for item in arr {
+                    to_scalar_tangents(item, saw_array);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut prior_scalar = current.clone();
+    to_scalar_tangents(&mut prior_scalar, &mut saw_array_tangent);
+    assert!(saw_array_tangent, "shared Lottie writer must emit array tangents for eased keys");
+
+    let view = View::stage(&doc, 0.5);
+    for f in 0..=last {
+        let got_array = draw(&lottie_player::frame(&current, f64::from(f)), &view);
+        let got_scalar = draw(&lottie_player::frame(&prior_scalar, f64::from(f)), &view);
+        assert_eq!(got_array, got_scalar, "frame {f}: array tangents and prior scalar tangents must render identically");
+    }
+}
+
 
 #[test]
 #[ignore = "timing; run with --ignored --nocapture"]

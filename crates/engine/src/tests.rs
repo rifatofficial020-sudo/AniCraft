@@ -2630,3 +2630,116 @@ fn path_extend_continues_an_open_path_from_either_end_and_closes_it() {
     assert!(s.execute("path.extend", &json!({"id": id, "d": "M100 0 L100 0 Z"})).is_err(), "a closed piece");
     assert_eq!(stage_anchors(&s, id), [(0.0, 0.0), (100.0, 0.0)]);
 }
+
+/// #454: the registry is rebuilt by every caller (the menu bar asks each frame), so nothing in a
+/// spec may be made afresh per call and kept forever. Each text of every command is the same
+/// allocation from one call to the next.
+#[test]
+fn building_the_registry_again_allocates_no_new_static_text() {
+    let (a, b) = (crate::commands(), crate::commands());
+    assert_eq!(a.len(), b.len());
+    for (x, y) in a.iter().zip(&b) {
+        assert_eq!(x.id, y.id);
+        for (what, p, q) in [("id", x.id, y.id), ("label", x.label, y.label), ("menu", x.menu, y.menu), ("params", x.params, y.params)] {
+            assert!(std::ptr::eq(p.as_ptr(), q.as_ptr()), "{}: its {what} is a new string on every call (leaked each frame)", x.id);
+        }
+    }
+}
+
+/// #438: F5 with no frame selection extends every layer at the playhead, so Shift+F5 there takes
+/// the frame off every layer too, and Shift+F6 clears the keyframes there on every layer
+/// (`all_layers`, as the editor sends with no frame selection). One undo step each.
+#[test]
+fn removing_frames_and_clearing_keys_on_every_layer_at_the_playhead() {
+    let mut s = Session::default();
+    let a = s.layer;
+    let b = anicraft_doc::LayerId(run(&mut s, "layer.new", json!({}))["layer"].as_u64().unwrap());
+    let c = anicraft_doc::LayerId(run(&mut s, "layer.new", json!({}))["layer"].as_u64().unwrap());
+    run(&mut s, "timeline.insert_frame", json!({"frame": 0, "count": 5, "all_layers": true}));
+    for l in [a, b, c] {
+        assert_eq!(starts(&s, l), vec![(0, 6)]);
+    }
+    // Shift+F5 three times: every layer loses the frames, not only the active one.
+    for _ in 0..3 {
+        run(&mut s, "timeline.remove_frame", json!({"frame": 2, "all_layers": true}));
+    }
+    for l in [a, b, c] {
+        assert_eq!(starts(&s, l), vec![(0, 3)], "layer {l:?}");
+    }
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(starts(&s, a), vec![(0, 4)], "each press is one undo step, on every layer");
+    assert_eq!(starts(&s, c), vec![(0, 4)]);
+    run(&mut s, "edit.redo", json!({}));
+    // Without it, as before: the one layer.
+    run(&mut s, "timeline.remove_frame", json!({"layer": a.0, "frame": 1}));
+    assert_eq!((starts(&s, a), starts(&s, b)), (vec![(0, 2)], vec![(0, 3)]));
+    run(&mut s, "edit.undo", json!({}));
+
+    // A layer that ends before the frame is left alone; one whose frames start later closes up.
+    run(&mut s, "timeline.remove_frame", json!({"layer": a.0, "frame": 2}));
+    assert_eq!(starts(&s, a), vec![(0, 2)]);
+    let r = run(&mut s, "timeline.remove_frame", json!({"frame": 2, "all_layers": true}));
+    assert_eq!(r["removed"], 2);
+    assert_eq!((starts(&s, a), starts(&s, b), starts(&s, c)), (vec![(0, 2)], vec![(0, 2)], vec![(0, 2)]));
+
+    // Shift+F6: keyframes at the playhead on two of the three layers are cleared together; the
+    // layer without one is skipped.
+    run(&mut s, "timeline.insert_frame", json!({"frame": 0, "count": 6, "all_layers": true}));
+    run(&mut s, "timeline.insert_keyframe", json!({"layers": [a.0, c.0], "frame": 4}));
+    assert_eq!(starts(&s, a), vec![(0, 4), (4, 4)]);
+    let r = run(&mut s, "timeline.clear_keyframe", json!({"frame": 4, "all_layers": true}));
+    assert_eq!(r["cleared"], 2);
+    for l in [a, b, c] {
+        assert_eq!(starts(&s, l), vec![(0, 8)]);
+    }
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!((starts(&s, a), starts(&s, c)), (vec![(0, 4), (4, 4)], vec![(0, 4), (4, 4)]));
+    assert!(s.execute("timeline.clear_keyframe", &json!({"frame": 2, "all_layers": true})).is_err(), "no keyframe starts there on any layer");
+    assert!(s.execute("timeline.remove_frame", &json!({"all_layers": "yes"})).is_err());
+
+    // The question before artwork is lost counts every layer the key acts on (ADR 0004).
+    run(&mut s, "timeline.goto", json!({"frame": 4}));
+    run(&mut s, "layer.select", json!({"layer": c.0}));
+    run(&mut s, "draw.rect", json!({"x": 0, "y": 0, "w": 10, "h": 10}));
+    run(&mut s, "layer.select", json!({"layer": b.0}));
+    assert!(s.confirmation("timeline.clear_keyframe", &json!({"frame": 4})).is_none(), "the active layer has no keyframe there");
+    assert!(s.confirmation("timeline.clear_keyframe", &json!({"frame": 4, "all_layers": true})).is_some(), "another layer's artwork would go");
+}
+
+/// #490: a guide drawn as a zigzag with the Line tool is several raw strokes (one per straight
+/// run between corners). The guided object stopped at the first sharp peak, since only the
+/// first stroke was followed. The strokes that meet end to end are one path.
+#[test]
+fn a_motion_guide_with_sharp_corners_is_followed_to_its_end() {
+    let mut s = Session::default();
+    let art = s.layer;
+    run(&mut s, "draw.ellipse", json!({"x": -10, "y": -10, "w": 20, "h": 20}));
+    run(&mut s, "timeline.goto", json!({"frame": 20}));
+    run(&mut s, "timeline.insert_keyframe", json!({}));
+    run(&mut s, "edit.select_all", json!({}));
+    run(&mut s, "element.translate", json!({"dx": 400, "dy": 0}));
+    run(&mut s, "timeline.goto", json!({"frame": 0}));
+    run(&mut s, "timeline.create_tween", json!({}));
+    run(&mut s, "layer.add_motion_guide", json!({"layer": art.0}));
+    // A zigzag as the editor draws it (merge drawing): peak at (100,-100), valley at (200,0),
+    // peak at (300,-100). Drawn out of order, and one run backwards.
+    for (a, b) in [((100, -100), (200, 0)), ((0, 0), (100, -100)), ((400, 0), (300, -100)), ((200, 0), (300, -100))] {
+        run(&mut s, "draw.line", json!({"x0": a.0, "y0": a.1, "x1": b.0, "y1": b.1, "object": false}));
+    }
+    let at = |s: &Session, f| anicraft_doc::evaluate_scene(&s.doc, s.scene, f).items.iter().find(|i| i.layer == art).unwrap().transform.translation();
+    let (first, last) = (at(&s, 0), at(&s, 20));
+    assert!(first.distance(anicraft_geom::Vec2::new(0.0, 0.0)) < 1.0 && last.distance(anicraft_geom::Vec2::new(400.0, 0.0)) < 1.0, "{first:?} → {last:?}");
+    // Even speed along the whole zigzag (four runs of the same length): a quarter of the way
+    // is the first peak, half the valley, three quarters the second peak.
+    for (f, want) in [(5, (100.0, -100.0)), (10, (200.0, 0.0)), (15, (300.0, -100.0))] {
+        let p = at(&s, f);
+        assert!(p.distance(anicraft_geom::Vec2::new(want.0, want.1)) < 1.5, "frame {f}: {p:?}, not {want:?}");
+    }
+    // And it keeps moving past each corner.
+    let mut prev = at(&s, 0);
+    for f in 1..=20 {
+        let p = at(&s, f);
+        assert!(p.distance(prev) > 10.0, "it stopped at frame {f}: {prev:?} → {p:?}");
+        prev = p;
+    }
+}

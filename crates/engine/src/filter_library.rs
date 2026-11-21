@@ -276,7 +276,8 @@ impl FilterLibrary {
 
     /// The presets in a preset file (bad entries skipped; values clamped).
     pub fn parse_file(text: &str) -> Result<Vec<FilterPreset>> {
-        let f: PresetFile = serde_json::from_str(text).map_err(|e| EngineError::Param(format!("not a filter preset file: {e}")))?;
+        let f: PresetFile =
+            serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| EngineError::Param(format!("not a filter preset file: {e}")))?;
         if f.format != FILE_FORMAT {
             return Err(EngineError::Param(format!("not a filter preset file (its format is '{}')", f.format.chars().take(40).collect::<String>())));
         }
@@ -323,6 +324,7 @@ mod tests {
         let text = FilterLibrary::file_json(&mine);
         assert!(text.contains("\"enabled\": false"), "a switched-off filter keeps its switch: {text}");
         assert_eq!(FilterLibrary::parse_file(&text).unwrap(), mine);
+        assert_eq!(FilterLibrary::parse_file(&format!("\u{feff}{text}")).unwrap(), mine);
         assert!(FilterLibrary::parse_file("{}").is_err());
         assert!(FilterLibrary::parse_file(r#"{"format": "anicraft-brushes", "version": 1, "presets": []}"#).is_err());
         assert!(FilterLibrary::parse_file(r#"{"format": "anicraft-filter-presets", "version": 99, "presets": []}"#).is_err());

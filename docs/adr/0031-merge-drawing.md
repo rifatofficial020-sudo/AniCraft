@@ -89,7 +89,8 @@ the program; nothing was copied.
 5. **Editing raw shapes.**
    * `draw.drop` merges the selected raw shapes back into the drawing (on top). The Selection
      tool runs it when a drag ends and after each arrow-key nudge, in the same undo step as the
-     move.
+     move. *Amended by ADR 0122:* the editor now floats a moved selection (`draw.float`) and
+     merges it when it is deselected, as Animate does; `draw.drop` stays for scripts.
    * `element.select_connected` is the double-click. On a stroke, it selects the stroke and
      every stroke joined to it end to end. On a fill, it selects the fill and the strokes along
      its edge or inside it.

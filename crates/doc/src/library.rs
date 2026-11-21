@@ -5,7 +5,7 @@
 //! or renaming a folder touches one small table, never a symbol's timeline, and documents from
 //! before folders open with every item at the top level.
 
-use crate::{BitmapId, Document, ElementId, ElementKind, LayerId, Paint, SoundId, Symbol, SymbolId, Timeline};
+use crate::{BitmapId, DataId, Document, ElementId, ElementKind, LayerId, Paint, SoundId, Symbol, SymbolId, Timeline};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -14,13 +14,14 @@ use std::sync::Arc;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FolderId(pub u64);
 
-/// A symbol, bitmap or sound in the Library.
+/// A symbol, bitmap, sound or data table (ADR 0118) in the Library.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LibraryItem {
     Symbol(SymbolId),
     Bitmap(BitmapId),
     Sound(SoundId),
+    Data(DataId),
 }
 
 impl LibraryItem {
@@ -30,6 +31,7 @@ impl LibraryItem {
             LibraryItem::Symbol(i) => i.0,
             LibraryItem::Bitmap(i) => i.0,
             LibraryItem::Sound(i) => i.0,
+            LibraryItem::Data(i) => i.0,
         }
     }
 }
@@ -139,13 +141,23 @@ pub fn clean_name(name: &str) -> Result<String, NameError> {
 }
 
 impl Document {
-    /// Every item in the Library: symbols, then bitmaps, then sounds.
+    /// Every item in the Library: symbols, then bitmaps, then sounds, then data tables.
     pub fn library_items(&self) -> impl Iterator<Item = LibraryItem> + '_ {
         self.library
             .iter()
             .map(|s| LibraryItem::Symbol(s.id))
             .chain(self.bitmaps.iter().map(|b| LibraryItem::Bitmap(b.id)))
             .chain(self.sounds.iter().map(|s| LibraryItem::Sound(s.id)))
+            .chain(self.data.tables.iter().map(|t| LibraryItem::Data(t.id)))
+    }
+
+    /// The folder `item` is in (`None`: the top level). A data table keeps its own (ADR 0118);
+    /// the others are in the tree's placements.
+    pub fn item_folder(&self, item: LibraryItem) -> Option<FolderId> {
+        match item {
+            LibraryItem::Data(id) => self.data.table(id).and_then(|t| t.folder),
+            other => self.library_tree.placed.get(&other).copied(),
+        }
     }
 
     pub fn has_item(&self, item: LibraryItem) -> bool {
@@ -157,6 +169,7 @@ impl Document {
             LibraryItem::Symbol(id) => self.symbol(id).map(|s| s.name.as_str()),
             LibraryItem::Bitmap(id) => self.bitmap(id).map(|b| b.name.as_str()),
             LibraryItem::Sound(id) => self.sound(id).map(|s| s.name.as_str()),
+            LibraryItem::Data(id) => self.data.table(id).map(|t| t.name.as_str()),
         }
     }
 
@@ -181,7 +194,7 @@ impl Document {
     /// The folder `e` is in (`None`: the top level).
     pub fn parent_of(&self, e: LibraryEntry) -> Option<FolderId> {
         match e {
-            LibraryEntry::Item(i) => self.library_tree.placed.get(&i).copied(),
+            LibraryEntry::Item(i) => self.item_folder(i),
             LibraryEntry::Folder(f) => self.folder(f).and_then(|f| f.parent),
         }
     }
@@ -217,7 +230,7 @@ impl Document {
     /// The folders and items directly in `parent` (`None`: the top level), folders first.
     pub fn library_children(&self, parent: Option<FolderId>) -> Vec<LibraryEntry> {
         let folders = self.library_tree.folders.iter().filter(|f| f.parent == parent).map(|f| LibraryEntry::Folder(f.id));
-        let items = self.library_items().filter(|i| self.library_tree.placed.get(i).copied() == parent).map(LibraryEntry::Item);
+        let items = self.library_items().filter(|i| self.item_folder(*i) == parent).map(LibraryEntry::Item);
         folders.chain(items).collect()
     }
 
@@ -226,7 +239,7 @@ impl Document {
         let inside: Vec<FolderId> = self.library_tree.folders.iter().filter(|f| f.id != id && self.folder_within(f.id, id)).map(|f| f.id).collect();
         let mut all = inside.clone();
         all.push(id);
-        let items = self.library_items().filter(|i| self.library_tree.placed.get(i).is_some_and(|f| all.contains(f)));
+        let items = self.library_items().filter(|i| self.item_folder(*i).is_some_and(|f| all.contains(&f)));
         inside.into_iter().map(LibraryEntry::Folder).chain(items.map(LibraryEntry::Item)).collect()
     }
 
@@ -275,6 +288,12 @@ impl Document {
 
     /// Moves `e` into folder `to` (`None`: the top level). No checks: see `library.move`.
     pub fn place_entry(&mut self, e: LibraryEntry, to: Option<FolderId>) {
+        if let LibraryEntry::Item(LibraryItem::Data(id)) = e {
+            if let Some(t) = Arc::make_mut(&mut self.data).tables.iter_mut().find(|t| t.id == id) {
+                Arc::make_mut(t).folder = to;
+            }
+            return;
+        }
         let tree = Arc::make_mut(&mut self.library_tree);
         match e {
             LibraryEntry::Item(i) => match to {
@@ -327,6 +346,10 @@ impl Document {
         for tl in self.scenes.iter().map(|s| &s.timeline).chain(self.library.iter().map(|s| &s.timeline)) {
             visit_refs(tl, |item| *uses.entry(item).or_default() += 1);
         }
+        // A data table is used once by each binding that reads it (ADR 0118).
+        for b in &self.data.bindings {
+            *uses.entry(LibraryItem::Data(b.table)).or_default() += 1;
+        }
         uses
     }
 
@@ -354,6 +377,10 @@ impl Document {
             if let Some(sym) = self.symbol(id) {
                 visit_refs(&sym.timeline, |item| reach(item, &mut reached, &mut stack));
             }
+        }
+        // A data table is reached by a binding that reads it (whatever instance it drives).
+        for b in &self.data.bindings {
+            reached.insert(LibraryItem::Data(b.table));
         }
         self.library_items().filter(|i| !reached.contains(i)).collect()
     }
@@ -407,7 +434,7 @@ impl Document {
             t.folders.len() <= MAX_FOLDERS
                 && t.folders.iter().all(|f| ids.insert(f.id) && clean_name(&f.name).as_deref() == Ok(f.name.as_str()) && f.parent.is_none_or(|p| p != f.id && d.folder(p).is_some()))
                 && t.folders.iter().all(|f| d.folder_chain(f.id).first().is_some_and(|top| d.folder(*top).is_some_and(|x| x.parent.is_none())))
-                && t.placed.iter().all(|(i, f)| d.has_item(*i) && d.folder(*f).is_some())
+                && t.placed.iter().all(|(i, f)| !matches!(i, LibraryItem::Data(_)) && d.has_item(*i) && d.folder(*f).is_some())
         };
         for f in &self.library_tree.folders {
             *max_id = (*max_id).max(f.id.0);
@@ -448,7 +475,7 @@ impl Document {
             }
         }
         let items: HashSet<LibraryItem> = self.library_items().collect();
-        tree.placed.retain(|i, f| items.contains(i) && ids.contains(f));
+        tree.placed.retain(|i, f| !matches!(i, LibraryItem::Data(_)) && items.contains(i) && ids.contains(f));
         self.library_tree = Arc::new(tree);
     }
 }

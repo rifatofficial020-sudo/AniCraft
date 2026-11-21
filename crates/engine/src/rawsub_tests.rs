@@ -114,9 +114,9 @@ fn dragging_a_handle_changes_the_curve_in_both_shapes_that_share_it() {
     run(&mut s, "draw.ellipse", json!({"x": 0, "y": 0, "w": 100, "h": 100, "fill": "#ff0000", "stroke": "#000000"}));
     let v = run(&mut s, "raw.subselect", json!({"x": 50, "y": 50}));
     let handles = v["handles"].as_array().cloned().unwrap_or_default();
-    // A circle of four arcs: two handles per arc, each listed once although the fill and the
+    // A circle of eight arcs: two handles per arc, each listed once although the fill and the
     // outline both have it.
-    assert_eq!(handles.len(), 8, "{v}");
+    assert_eq!(handles.len(), 16, "{v}");
     let h = &handles[0];
     let (id, cmd, slot) = (h["id"].as_u64().unwrap(), h["cmd"].as_u64().unwrap(), h["slot"].as_u64().unwrap());
     let before: Vec<Arc<Element>> = raw(&s);

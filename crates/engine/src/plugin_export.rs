@@ -46,6 +46,7 @@ pub const BUILT_IN: &[(&str, &str, &str, &[&str], &str)] = &[
     ("png", "file.export_png", "PNG image (one frame)", &["png"], "path"),
     ("svg", "file.export_svg", "SVG image (one frame)", &["svg"], "path"),
     ("png-sequence", "file.export_png_sequence", "PNG sequence", &[], "dir"),
+    ("svg-sequence", "file.export_svg_sequence", "SVG sequence", &[], "dir"),
     ("sprite-sheet", "file.export_sprite_sheet", "Sprite sheet", &["png"], "path"),
     ("gif", "file.export_gif", "Animated GIF", &["gif"], "path"),
     ("apng", "file.export_apng", "Animated PNG", &["png", "apng"], "path"),

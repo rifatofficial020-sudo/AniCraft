@@ -96,7 +96,8 @@ pub fn shape_kind(p: &Path) -> &'static str {
         (3 | 4, 0, 1) if axis_aligned() => tr_noop!("Rectangle"),
         // A rounded rectangle: four sides and four corners.
         (4, 4, 1) => tr_noop!("Rectangle"),
-        (0, 4, 1) => tr_noop!("Oval"),
+        // Four arcs (an imported circle) or the Oval tool's eight (#459).
+        (0, 4 | 8, 1) => tr_noop!("Oval"),
         (n, 0, 1) if n >= 2 => tr_noop!("Polygon"),
         _ => tr_noop!("Shape"),
     }
@@ -360,6 +361,7 @@ mod tests {
         assert_eq!(shape_kind(&Path::rect(0.0, 0.0, 10.0, 5.0)), "Rectangle");
         assert_eq!(shape_kind(&Path::rounded_rect(0.0, 0.0, 10.0, 5.0, 2.0)), "Rectangle");
         assert_eq!(shape_kind(&Path::ellipse(0.0, 0.0, 4.0, 3.0)), "Oval");
+        assert_eq!(shape_kind(&Path::ellipse8(0.0, 0.0, 4.0, 3.0)), "Oval");
         assert_eq!(shape_kind(&Path::star(0.0, 0.0, 10.0, 4.0, 5)), "Polygon");
         assert_eq!(shape_kind(&Path::line(V::new(0.0, 0.0), V::new(3.0, 4.0))), "Line");
         // A slanted quadrilateral is a polygon, not a rectangle.

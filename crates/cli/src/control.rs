@@ -11,6 +11,7 @@
 //! [`Server::try_recv`] (the app's frame loop), with a channel for the answer.
 
 use crate::mcp;
+use anicraft_engine::access::Roots;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
@@ -20,8 +21,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
-/// The wire protocol's version, reported by `hello`.
-pub const PROTOCOL: u32 = 1;
+/// The wire protocol's version, reported by `hello`. 2: `tools.call` carries the caller's
+/// automation roots, and a call without them may touch no file (ADR 0124).
+pub const PROTOCOL: u32 = 2;
 /// The port AniCraft's documentation and shortcuts use (VectorCraft 7979, CadCraft 7980,
 /// FilmCraft 9876, EffectCraft 9877).
 pub const DEFAULT_PORT: u16 = 9878;
@@ -188,6 +190,8 @@ pub const BUSY: &str = "AniCraft was busy for 60 s (an edit in progress in the w
 pub struct Request {
     pub name: String,
     pub arguments: Value,
+    /// The folders the caller's commands may use; none at all when it sent none.
+    roots: Arc<Roots>,
     deadline: Instant,
     reply: Sender<Result<Value, String>>,
 }
@@ -203,7 +207,7 @@ impl Request {
     }
     /// Runs it on `host` and sends the answer; an expired request is refused instead.
     pub fn run<H: mcp::Host + ?Sized>(self, host: &mut H) {
-        let result = if self.expired() { Err(BUSY.to_string()) } else { mcp::call_tool(host, &self.name, &self.arguments) };
+        let result = if self.expired() { Err(BUSY.to_string()) } else { mcp::call_tool_in(host, &self.name, &self.arguments, Some(&self.roots)) };
         let _ = self.reply.send(result);
     }
     /// Answers without running (the app is closing).
@@ -348,6 +352,27 @@ fn close_after_reply(out: &TcpStream, reader: &mut BufReader<TcpStream>) {
     }
 }
 
+/// The automation roots a `tools.call` carries: `{"read": [folder, …], "write": folder}`,
+/// absolute. Without them the call may touch no file at all.
+pub fn parse_roots(v: Option<&Value>) -> Result<Roots, String> {
+    let Some(v) = v.filter(|v| !v.is_null()) else { return Ok(Roots::none()) };
+    let bad = || "\"roots\" must be {\"read\": [folder, …], \"write\": folder} with absolute paths".to_string();
+    if !v.is_object() {
+        return Err(bad());
+    }
+    let absolute = |v: &Value| v.as_str().map(PathBuf::from).filter(|p| p.is_absolute()).ok_or_else(bad);
+    let read = match v.get("read") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(a)) => a.iter().map(absolute).collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err(bad()),
+    };
+    let write = match v.get("write") {
+        None | Some(Value::Null) => None,
+        Some(w) => Some(absolute(w)?),
+    };
+    Roots::new(&read, write.as_deref())
+}
+
 /// The reply to one request line, and whether the connection stays open.
 fn answer(line: &str, token: &str, tx: &Sender<Request>, wake: &Wake) -> (Value, bool) {
     let req = match parse_request(line) {
@@ -365,8 +390,12 @@ fn answer(line: &str, token: &str, tx: &Sender<Request>, wake: &Wake) -> (Value,
         "tools.call" => {
             let Some(name) = req.params.get("name").and_then(Value::as_str) else { return (fail(id, "tools.call needs a tool \"name\" in params"), true) };
             let arguments = req.params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let roots = match parse_roots(req.params.get("roots")) {
+                Ok(r) => Arc::new(r),
+                Err(e) => return (fail(id, e), true),
+            };
             let (reply, rx) = channel();
-            let request = Request { name: name.to_string(), arguments, deadline: Instant::now() + REQUEST_TIMEOUT, reply };
+            let request = Request { name: name.to_string(), arguments, roots, deadline: Instant::now() + REQUEST_TIMEOUT, reply };
             if tx.send(request).is_err() {
                 return (fail(id, "AniCraft is closing"), false);
             }
@@ -432,6 +461,8 @@ pub enum BridgeError {
 struct Conn {
     reader: BufReader<TcpStream>,
     writer: TcpStream,
+    /// The app at the other end applies automation roots (its `hello` said protocol 2).
+    applies_roots: bool,
 }
 
 impl Conn {
@@ -453,16 +484,28 @@ pub struct Bridge {
     next_id: u64,
     /// Where the token comes from (tests point it elsewhere).
     token_file: Option<PathBuf>,
+    /// The automation roots sent with every call (`null`: none, so the app allows no file).
+    roots: Value,
 }
 
 impl Bridge {
     /// Doesn't connect: the assistant starts its servers when it starts, often before AniCraft.
     pub fn new(addr: SocketAddr) -> Bridge {
-        Bridge { addr, conn: None, next_id: 1, token_file: control_file() }
+        Bridge { addr, conn: None, next_id: 1, token_file: control_file(), roots: Value::Null }
     }
 
     pub fn with_token_file(addr: SocketAddr, file: Option<PathBuf>) -> Bridge {
-        Bridge { addr, conn: None, next_id: 1, token_file: file }
+        Bridge { addr, conn: None, next_id: 1, token_file: file, roots: Value::Null }
+    }
+
+    /// The folders this assistant's commands may use, sent with every call for the app to
+    /// apply (ADR 0124). They go as text, so a folder whose name is not Unicode is refused.
+    pub fn with_roots(mut self, roots: &Roots) -> Result<Bridge, String> {
+        let text = |p: &Path| p.to_str().map(str::to_string).ok_or_else(|| format!("{}: an automation root's name must be Unicode text", p.display()));
+        let read = roots.read().iter().map(|p| text(p)).collect::<Result<Vec<_>, _>>()?;
+        let write = roots.write().map(text).transpose()?;
+        self.roots = json!({"read": read, "write": write});
+        Ok(self)
     }
 
     fn connect(&mut self) -> Result<String, BridgeError> {
@@ -475,7 +518,7 @@ impl Bridge {
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT + GRACE + Duration::from_secs(5)));
         let reader = BufReader::new(stream.try_clone().map_err(|e| BridgeError::NotRunning(e.to_string()))?);
-        self.conn = Some(Conn { reader, writer: stream });
+        self.conn = Some(Conn { reader, writer: stream, applies_roots: false });
         Ok(token)
     }
 
@@ -515,6 +558,22 @@ impl Bridge {
         Err(BridgeError::Refused(error))
     }
 
+    /// One tool call, once the app has said it applies automation roots: an older AniCraft
+    /// would ignore them and run the command anywhere, so it is not sent the call at all.
+    fn checked_call(&mut self, token: &str, name: &str, args: &Value) -> Result<Value, BridgeError> {
+        if !self.conn.as_ref().is_some_and(|c| c.applies_roots) {
+            let hello = self.round_trip(token, "hello", json!({}))?;
+            if hello.get("protocol").and_then(Value::as_u64).unwrap_or(0) < 2 {
+                self.conn = None;
+                return Err(BridgeError::NotRunning("The AniCraft window that is open is an older version, which can't keep an assistant inside its automation roots. Update AniCraft (Help > Check for Updates), start it again, then try again.".into()));
+            }
+            if let Some(c) = self.conn.as_mut() {
+                c.applies_roots = true;
+            }
+        }
+        self.round_trip(token, "tools.call", json!({"name": name, "arguments": args, "roots": self.roots}))
+    }
+
     /// Runs a tool in the app. An edit whose answer was lost is never sent again (the app may
     /// have made it); a call that only reads is tried once more on a new connection.
     pub fn call_tool(&mut self, name: &str, args: &Value) -> Result<Value, BridgeError> {
@@ -522,7 +581,7 @@ impl Bridge {
         let mut attempt = 0;
         loop {
             let token = self.connect()?;
-            match self.round_trip(&token, "tools.call", json!({"name": name, "arguments": args})) {
+            match self.checked_call(&token, name, args) {
                 Err(BridgeError::Lost(_)) if attempt < retries => attempt += 1,
                 Err(BridgeError::Refused(e)) if e.starts_with("wrong token") && attempt < 1 => attempt += 1,
                 other => return other,
@@ -538,7 +597,8 @@ anicraft_commands to find one (filter by words such as 'tween' or 'export'), the
 anicraft_run_script for several in order. Frames in params are 0-based. Commands act on the current scene, layer, frame and \
 selection, which anicraft_document reports (the person may change them between your calls). Use anicraft_render to see a \
 frame. Commands that would lose work or replace a file refuse until params include \"confirm\": true; ask the person before \
-confirming. If AniCraft isn't open with remote control on, the tools say how to start it.";
+confirming. Files can be read only inside the automation read root and written only inside the automation write root the \
+person gave this server; an error names them. If AniCraft isn't open with remote control on, the tools say how to start it.";
 
 impl mcp::Backend for Bridge {
     fn instructions(&self) -> &'static str {

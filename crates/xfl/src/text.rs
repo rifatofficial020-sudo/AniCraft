@@ -25,6 +25,12 @@ use std::sync::Arc;
 /// text fields.
 pub const GUTTER: f32 = 2.0;
 
+/// The line spacing of a run whose `DOMTextAttrs` leaves `lineSpacing` out (pixels). Animate
+/// writes the attribute only when it differs from 2 px: it writes `lineSpacing="0"` for 0, a
+/// multi-line field's saved height fits 2 px between its lines, and legacy binary `.fla` files
+/// store 40 twips (2 px) for exactly the runs whose XFL leaves it out.
+pub const LINE_SPACING: f32 = 2.0;
+
 /// Most runs read from one field.
 const MAX_RUNS: usize = anicraft_doc::MAX_TEXT_RUNS;
 
@@ -44,7 +50,7 @@ struct Flags {
 /// PostScript name).
 fn run_style(attrs: Option<craft_xfl::text::TextStyle<'_, X>>, url: &str, flags: &mut Flags) -> (CharStyle, ParagraphStyle) {
     let Some(a) = attrs else {
-        return (CharStyle { size: 12.0, ..CharStyle::default() }, ParagraphStyle::default());
+        return (CharStyle { size: 12.0, ..CharStyle::default() }, ParagraphStyle { line_spacing: LINE_SPACING, ..ParagraphStyle::default() });
     };
     let clamp = |number: Option<f32>, lo: f32, hi: f32| number.unwrap_or(0.0).clamp(lo, hi);
     let align = match a.alignment() {
@@ -78,7 +84,7 @@ fn run_style(attrs: Option<craft_xfl::text::TextStyle<'_, X>>, url: &str, flags:
         indent: clamp(a.indent(), -1000.0, 1000.0),
         left_margin: clamp(a.left_margin(), 0.0, 1000.0),
         right_margin: clamp(a.right_margin(), 0.0, 1000.0),
-        line_spacing: clamp(a.line_spacing(), -1000.0, 1000.0),
+        line_spacing: a.line_spacing().unwrap_or(LINE_SPACING).clamp(-1000.0, 1000.0),
     };
     (c, p)
 }

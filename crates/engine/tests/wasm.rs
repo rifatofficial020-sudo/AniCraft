@@ -78,3 +78,58 @@ fn plugins_run_in_the_browser_too() {
     assert_eq!(plugin.id(), "org.test.web");
     plugin.run(&mut Quiet, &Map::new()).unwrap();
 }
+
+#[wasm_bindgen_test]
+fn exports_and_reimports_svg_and_lottie_in_memory() {
+    use anicraft_engine::doc::{Document, Element, ElementId, ElementKind, GradientStop, Paint, Rgba, Shape, Stage};
+    use anicraft_engine::geom::{Affine, Path as GeomPath, Vec2};
+    use std::sync::Arc;
+
+    let mut doc = Document { stage: Stage { width: 120, height: 80, ..Default::default() }, ..Default::default() };
+    let linear = Paint::linear(
+        Vec2::new(10.0, 10.0),
+        Vec2::new(110.0, 10.0),
+        vec![GradientStop { offset: 0.0, color: Rgba::hex(0xff3300) }, GradientStop { offset: 1.0, color: Rgba::hex(0x0066ff) }],
+    );
+    {
+        let tl = doc.timeline_mut(0);
+        let layer = Arc::make_mut(&mut tl.layers[0]);
+        let kf = Arc::make_mut(&mut layer.keyframes[0]);
+        kf.elements.push(Arc::new(Element {
+            id: ElementId(1),
+            name: "grad".into(),
+            transform: Affine::IDENTITY,
+            color: Default::default(),
+            kind: ElementKind::Shape(Shape::filled(GeomPath::rect(10.0, 10.0, 100.0, 60.0), linear)),
+        }));
+    }
+    let mut s = Session::new(doc);
+    s.execute("layer.new", &json!({"name": "Clip"})).unwrap();
+    s.execute("draw.ellipse", &json!({"x": 20, "y": 15, "w": 80, "h": 50, "fill": "#000000", "stroke": null})).unwrap();
+    s.execute("layer.toggle_mask", &json!({})).unwrap();
+
+    s.execute("file.export_svg", &json!({"path": "frame.svg"})).unwrap();
+    let written = vfs::take_written();
+    let svg_bytes = written.into_iter().find(|(p, _)| p == Path::new("frame.svg")).unwrap().1;
+    let svg = String::from_utf8(svg_bytes.clone()).unwrap();
+    assert!(svg.contains("viewBox=\"0 0 120 80\"") && svg.contains("<linearGradient") && svg.contains("<clipPath"));
+
+    vfs::put(Path::new("frame.svg"), svg_bytes).unwrap();
+    let mut imported_doc = Document::default();
+    imported_doc.stage = s.doc.stage;
+    let mut imported = Session::new(imported_doc);
+    imported.execute("file.import", &json!({"path": "frame.svg", "x": 0, "y": 0})).unwrap();
+
+    let want = anicraft_engine::render::render_frame(&s.doc, 0, 1.0).unwrap().to_rgba8();
+    let got = anicraft_engine::render::render_frame(&imported.doc, 0, 1.0).unwrap().to_rgba8();
+    let worst = want.iter().zip(&got).map(|(x, y)| (i32::from(*x) - i32::from(*y)).unsigned_abs()).max().unwrap_or(0);
+    assert!(worst <= 2, "WASM SVG export/reimport pixel diff worst={worst}");
+
+    // Animated Lottie export in WASM.
+    let mut anim = Session::new(anicraft_engine::doc::sample::demo());
+    anim.execute("file.export_lottie", &json!({"path": "movie.json"})).unwrap();
+    let lottie_bytes = vfs::take_written().into_iter().find(|(p, _)| p == Path::new("movie.json")).unwrap().1;
+    let lottie: Value = serde_json::from_slice(&lottie_bytes).unwrap();
+    assert!(lottie["layers"].as_array().is_some_and(|l| !l.is_empty()));
+    assert!(lottie_bytes.windows(5).any(|w| w == b"\"a\":1"));
+}

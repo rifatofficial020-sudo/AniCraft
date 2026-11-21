@@ -9,12 +9,13 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 if ($Out -eq '') { $Out = Join-Path $root 'target/i18n/anicraft.tsv' }
 elseif (-not [System.IO.Path]::IsPathRooted($Out)) { $Out = Join-Path (Get-Location) $Out }
+$previousOut = $env:ANICRAFT_I18N_OUT
 Push-Location $root
 try {
     $env:ANICRAFT_I18N_OUT = $Out
     cargo test --quiet --bin anicraft i18n::tests::extract -- --ignored --exact --nocapture
     if ($LASTEXITCODE -ne 0) { throw "extraction failed ($LASTEXITCODE)" }
 } finally {
-    Remove-Item Env:ANICRAFT_I18N_OUT -ErrorAction SilentlyContinue
+    $env:ANICRAFT_I18N_OUT = $previousOut
     Pop-Location
 }

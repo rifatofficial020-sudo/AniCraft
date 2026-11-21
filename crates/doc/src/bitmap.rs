@@ -93,6 +93,17 @@ impl Bitmap {
         Some(Bitmap { id, name: name.into(), width, height, png: Arc::new(png), smoothing: true, decoded: Arc::new(decoded) })
     }
 
+    /// [`Bitmap::from_rgba`] for one picture of many (a video's frames, ADR 0116): only the
+    /// PNG is kept, and the pixels are decoded again when the picture is first shown, so a
+    /// long sequence costs its PNGs, not every frame's pixels at once.
+    pub fn from_rgba_stored(id: BitmapId, name: impl Into<String>, width: u32, height: u32, rgba: &[u8]) -> Option<Bitmap> {
+        if width == 0 || height == 0 || width > MAX_BITMAP_EDGE || height > MAX_BITMAP_EDGE || rgba.len() != width as usize * height as usize * 4 {
+            return None;
+        }
+        let png = encode_png(width, height, rgba)?;
+        Some(Bitmap { id, name: name.into(), width, height, png: Arc::new(png), smoothing: true, decoded: Arc::new(OnceLock::new()) })
+    }
+
     /// The decoded pixels (decoded once and shared by every clone). `None` for unreadable data.
     pub fn pixels(&self) -> Option<Arc<Pixels>> {
         self.decoded.get_or_init(|| decode_png(&self.png).map(Arc::new)).clone()
@@ -211,6 +222,46 @@ pub use base64_bytes::encode as base64_encode;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #447: a CMYK JPEG imported with scrambled colours (the decoder was asked for RGBA and
+    /// wrote three bytes a pixel into four-byte rows). A 16 × 16 picture in quarters of cyan,
+    /// magenta, yellow and grey comes out in those colours, opaque, every pixel in its place.
+    #[test]
+    fn a_cmyk_jpeg_imports_in_its_own_colours() {
+        use craft_image_codecs::{ChannelLayout, EncodeOptions, Format, Image};
+        // Ink amounts: full cyan, full magenta, full yellow, half black.
+        let quarter = |x: u32, y: u32| -> [u8; 4] {
+            match (x < 8, y < 8) {
+                (true, true) => [255, 0, 0, 0],
+                (false, true) => [0, 255, 0, 0],
+                (true, false) => [0, 0, 255, 0],
+                (false, false) => [0, 0, 0, 128],
+            }
+        };
+        let cmyk: Vec<u8> = (0..16).flat_map(|y| (0..16).flat_map(move |x| quarter(x, y))).collect();
+        let img = Image::from_u8(16, 16, ChannelLayout::Cmyk, cmyk).unwrap();
+        let opts = EncodeOptions { jpeg_quality: 95, jpeg_chroma_subsampling: false, ..EncodeOptions::default() };
+        let jpeg = craft_image_codecs::encode(&img, Format::Jpeg, &opts).unwrap();
+        assert!(jpeg.starts_with(&[0xff, 0xd8, 0xff]));
+
+        let png = image_to_png(jpeg).unwrap();
+        let back = craft_image_codecs::decode(&png).unwrap();
+        assert_eq!(back.dimensions(), (16, 16));
+        let rgba = back.to_rgba8();
+        let px = |x: usize, y: usize| -> [u8; 4] { [rgba[(y * 16 + x) * 4], rgba[(y * 16 + x) * 4 + 1], rgba[(y * 16 + x) * 4 + 2], rgba[(y * 16 + x) * 4 + 3]] };
+        let near = |got: [u8; 4], want: [u8; 3]| got[3] == 255 && got.iter().zip(want).all(|(g, w)| g.abs_diff(w) <= 24);
+        // Away from the seams between the quarters (JPEG blocks are 8 × 8, so they are exact).
+        for (x, y, want, name) in [(3, 3, [0, 255, 255], "cyan"), (12, 3, [255, 0, 255], "magenta"), (3, 12, [255, 255, 0], "yellow"), (12, 12, [127, 127, 127], "grey")] {
+            assert!(near(px(x, y), want), "{name} at ({x}, {y}) came out {:?}", px(x, y));
+        }
+        // Every pixel of a quarter is that quarter's colour: nothing smeared along the rows.
+        for y in 0..8 {
+            for x in 0..8 {
+                assert!(near(px(x, y), [0, 255, 255]), "({x}, {y}) in the cyan quarter is {:?}", px(x, y));
+                assert!(near(px(x + 8, y + 8), [127, 127, 127]), "({}, {}) in the grey quarter is {:?}", x + 8, y + 8, px(x + 8, y + 8));
+            }
+        }
+    }
 
     fn png_of(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
         encode_png(w, h, rgba).unwrap()

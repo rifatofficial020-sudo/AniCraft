@@ -66,6 +66,15 @@ pub fn specs() -> Vec<CommandSpec> {
             run: export_sequence,
         },
         CommandSpec {
+            id: "file.export_svg_sequence",
+            label: "Export SVG Sequence…",
+            menu: "File/Export",
+            shortcut: None,
+            params: "{dir, from?, to? (movie frames: every scene in order), confirm?} → one frame_00001.svg per frame (vectors, gradients and masks kept)",
+            mutates: false,
+            run: export_svg_sequence,
+        },
+        CommandSpec {
             id: "file.export_gif",
             label: "Export Animated GIF…",
             menu: "File/Export",
@@ -116,7 +125,7 @@ pub fn specs() -> Vec<CommandSpec> {
             id: "doc.set_stage",
             label: "Document Settings",
             menu: "Modify",
-            shortcut: None,
+            shortcut: Some("Ctrl+J"),
             params: "{width?, height?, fps?, background?: \"#rrggbb\"}",
             mutates: true,
             run: set_stage,
@@ -197,6 +206,8 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
         } else if crate::vfs::in_memory() {
             return Err(EngineError::Param("an XFL document is a folder, which a web browser can't hand over: open the .fla instead".into()));
         } else {
+            // The XFL reader opens the folder's files itself (ADR 0124).
+            crate::access::check(&path, crate::access::Access::Read)?;
             anicraft_xfl::import_path(&path)
         };
         let (mut doc, report) = imported.map_err(|e| EngineError::Format(format!("{}: {e}", path.display())))?;
@@ -522,7 +533,7 @@ fn export_svg(s: &mut Session, p: &Value) -> Result<Value> {
     let path = PathBuf::from(str_req(p, "path")?);
     let frame = opt_u32(p, "frame")?.unwrap_or(s.frame);
     if frame >= s.frame_count() {
-        return Err(EngineError::Param(format!("frame {} is past the end (the timeline has {} frames)", frame + 1, s.frame_count())));
+        return Err(EngineError::Param(format!("frame {} is past the end (the timeline has {} frames)", u64::from(frame) + 1, s.frame_count())));
     }
     let svg = frame_svg(&s.doc, s.doc.scene_start(s.scene).saturating_add(frame));
     crate::vfs::write(&path, svg.as_bytes())?;
@@ -624,11 +635,8 @@ fn export_sprite_sheet(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// The ffmpeg to run: `ffmpeg` param, else `ANICRAFT_FFMPEG`, else `ffmpeg` on the PATH.
-fn ffmpeg_program(p: &Value) -> Result<std::ffi::OsString> {
-    if let Some(x) = opt_str(p, "ffmpeg")?.filter(|x| !x.trim().is_empty()) {
-        return Ok(x.into());
-    }
-    Ok(std::env::var_os("ANICRAFT_FFMPEG").filter(|x| !x.is_empty()).unwrap_or_else(|| "ffmpeg".into()))
+pub(crate) fn ffmpeg_program(p: &Value) -> Result<std::ffi::OsString> {
+    Ok(crate::video::program(opt_str(p, "ffmpeg")?))
 }
 
 /// Export Video: movie frames streamed in order to the user's own ffmpeg (AniCraft bundles no
@@ -642,6 +650,8 @@ fn export_video(s: &mut Session, p: &Value) -> Result<Value> {
         // ffmpeg writes the file itself, and a web browser can't start it (ADR 0036).
         return Err(EngineError::State("video export runs ffmpeg, which can't run in a web browser: export an animated GIF, a PNG sequence or an HTML page instead".into()));
     }
+    // ffmpeg writes the file, not `vfs`: the automation roots are asked here (ADR 0124).
+    let path = crate::access::for_program(&path, crate::access::Access::Write)?;
     let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
     // Sound is encoded by the same ffmpeg: Opus in WebM (royalty-free), AAC in MP4.
     let (codec, audio_codec): (&[&str], &[&str]) = match ext.as_deref() {
@@ -777,6 +787,36 @@ fn export_sequence(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"frames": files, "dir": dir.display().to_string()}))
 }
 
+/// Export SVG Sequence (#504): every movie frame as its own SVG file, named like the PNG
+/// sequence's (`frame_00001.svg`), so other programs read the animation as vectors. Each file
+/// is what Export Frame as SVG writes for that frame.
+fn export_svg_sequence(s: &mut Session, p: &Value) -> Result<Value> {
+    let dir = PathBuf::from(str_req(p, "dir")?);
+    let last = s.doc.frame_count().saturating_sub(1);
+    let from = opt_u32(p, "from")?.unwrap_or(0).min(last);
+    let to = opt_u32(p, "to")?.unwrap_or(last).min(last);
+    if to < from {
+        return Err(EngineError::Param("'to' must not be before 'from'".into()));
+    }
+    crate::vfs::create_dir_all(&dir)?;
+    // Frames are independent: a small batch at a time in parallel, so the text held in memory
+    // stays bounded, written here on the command's thread (ADR 0036).
+    let doc = &s.doc;
+    let job = s.job.as_deref();
+    let (mut files, mut bytes) = (0usize, 0u64);
+    let frames: Vec<u32> = (from..=to).collect();
+    for batch in frames.chunks(16) {
+        let svgs: Vec<String> = batch.par_iter().map(|&f| frame_svg(doc, f)).collect();
+        for (f, svg) in batch.iter().zip(svgs) {
+            bytes = bytes.saturating_add(svg.len() as u64);
+            crate::vfs::write(&dir.join(format!("frame_{:05}.svg", f + 1)), svg.as_bytes())?;
+            files += 1;
+        }
+        crate::publish::tick(job, batch.len() as u64)?;
+    }
+    Ok(json!({"frames": files, "bytes": bytes, "dir": dir.display().to_string()}))
+}
+
 /// Largest GIF we produce (frames × pixels), keeping memory and time bounded.
 const MAX_GIF_PIXELS: u64 = 600 * 1280 * 720;
 
@@ -825,9 +865,14 @@ fn export_html(s: &mut Session, p: &Value) -> Result<Value> {
         Some(t) if !t.trim().is_empty() => t.to_string(),
         _ => stem,
     };
-    let opts = anicraft_render::html::HtmlOptions { title, sound: opt_bool(p, "sound")?.unwrap_or(true), fit: opt_bool(p, "fit")?.unwrap_or(true) };
     let started = web_time::Instant::now();
-    let out = anicraft_render::html::to_html(&s.doc, &opts).map_err(EngineError::Param)?;
+    // Glyph outlines for fields that embed characters (ADR 0107), where the fonts allow it.
+    let embedded = crate::embed::embedded_faces(&s.doc);
+    let opts = anicraft_render::html::HtmlOptions { title, sound: opt_bool(p, "sound")?.unwrap_or(true), fit: opt_bool(p, "fit")?.unwrap_or(true), fonts: embedded.faces };
+    let mut out = anicraft_render::html::to_html(&s.doc, &opts).map_err(EngineError::Param)?;
+    for (note, n) in embedded.notes {
+        out.report.insert(note, n);
+    }
     crate::vfs::write(&path, out.html.as_bytes())?;
     let summary = if out.report.is_empty() {
         String::new()
@@ -850,6 +895,7 @@ fn export_html(s: &mut Session, p: &Value) -> Result<Value> {
         "ms": started.elapsed().as_millis() as u64,
         "report": summary,
         "notes": out.report,
+        "fonts": embedded.summary,
     }))
 }
 
@@ -909,4 +955,67 @@ fn set_stage(s: &mut Session, p: &Value) -> Result<Value> {
         s.doc.stage.background = c;
     }
     Ok(json!({"width": s.doc.stage.width, "height": s.doc.stage.height, "fps": s.doc.stage.fps, "background": s.doc.stage.background.to_hex()}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #504: one SVG per movie frame, each the same as Export Frame as SVG gives.
+    #[test]
+    fn svg_sequence_writes_each_frame_as_the_single_frame_export_does() {
+        std::thread::spawn(|| {
+            crate::vfs::use_memory();
+            let mut s = Session::new(anicraft_doc::sample::demo());
+            let info = s.info();
+            let v = s.execute("file.export_svg_sequence", &json!({"dir": "seq", "from": 2, "to": 5})).unwrap();
+            assert_eq!(v["frames"], 4);
+            assert_eq!(v["dir"], "seq");
+            let dir = std::path::Path::new("seq");
+            let mut total = 0;
+            for f in 2..=5u32 {
+                let file = crate::vfs::read_to_string(&dir.join(format!("frame_{:05}.svg", f + 1))).unwrap();
+                assert!(file.starts_with("<svg") || file.starts_with("<?xml"), "{}", &file[..file.len().min(40)]);
+                assert_eq!(file, frame_svg(&s.doc, f), "frame {f}");
+                total += file.len() as u64;
+            }
+            assert_eq!(v["bytes"], total);
+            assert!(!crate::vfs::exists(&dir.join("frame_00002.svg")) && !crate::vfs::exists(&dir.join("frame_00007.svg")), "only the frames asked for");
+            assert_ne!(frame_svg(&s.doc, 2), frame_svg(&s.doc, 5), "the sample moves, so the frames differ");
+            assert_eq!(s.info(), info, "exporting changes nothing");
+            // Past the end is the last frame; a backwards range is refused; frames already there ask.
+            assert_eq!(s.execute("file.export_svg_sequence", &json!({"dir": "tail", "from": 4_000_000_000u32})).unwrap()["frames"], 1);
+            assert!(s.execute("file.export_svg_sequence", &json!({"dir": "seq", "from": 5, "to": 2})).is_err());
+            assert!(s.confirmation("file.export_svg_sequence", &json!({"dir": "seq"})).is_some_and(|c| c.irreversible));
+            assert!(s.confirmation("file.export_svg_sequence", &json!({"dir": "elsewhere"})).is_none());
+            assert!(s.confirmation("file.export_png_sequence", &json!({"dir": "seq"})).is_none(), "SVG frames are not PNG frames");
+            assert!(matches!(s.execute("file.export_svg_sequence", &json!({"dir": "seq"})), Err(EngineError::NeedsConfirmation(_))));
+            s.execute("file.export_svg_sequence", &json!({"dir": "seq", "confirm": true})).unwrap();
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn oversized_svg_frame_is_an_error_without_writing() {
+        // Keep this test's memory-backed files off reused test worker threads.
+        std::thread::spawn(|| {
+            crate::vfs::use_memory();
+            let mut s = Session::default();
+            let info = s.info();
+            let path = std::path::Path::new("frame.svg");
+            crate::vfs::put(path, b"keep this file".to_vec()).unwrap();
+            for (frame, shown) in [(u32::MAX, "4294967296"), (1, "2")] {
+                let error = s.execute("file.export_svg", &json!({"path": "frame.svg", "frame": frame, "confirm": true})).unwrap_err();
+                assert_eq!(error.to_string(), format!("frame {shown} is past the end (the timeline has 1 frames)"));
+                assert_eq!(crate::vfs::read(path).unwrap(), b"keep this file");
+                assert_eq!(s.info(), info);
+            }
+            s.execute("file.export_svg", &json!({"path": "frame.svg", "frame": 0, "confirm": true})).unwrap();
+            assert!(crate::vfs::read_to_string(path).unwrap().contains("<svg"));
+            assert_eq!(s.info(), info);
+        })
+        .join()
+        .unwrap();
+    }
 }

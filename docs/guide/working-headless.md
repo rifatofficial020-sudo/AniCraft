@@ -121,6 +121,22 @@ anicraft-cli run shot010.anicraft title.json --save shot010_titled.anicraft
 Steps run in order. The first one that fails stops the run, and the error names the step. The
 results of all the steps print as a JSON array.
 
+### A chart from numbers
+
+Tables of numbers can drive instances (see [Data-driven animation](data-driven-animation.md)).
+This script gives a document a table and lets one of its columns set the height of the selected
+bar, frame by frame:
+
+```json
+[
+  {"cmd": "data.set_table", "params": {"name": "Rainfall", "columns": [{"name": "Jan", "values": [40, 85, 120, 96]}]}},
+  {"cmd": "data.bind", "params": {"property": "scale_y", "table": "Rainfall", "column": "Jan", "frames": 24}}
+]
+```
+
+`data.import_table` reads the numbers from a CSV, TSV or JSON file instead, and importing a
+table that is already there replaces its values and keeps what is bound to it.
+
 ### Publishing a document
 
 If a document has **File › Publish Settings** set up, one command writes every format it has
@@ -222,16 +238,26 @@ it: they can be undone with `edit.undo` in the same session.
 then open a document, draw, animate, look at frames and export, through the same commands the
 app uses.
 
+You say which folders the assistant may use. `mcp` does not start without both:
+
+* `--automation-read-root <folder>`: its commands may read files inside this folder (open,
+  import). Give it again for more folders.
+* `--automation-write-root <folder>`: its commands may save and export inside this folder.
+
+They can be the same folder, and each must already exist.
+
 ```sh
-anicraft-cli mcp                    # a new, empty document
-anicraft-cli mcp scene.anicraft     # open a document
-anicraft-cli mcp --sample           # the sample animation
+ROOTS="--automation-read-root /work/project --automation-write-root /work/project"
+anicraft-cli mcp $ROOTS                   # a new, empty document
+anicraft-cli mcp scene.anicraft $ROOTS    # open a document
+anicraft-cli mcp --sample $ROOTS          # the sample animation
 ```
 
 To register it with Claude Code:
 
 ```sh
-claude mcp add anicraft -- /path/to/anicraft-cli mcp
+claude mcp add anicraft -- /path/to/anicraft-cli mcp \
+  --automation-read-root /work/project --automation-write-root /work/project
 ```
 
 Most other clients take an entry like this (use the full path to `anicraft-cli`):
@@ -241,7 +267,9 @@ Most other clients take an entry like this (use the full path to `anicraft-cli`)
   "mcpServers": {
     "anicraft": {
       "command": "/path/to/anicraft-cli",
-      "args": ["mcp", "/path/to/scene.anicraft"]
+      "args": ["mcp", "/work/project/scene.anicraft",
+               "--automation-read-root", "/work/project",
+               "--automation-write-root", "/work/project"]
     }
   }
 }
@@ -262,8 +290,14 @@ Things to know:
 * Every edit is checked and can be undone, as in the app.
 * Commands that would lose work or replace a file still need `"confirm": true`. The server tells
   the assistant to check with you before confirming.
-* The assistant reads and writes files with your permissions, at the paths it chooses. Only
-  connect assistants you trust with those files.
+* The assistant's commands read files only inside the read root and write only inside the write
+  root. Anything else is refused before a file is touched, with a message that names the root.
+  The path is checked as the file it really is: `..`, shortcuts to other folders (symbolic
+  links, junctions) and, on Windows, capital letters make no difference. Inside the roots the
+  assistant has your permissions, so give it a project folder, not your home folder.
+* The document you name when starting the server opens wherever it is. If it is outside the
+  write root, the assistant can't save over it: it saves a copy inside the write root
+  (`file.save_as`).
 * The server works on its own copy of the document, not on the window you have open. Save from
   the assistant, then open the file in AniCraft. To have the assistant work in the window
   instead, see the next section.
@@ -271,7 +305,8 @@ Things to know:
 ### An assistant in the window you have open
 
 Start AniCraft with `anicraft --control 9878`, and give the assistant
-`anicraft-cli mcp --bridge 9878` as its server instead of `anicraft-cli mcp`. The same five
+`anicraft-cli mcp --bridge 9878` (with the same two `--automation-…-root` flags) as its server
+instead. The same five
 tools then act on the document in front of you: each edit shows at once and undoes with
 **Ctrl+Z** like your own. While this is on, the status bar says **Remote control on (port
 9878)**.
@@ -282,6 +317,8 @@ tools then act on the document in front of you: each edit shows at once and undo
 * An edit from the assistant waits while you are in the middle of a drag, so your undo steps
   and its own never mix.
 * Commands that would lose work still need `"confirm": true`, as above.
+* The two folders apply here too, to the assistant's commands only: your own work in the window
+  is not limited.
 * Without `--control` nothing listens: remote control is off unless you start AniCraft this way.
 
 The full details are in

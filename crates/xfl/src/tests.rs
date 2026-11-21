@@ -287,6 +287,26 @@ fn a_fla_archive_imports_the_same() {
 }
 
 #[test]
+fn folder_import_ignores_backslash_escapes_and_symlinks() {
+    let dir = std::env::temp_dir().join(format!("anicraft-xfl-path-{}", std::process::id()));
+    let pkg = dir.join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(dir.join("secret.xml"), DOC).unwrap();
+    // A reference that climbs out with backslashes is not read (here it would be the whole document).
+    std::fs::write(pkg.join("DOMDocument.xml"), "<DOMDocument><symbols><Include href=\"x\\..\\..\\secret.xml\"/></symbols></DOMDocument>").unwrap();
+    let (doc, _) = crate::import_path(&pkg).unwrap();
+    assert_eq!(doc.library.len(), 0);
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(pkg.join("DOMDocument.xml")).unwrap();
+        std::os::unix::fs::symlink(dir.join("secret.xml"), pkg.join("DOMDocument.xml")).unwrap();
+        let e = crate::import_path(&pkg).err().map(|e| e.to_string());
+        assert!(e.is_some_and(|e| e.contains("no DOMDocument.xml")), "a symlink is not package content");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn hostile_packages_fail_cleanly() {
     let mut files = package();
     files.insert("DOMDocument.xml", "<DOMDocument><timelines><DOMTimeline><layers><DOMLayer><frames><DOMFrame index=\"99999999999\" duration=\"-4\"><elements><DOMShape><edges><Edge fillStyle1=\"1\" edges=\"!#FFFFFFFF.FF 1e30|nan 0[\"/></edges></DOMShape></elements></DOMFrame></frames></DOMLayer></layers></DOMTimeline></timelines></DOMDocument>");
@@ -432,6 +452,44 @@ fn shape_hints_come_across_in_either_form() {
         let hit = it.path.cmds.iter().any(|c| matches!(*c, PathCmd::MoveTo(a) | PathCmd::CubicTo(_, _, a) if it.transform.apply(a).distance(want) < 0.05));
         assert!(hit, "{want:?} {:?}", it.path.cmds);
     }
+}
+
+#[test]
+fn shape_hints_come_across_as_animate_writes_them() {
+    // `morphHintsList` on the start keyframe, both points per record, in units of 256 twips:
+    // (0, 0) and (300, 50) px, the end as hex fixed point and decimal. The list inside
+    // `MorphShape` is not the artist's and is left alone.
+    let hint = r##"<MorphHint startPoint="0, #0" endPoint="#17.70, 3.90625" key="0"/>"##;
+    let doc = hinted_doc(&format!("<MorphShape><morphHintsList>{hint}{hint}</morphHintsList></MorphShape><morphHintsList>{hint}</morphHintsList>"), "");
+    let (d, report) = import(&HashMap::from([("DOMDocument.xml", doc)])).unwrap();
+    assert!(report.skipped.keys().all(|s| !s.contains("hint")), "{:?}", report.skipped);
+    let l = &d.timeline(0).layers[0];
+    let k = &l.keyframes[0];
+    assert_eq!(k.hints.len(), 1);
+    assert!(k.hints[0].start.distance(anicraft_geom::Vec2::new(0.0, 0.0)) < 1e-3, "{:?}", k.hints[0]);
+    assert!(k.hints[0].end.distance(anicraft_geom::Vec2::new(300.0, 50.0)) < 1e-3, "{:?}", k.hints[0]);
+    assert!(anicraft_doc::placed_on(&k.elements, k.hints[0].start).is_some());
+    assert!(anicraft_doc::placed_on(&l.keyframes[1].elements, k.hints[0].end).is_some());
+    // Either spelling gives the same hints.
+    let native = hinted_doc(r#"<shapeHints><ShapeHint startPoint="0, 0" endPoint="300, 50"/></shapeHints>"#, "");
+    let (n, _) = import(&HashMap::from([("DOMDocument.xml", native)])).unwrap();
+    assert_eq!(n.timeline(0).layers[0].keyframes[0].hints, k.hints);
+}
+
+#[test]
+fn odd_morph_hints_are_reported_not_fatal() {
+    let many: String = (0..30).map(|_| r##"<MorphHint startPoint="0, 0" endPoint="#F.A0, 0"/>"##).collect();
+    let odd = r##"<MorphHint/><MorphHint startPoint="#zz, 1"/><MorphHint startPoint="1e39, 0"/><MorphHint startPoint="#7FFFFFFF.FF, #80000000" endPoint="#F.A0, 0"/>"##;
+    let doc = hinted_doc(&format!("<morphHintsList>{odd}{many}<Other startPoint=\"0, 0\"/></morphHintsList>"), "");
+    let (d, report) = import(&HashMap::from([("DOMDocument.xml", doc)])).unwrap();
+    assert_eq!(d.timeline(0).layers[0].keyframes[0].hints.len(), 26);
+    assert!(report.skipped.contains_key("shape hints past z"), "{:?}", report.skipped);
+    assert!(report.skipped.contains_key("shape hints without a position"));
+    // No end point, and no hints on the end keyframe to take one from.
+    let doc = hinted_doc(r#"<morphHintsList><MorphHint startPoint="0, 0" endPoint="0"/></morphHintsList>"#, "");
+    let (d, report) = import(&HashMap::from([("DOMDocument.xml", doc)])).unwrap();
+    assert!(d.timeline(0).layers[0].keyframes[0].hints.is_empty());
+    assert!(report.skipped.contains_key("shape hints missing on the end keyframe"));
 }
 
 #[test]
@@ -637,6 +695,10 @@ fn stroke_caps_joints_dashes_and_dots_come_across() {
     assert_eq!(read(r#"<SolidStroke caps="square" joints="bevel" miterLimit="1e9"/>"#).0.style, StrokeStyle { cap: Cap::Square, join: Join::Bevel, miter_limit: 100.0, dash: None });
     let (dashed, _) = read(r#"<DashedStroke weight="2" dash1="8" dash2="2.5" caps="square"/>"#);
     assert_eq!(dashed.style, StrokeStyle { cap: Cap::Square, dash: Dash::dashed(8.0, 2.5), ..StrokeStyle::default() });
+    // Animate's defaults are a 6 px dash and a 6 px gap, each written only when it differs.
+    assert_eq!(read(r#"<DashedStroke weight="2"/>"#).0.style.dash, Dash::dashed(6.0, 6.0));
+    assert_eq!(read(r#"<DashedStroke weight="9" dash2="9"/>"#).0.style.dash, Dash::dashed(6.0, 9.0));
+    assert_eq!(read(r#"<DashedStroke dash1="10"/>"#).0.style.dash, Dash::dashed(10.0, 6.0));
     // No gap draws solid.
     assert_eq!(read(r#"<DashedStroke dash1="8" dash2="0"/>"#).0.style.dash, None);
     assert_eq!(read(r#"<DottedStroke weight="3" dotSpace="5"/>"#).0.style.dash, Dash::dotted(5.0));
@@ -833,4 +895,104 @@ fn grouped_instance_is_not_scaled_twice() {
     // The groups keep their own matrices for editing.
     assert_eq!(els[0].transform.m, [0.5, 0.0, 0.0, 0.5, 50.0, 50.0]);
     assert_eq!(outer.transform.m, [1.0, 0.0, 0.0, 1.0, 10.0, 20.0]);
+}
+
+#[test]
+fn folder_packages_refuse_backslash_paths_that_leave_the_package() {
+    let dir = std::env::temp_dir().join(format!("anicraft-xfl-escape-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("LIBRARY")).unwrap();
+    std::fs::write(dir.join("DOMDocument.xml"), r#"<DOMDocument><symbols><Include href="..\Ball.xml"/></symbols></DOMDocument>"#).unwrap();
+    // On Windows this lands outside LIBRARY; elsewhere it is a file named `..\Ball.xml`.
+    std::fs::write(dir.join("LIBRARY/..\\Ball.xml"), BALL).unwrap();
+    let (doc, report) = crate::import_path(&dir).unwrap();
+    assert!(doc.library.is_empty(), "the escaping path was read");
+    assert_eq!(report.skipped.get("missing library files"), Some(&1));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn folder_import_enforces_full_path_boundaries() {
+    let dir = std::env::temp_dir().join(format!("anicraft-xfl-bounds-{}", std::process::id()));
+    let outside = dir.join("outside");
+    let pkg = dir.join("pkg");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::create_dir_all(pkg.join("LIBRARY")).unwrap();
+    std::fs::write(outside.join("Escape.xml"), BALL).unwrap();
+    std::fs::write(pkg.join("LIBRARY/Real.xml"), BALL.replace("name=\"Ball\"", "name=\"Real\"")).unwrap();
+    std::fs::write(
+        pkg.join("DOMDocument.xml"),
+        r#"<DOMDocument><symbols>
+          <Include href="../outside/Escape.xml"/>
+          <Include href="..\outside\Escape.xml"/>
+          <Include href="./Real.xml"/>
+          <Include href="C:Escape.xml"/>
+          <Include href="/Escape.xml"/>
+          <Include href="Real.xml"/>
+        </symbols></DOMDocument>"#,
+    )
+    .unwrap();
+    let (doc, report) = crate::import_path(&pkg).unwrap();
+    assert_eq!(doc.library.len(), 1, "only Real.xml inside LIBRARY is imported");
+    assert_eq!(report.skipped.get("missing library files"), Some(&5));
+
+    #[cfg(unix)]
+    {
+        let dir2 = std::env::temp_dir().join(format!("anicraft-xfl-dirsym-{}", std::process::id()));
+        let ext = dir2.join("ext");
+        let pkg2 = dir2.join("pkg");
+        std::fs::create_dir_all(&ext).unwrap();
+        std::fs::create_dir_all(&pkg2).unwrap();
+        std::fs::write(ext.join("Ball.xml"), BALL).unwrap();
+        std::os::unix::fs::symlink(&ext, pkg2.join("LIBRARY")).unwrap();
+        std::fs::write(pkg2.join("DOMDocument.xml"), r#"<DOMDocument><symbols><Include href="Ball.xml"/></symbols></DOMDocument>"#).unwrap();
+        let (doc2, report2) = crate::import_path(&pkg2).unwrap();
+        assert!(doc2.library.is_empty(), "intermediate directory symlink must not be traversed");
+        assert_eq!(report2.skipped.get("missing library files"), Some(&1));
+        std::fs::remove_dir_all(&dir2).ok();
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn bitmap_import_enforces_aggregate_pixel_budget() {
+    assert_eq!(crate::import::MAX_BITMAP_PIXELS, 256 * 1024 * 1024);
+    let doc_xml = r#"<DOMDocument><media>
+      <DOMBitmapItem name="a.png" href="a.png"/>
+      <DOMBitmapItem name="b.png" href="b.png"/>
+      <DOMBitmapItem name="c.png" href="c.png"/>
+    </media></DOMDocument>"#;
+    let files: HashMap<String, Vec<u8>> = HashMap::from([
+        ("DOMDocument.xml".to_string(), doc_xml.as_bytes().to_vec()),
+        ("LIBRARY/a.png".to_string(), png_2x1()),
+        ("LIBRARY/b.png".to_string(), png_2x1()),
+        ("LIBRARY/c.png".to_string(), png_2x1()),
+    ]);
+    let read = |p: &str| -> Result<Option<Vec<u8>>, XflError> { Ok(files.get(p).cloned()) };
+    let (doc, report) = crate::import::import_with_bitmap_budget(&read, 4).unwrap();
+    assert_eq!(doc.bitmaps.len(), 2, "two 2x1 bitmaps fit in the 4-pixel budget");
+    assert_eq!(report.skipped.get("bitmaps past the import pixel budget"), Some(&1));
+}
+
+#[test]
+fn valid_long_bitmap_sequence_imports_under_budget() {
+    let count = 200usize;
+    let mut media = String::new();
+    let mut frames = String::new();
+    let mut files: HashMap<String, Vec<u8>> = HashMap::new();
+    let img = png_2x1();
+    for i in 0..count {
+        let name = format!("seq/frame_{i:04}.png");
+        media.push_str(&format!(r#"<DOMBitmapItem name="{name}" href="{name}"/>"#));
+        frames.push_str(&format!(r#"<DOMFrame index="{i}"><elements><DOMBitmapInstance libraryItemName="{name}"/></elements></DOMFrame>"#));
+        files.insert(format!("LIBRARY/{name}"), img.clone());
+    }
+    let doc_xml = format!(
+        r#"<DOMDocument><media>{media}</media><timelines><DOMTimeline name="Scene 1"><layers><DOMLayer name="Seq"><frames>{frames}</frames></DOMLayer></layers></DOMTimeline></timelines></DOMDocument>"#
+    );
+    files.insert("DOMDocument.xml".to_string(), doc_xml.into_bytes());
+    let read = |p: &str| -> Result<Option<Vec<u8>>, XflError> { Ok(files.get(p).cloned()) };
+    let (doc, report) = import_with(&read).unwrap();
+    assert_eq!(doc.bitmaps.len(), count, "all {count} sequence bitmaps fit within the 256 MP budget");
+    assert_eq!(doc.timeline(0).layers[0].keyframes.len(), count);
+    assert!(!report.skipped.contains_key("bitmaps past the import pixel budget"));
 }

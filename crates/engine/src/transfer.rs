@@ -88,6 +88,8 @@ pub(crate) fn carry(s: &Session, roots: &[Element], sounds: impl IntoIterator<It
             }
             LibraryItem::Bitmap(id) => out.bitmaps.extend(s.doc.bitmaps.iter().find(|b| b.id == id).cloned()),
             LibraryItem::Sound(id) => out.sounds.extend(s.doc.sounds.iter().find(|x| x.id == id).cloned()),
+            // Artwork never refers to a data table (bindings do, and they aren't copied).
+            LibraryItem::Data(_) => {}
         }
     }
     out

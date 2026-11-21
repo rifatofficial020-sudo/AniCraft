@@ -24,24 +24,25 @@ the panels, tools and shortcuts you know to AniCraft's, and lists what works dif
 8. [Text](text.md): static, dynamic and input text.
 9. [Images and sound](images-and-sound.md): bitmaps, SVG files and sound on the timeline.
 10. [Interactivity](interactivity.md): actions, buttons, frame scripts and Test Movie.
+11. [Data-driven animation](data-driven-animation.md): tables of numbers that drive charts, markers and shapes.
 
 ## Sharing your work
 
-11. [Exporting and Publish](exporting-and-publish.md): pictures, GIFs, animated PNG and WebP, video, HTML and Publish Settings.
-12. [Opening Animate files](opening-animate-files.md): what comes across from `.fla` and XFL, and what AniCraft tells you about the rest.
+12. [Exporting and Publish](exporting-and-publish.md): pictures, GIFs, animated PNG and WebP, video, HTML and Publish Settings.
+13. [Opening Animate files](opening-animate-files.md): what comes across from `.fla` and XFL, and what AniCraft tells you about the rest.
 
 ## Making AniCraft yours
 
-13. [Preferences, shortcuts, accessibility and languages](preferences-shortcuts-accessibility.md).
-14. [Plug-ins](plugins.md): add commands safely.
-15. [Saved commands](saved-commands.md): keep steps from the History panel and run them again on any selection.
-16. [Working headless](working-headless.md): the command line and AI assistants, for pipelines.
+14. [Preferences, shortcuts, accessibility and languages](preferences-shortcuts-accessibility.md).
+15. [Plug-ins](plugins.md): add commands safely.
+16. [Saved commands](saved-commands.md): keep steps from the History panel and run them again on any selection.
+17. [Working headless](working-headless.md): the command line and AI assistants, for pipelines.
 
 ## Help
 
-17. [Using this guide](using-this-guide.md): searching it, and help for whatever you are working on (**F1**).
-18. [Troubleshooting and FAQ](troubleshooting-and-faq.md).
-19. [Coming from Animate](coming-from-animate.md).
+18. [Using this guide](using-this-guide.md): searching it, and help for whatever you are working on (**F1**).
+19. [Troubleshooting and FAQ](troubleshooting-and-faq.md).
+20. [Coming from Animate](coming-from-animate.md).
 
 ## Reference
 

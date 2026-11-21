@@ -431,7 +431,8 @@ impl BrushLibrary {
 
     /// The presets in a brush set file (bad entries skipped; values clamped).
     pub fn parse_file(text: &str) -> Result<Vec<BrushPreset>> {
-        let f: BrushFile = serde_json::from_str(text).map_err(|e| EngineError::Param(format!("not a brush set file: {e}")))?;
+        let f: BrushFile =
+            serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| EngineError::Param(format!("not a brush set file: {e}")))?;
         if f.format != FILE_FORMAT {
             return Err(EngineError::Param(format!("not a brush set file (its format is '{}')", f.format.chars().take(40).collect::<String>())));
         }
@@ -483,6 +484,7 @@ mod tests {
         let mine = vec![BrushPreset { name: "A".into(), curve: PressureCurve::SOFT, jitter: 12.0, ..BrushPreset::default() }, builtin("dotted").unwrap()];
         let text = BrushLibrary::file_json(&mine);
         assert_eq!(BrushLibrary::parse_file(&text).unwrap(), mine);
+        assert_eq!(BrushLibrary::parse_file(&format!("\u{feff}{text}")).unwrap(), mine);
         assert!(BrushLibrary::parse_file("{}").is_err());
         assert!(BrushLibrary::parse_file(r#"{"format": "other", "version": 1, "brushes": []}"#).is_err());
         assert!(BrushLibrary::parse_file(r#"{"format": "anicraft-brushes", "version": 99, "brushes": []}"#).is_err());

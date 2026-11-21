@@ -26,6 +26,8 @@ craft-image-codecs.workspace = true
 craft-apng-container.workspace = true
 craft-webp.workspace = true
 regex.workspace = true
+# CSV and TSV data tables (ADR 0118).
+craft-csv.workspace = true
 
 [dev-dependencies]
 # Packs the XFL corpus into .fla archives in tests (ADR 0054; already in the tree through xfl).

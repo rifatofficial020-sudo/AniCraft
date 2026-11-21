@@ -18,7 +18,7 @@ pub fn specs() -> Vec<CommandSpec> {
     let c = |id, label, menu, shortcut, params, mutates, run| CommandSpec { id, label, menu, shortcut, params, mutates, run };
     vec![
         c("control.test_movie", "Test Movie", "Control", Some("Ctrl+Enter"), "{frames?: steps to play (default 10 s of frames, at most 10,000), events?: [{tick, type: move|down|up|click|leave, x, y} or {tick, type: key_down|key_up|key, key: code|letter|LEFT…}], seed?: Math.random()'s seed (default 0)} plays the movie with its actions and frame scripts from the first frame; returns the output, the sounds it started ({tick, sound, name, sync, gain}; buttons' as the pointer changes their state) and where it ended (the app opens the Test Movie window)", false, test_movie as crate::RunFn),
-        c("actions.set", "Set Actions", "", None, "{actions: [{op: stop|play|goto_and_play|goto_and_stop|next_frame|prev_frame|next_scene|prev_scene|trace|set_property, target?, frame?, scene?, message?, property?, value?}] | plugin: id, entry?, symbol?: id (a movie clip's timeline), layer?, frame?} sets what the keyframe at the frame runs; or {element, event: click|press|release|over|out, actions} sets an instance's event handler. An empty list clears it", true, set),
+        c("actions.set", "Set Actions", "", None, "{actions: [{op: stop|play|goto_and_play|goto_and_stop|next_frame|prev_frame|next_scene|prev_scene|trace|set_property, target?, frame?, scene?, message?, property?, value?}] | plugin: id, entry?, symbol?: id (a movie clip's timeline), layer?, frame?} sets what the keyframe at the frame runs; or {element, event: click|press|release|over|out, actions} (or event: change on an input text field: what it does when the viewer changes its text, ADR 0107) sets an instance's event handler. An empty list clears it", true, set),
         c("actions.clear", "Clear Actions", "", None, "{symbol?, layer?, frame?} clears the keyframe's actions; {element, event?} clears an instance's handlers (one event, or all)", true, clear),
         c("actions.list", "List Actions", "", None, "{} every keyframe with actions or a frame script and every instance with event handlers, in every scene and symbol", false, list),
         c("instance.set_name", "Instance Name", "", None, "{element?: id (default: the selected instance), name: letters, digits, _ or $, not starting with a digit; \"\" clears} names a movie clip or button instance, or a dynamic or input text field, for actions and scripts", true, set_name),
@@ -142,8 +142,28 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"layer": lid.0, "keyframe": k.start, "actions": n, "summary": summary}))
 }
 
+/// `{element, event: "change", actions}`: what an input text field does when the viewer
+/// changes its text (ADR 0107).
+fn set_change(s: &mut Session, p: &Value) -> Result<Value> {
+    let list = parse_actions(p)?;
+    let el = instance_mut(s, p)?;
+    let id = el.id;
+    match &mut el.kind {
+        ElementKind::Text(t) if t.field.as_ref().is_some_and(|f| f.kind == anicraft_doc::TextKind::Input) => {
+            if let Some(f) = Arc::make_mut(t).field.as_mut() {
+                f.on_change = list.clone();
+            }
+        }
+        _ => return Err(EngineError::State("only input text fields have a change event: the viewer changes their text (set the text's type to Input in Properties)".into())),
+    }
+    Ok(json!({"element": id.0, "event": "change", "actions": list.len()}))
+}
+
 fn set_handler(s: &mut Session, p: &Value) -> Result<Value> {
-    let event = ButtonEvent::from_key(str_req(p, "event")?).ok_or_else(|| EngineError::Param("param 'event' must be click, press, release, over or out".into()))?;
+    if opt_str(p, "event")? == Some("change") {
+        return set_change(s, p);
+    }
+    let event = ButtonEvent::from_key(str_req(p, "event")?).ok_or_else(|| EngineError::Param("param 'event' must be click, press, release, over or out (or change, on an input text field)".into()))?;
     let list = parse_actions(p)?;
     let e = instance_mut(s, p)?.clone();
     interactive_kind(s, &e)?;
@@ -165,6 +185,20 @@ fn set_handler(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn clear(s: &mut Session, p: &Value) -> Result<Value> {
     if p.get("element").is_some() {
+        // An input text field's change actions (its one event).
+        if matches!(opt_str(p, "event")?, None | Some("change")) {
+            let el = instance_mut(s, p)?;
+            let id = el.id;
+            if let ElementKind::Text(t) = &mut el.kind {
+                let n = t.field.as_ref().map_or(0, |f| usize::from(!f.on_change.is_empty()));
+                if n > 0
+                    && let Some(f) = Arc::make_mut(t).field.as_mut()
+                {
+                    f.on_change.clear();
+                }
+                return Ok(json!({"element": id.0, "cleared": n}));
+            }
+        }
         let event = match opt_str(p, "event")? {
             Some(k) => Some(ButtonEvent::from_key(k).ok_or_else(|| EngineError::Param("param 'event' must be click, press, release, over or out".into()))?),
             None => None,
@@ -208,6 +242,14 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
                     {
                         let evs: Vec<Value> = events.iter().map(|h| json!({"event": h.event.key(), "actions": serde_json::to_value(&h.actions).unwrap_or(Value::Null), "summary": h.actions.iter().map(Action::describe).collect::<Vec<_>>().join("; ")})).collect();
                         let mut v = json!({"timeline": name, "layer": l.id.0, "frame": k.start, "element": e.id.0, "name": e.name, "symbol": s.doc.symbol(*symbol).map(|x| x.name.clone()), "events": evs});
+                        merge(&mut v, &at);
+                        instances.push(v);
+                    }
+                    if let ElementKind::Text(t) = &e.kind
+                        && let Some(f) = t.field.as_ref().filter(|f| !f.on_change.is_empty())
+                    {
+                        let evs = json!([{"event": "change", "actions": serde_json::to_value(&f.on_change).unwrap_or(Value::Null), "summary": f.on_change.iter().map(Action::describe).collect::<Vec<_>>().join("; ")}]);
+                        let mut v = json!({"timeline": name, "layer": l.id.0, "frame": k.start, "element": e.id.0, "name": e.name, "field": f.kind.key(), "events": evs});
                         merge(&mut v, &at);
                         instances.push(v);
                     }

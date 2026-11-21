@@ -180,3 +180,22 @@ fn script_text_is_capped_and_takes_actionscript_line_ends() {
     assert_eq!(slice("héllo", 4, 99), "o");
     assert_eq!(byte_at("héllo", 2), 3);
 }
+
+#[test]
+fn restrict_reads_as_actionscript_writes_it() {
+    let ok = |r: &str, s: &str| s.chars().filter(|c| allowed(r, *c)).collect::<String>();
+    assert_eq!(ok("A-Z 0-9", "Ab 9-z"), "A 9");
+    assert_eq!(ok("^a-z", "aBc1"), "B1", "everything but lower case");
+    assert_eq!(ok("A-Z^Q", "PQR"), "PR", "capitals, but not Q");
+    assert_eq!(ok("^a-z^m", "almz"), "m", "excluded, then let back in");
+    assert_eq!(ok("0-9\\-", "1-2a"), "1-2", "an escaped hyphen is a character");
+    assert_eq!(ok("\\^\\\\", "^\\a"), "^\\");
+    assert_eq!(ok("", "abc"), "", "an empty list allows nothing");
+    assert_eq!(ok("abc-", "a-c"), "a-c", "a trailing hyphen is itself");
+    assert_eq!(ok("z-a", "amz"), "", "a backwards range holds nothing");
+    assert_eq!(ok("é-ü😀", "é😀a"), "é😀");
+    // Long and odd lists are read without trouble.
+    assert!(!allowed(&"^".repeat(5000), 'a') || allowed(&"^".repeat(5000), 'a'));
+    assert!(allowed(&"\\".repeat(1023), '\\'));
+}
+

@@ -59,6 +59,8 @@ fn target_count(p: &Value) -> u32 {
 /// `(layer name, element count)`.
 fn lost_keys(s: &Session, p: &Value, hit: impl Fn(&Keyframe) -> bool) -> Vec<(String, usize)> {
     let ids: Vec<LayerId> = match p.get("layers").and_then(Value::as_array) {
+        // Every layer that reaches the frame (Shift+F5 and Shift+F6 with no frame selection).
+        _ if p.get("all_layers").and_then(Value::as_bool) == Some(true) => crate::cmds_timeline::layers_at_or_after(s, target_frame(s, p)),
         Some(v) => v.iter().filter_map(Value::as_u64).map(LayerId).take(1000).collect(),
         None => vec![p.get("layer").and_then(Value::as_u64).map_or(s.layer, LayerId)],
     };
@@ -242,11 +244,12 @@ pub fn confirmation(s: &Session, id: &str, p: &Value) -> Option<Confirmation> {
             let json = path.with_extension("json");
             [path, json.as_path()].into_iter().find(|f| crate::vfs::exists(f)).map(|f| overwrite(f, "Exporting"))
         }
-        "file.export_png_sequence" => {
+        "file.export_png_sequence" | "file.export_svg_sequence" => {
             let dir = Path::new(p.get("dir").and_then(Value::as_str)?);
+            let ext = if id == "file.export_svg_sequence" { ".svg" } else { ".png" };
             let has_frames = crate::vfs::list(dir, 10_000).iter().any(|e| {
                 let n = e.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-                n.starts_with("frame_") && n.ends_with(".png")
+                n.starts_with("frame_") && n.ends_with(ext)
             });
             has_frames.then(|| Confirmation {
                 title: "Replace exported frames?".into(),

@@ -10,10 +10,16 @@
 //! The same tools drive the desktop app live (ADR 0104): the app runs [`call_tool`] on its own
 //! session for requests from its control port, and `anicraft-cli mcp --bridge <port>` is this
 //! server with a [`Backend`] that forwards each tool call there (`crate::control`).
+//!
+//! An assistant's commands touch files inside the automation roots only (ADR 0124): the
+//! server refuses to start without `--automation-read-root` and `--automation-write-root`
+//! ([`Headless`]), and the bridge sends its roots with every call for the app to apply.
 
+use anicraft_engine::access::Roots;
 use anicraft_engine::{Session, commands};
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
+use std::sync::Arc;
 
 /// Protocol revisions this server speaks, newest first.
 const PROTOCOLS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -31,7 +37,8 @@ with its id and params, or anicraft_run_script for several in order. Frames in p
 0-based. Commands act on the current scene, layer, frame and selection, which anicraft_document \
 reports. Use anicraft_render to see a frame. Edits can be undone with edit.undo. Commands that \
 would lose work or replace a file refuse until params include \"confirm\": true; ask the person \
-before confirming.";
+before confirming. Files can be read only inside the automation read root and written only inside the \
+automation write root the person gave this server; an error names them.";
 
 /// The tools, as `tools/list` returns them. The desktop app's control port lists the same.
 pub fn tools() -> Value {
@@ -131,16 +138,24 @@ pub fn tool_changes_document(name: &str) -> bool {
     !matches!(name, "anicraft_commands" | "anicraft_document" | "anicraft_render")
 }
 
-/// Runs one tool. Tool failures are results with `isError` (so the assistant can read and
-/// correct them); only malformed calls are protocol errors.
+/// Runs one tool with no automation roots: for callers that are not an agent's entry point
+/// (tests, an embedding program that has already decided what may be touched).
 pub fn call_tool<H: Host + ?Sized>(h: &mut H, name: &str, args: &Value) -> Result<Value, String> {
+    call_tool_in(h, name, args, None)
+}
+
+/// Runs one tool. Tool failures are results with `isError` (so the assistant can read and
+/// correct them); only malformed calls are protocol errors. With `roots`, each command reads
+/// and writes files inside them only (ADR 0124).
+pub fn call_tool_in<H: Host + ?Sized>(h: &mut H, name: &str, args: &Value, roots: Option<&Arc<Roots>>) -> Result<Value, String> {
     let run = |h: &mut H, step: &Value| -> Result<Value, String> {
         let id = step.get("command").and_then(Value::as_str).ok_or("missing \"command\"")?;
         let params = step.get("params").cloned().unwrap_or_else(|| json!({}));
         if !params.is_object() {
             return Err(format!("{id}: \"params\" must be an object"));
         }
-        h.execute(id, &params).map_err(|e| format!("{id}: {e}"))
+        crate::refuse_remote_ffmpeg(id, &params).map_err(|e| format!("{id}: {e}"))?;
+        crate::execute_in(roots, || h.execute(id, &params)).map_err(|e| format!("{id}: {e}"))
     };
     Ok(match name {
         "anicraft_commands" => {
@@ -227,6 +242,21 @@ impl Backend for Session {
     }
 }
 
+/// What `anicraft-cli mcp` serves: a session whose commands stay inside the automation roots.
+pub struct Headless {
+    pub session: Session,
+    pub roots: Arc<Roots>,
+}
+
+impl Backend for Headless {
+    fn instructions(&self) -> &'static str {
+        INSTRUCTIONS
+    }
+    fn call(&mut self, name: &str, args: &Value) -> Result<Value, String> {
+        call_tool_in(&mut self.session, name, args, Some(&self.roots))
+    }
+}
+
 /// Answers one JSON-RPC message; `None` for notifications (and responses), which get no reply.
 pub fn handle<B: Backend + ?Sized>(s: &mut B, line: &str) -> Option<Value> {
     let msg: Value = match serde_json::from_str(line.trim_start_matches('\u{feff}')) {
@@ -273,8 +303,17 @@ pub fn handle<B: Backend + ?Sized>(s: &mut B, line: &str) -> Option<Value> {
 /// The stdio loop: one message per line in, one reply per line out, until stdin closes.
 /// Nothing but protocol messages is written to `out` (logs would corrupt the stream).
 pub fn serve<B: Backend + ?Sized, R: BufRead, W: Write>(s: &mut B, input: R, out: &mut W) -> std::io::Result<()> {
-    for line in input.lines() {
-        let line = line?;
+    let mut input = input;
+    loop {
+        let line = match crate::read_line(&mut input, crate::MAX_LINE)? {
+            crate::Line::Eof => break,
+            crate::Line::TooLong => {
+                writeln!(out, "{}", json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "request line too long"}}))?;
+                out.flush()?;
+                continue;
+            }
+            crate::Line::Text(l) => l,
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -318,6 +357,66 @@ mod tests {
         assert_eq!(call(&mut s, 5, "nope", json!({}))["error"]["code"], -32601);
         assert_eq!(handle(&mut s, "{oops").unwrap()["error"]["code"], -32700);
         assert_eq!(call(&mut s, 6, "tools/call", json!({"name": "nope"}))["error"]["code"], -32602);
+    }
+
+
+    /// The headless server keeps an assistant's commands inside its roots (ADR 0124), and the
+    /// refusal it reads names the root.
+    #[test]
+    fn the_headless_server_reads_and_writes_inside_its_roots_only() {
+        let r = crate::tests::Roots3::new("mcp");
+        let mut h = Headless { session: Session::default(), roots: r.roots.clone() };
+        let mut run = |command: &str, params: Value| {
+            let line = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "anicraft_run", "arguments": {"command": command, "params": params}}});
+            handle(&mut h, &line.to_string()).unwrap()["result"].clone()
+        };
+        let said = |v: &Value| v["content"][0]["text"].as_str().unwrap_or_default().to_string();
+        assert_eq!(run("draw.rect", json!({"x": 1, "y": 1, "w": 9, "h": 9}))["isError"], false, "commands without files run as ever");
+        let ok = run("file.save_as", json!({"path": r.path(&["out", "a.anicraft"])}));
+        assert_eq!(ok["isError"], false, "{ok}");
+        for (command, params, root) in [
+            ("file.save_as", json!({"path": r.path(&["secret", "a.anicraft"])}), "write"),
+            ("file.save_as", json!({"path": r.path(&["out", "..", "secret", "a.anicraft"])}), "write"),
+            ("file.export_png", json!({"path": r.path(&["work", "f.png"])}), "write"),
+            ("file.export_png", json!({"path": "f.png"}), "write"),
+            ("file.open", json!({"path": r.path(&["secret", "s.json"]), "confirm": true}), "read"),
+            ("macro.run", json!({"path": r.path(&["work", "..", "secret", "s.json"])}), "read"),
+            ("file.open", json!({"path": r.path(&["out", "a.anicraft"]), "confirm": true}), "read"),
+        ] {
+            let v = run(command, params.clone());
+            assert_eq!(v["isError"], true, "{command} {params}");
+            let root_dir = if root == "write" { r.roots.write().unwrap().to_path_buf() } else { r.roots.read()[0].clone() };
+            assert!(said(&v).contains(&format!("automation {root} root")) && said(&v).contains(&anicraft_engine::access::display(&root_dir)), "{}", said(&v));
+        }
+        assert!(!std::path::Path::new(&r.path(&["secret", "a.anicraft"])).exists() && !std::path::Path::new("f.png").exists());
+        // The ffmpeg refusal (#497) is still the first thing checked.
+        let v = run("file.export_video", json!({"path": r.path(&["out", "a.mp4"]), "ffmpeg": "/bin/sh"}));
+        assert!(said(&v).contains("ANICRAFT_FFMPEG"), "{v}");
+        // A script stops at the refused step.
+        let line = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "anicraft_run_script", "arguments": {"steps": [
+            {"command": "draw.rect", "params": {"x": 30, "y": 1, "w": 9, "h": 9}},
+            {"command": "file.export_svg", "params": {"path": r.path(&["secret", "f.svg"])}}
+        ]}}});
+        let v = handle(&mut h, &line.to_string()).unwrap()["result"].clone();
+        assert_eq!((v["isError"].clone(), text(&v)["failed_step"].clone()), (json!(true), json!(2)), "{v}");
+        assert!(init_mentions_roots(&mut h));
+    }
+
+    fn init_mentions_roots(h: &mut Headless) -> bool {
+        let init = handle(h, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#).unwrap();
+        init["result"]["instructions"].as_str().is_some_and(|t| t.contains("automation read root"))
+    }
+
+    #[test]
+    fn mcp_refuses_a_caller_supplied_ffmpeg() {
+        let mut s = Session::default();
+        for r in [
+            tool(&mut s, "anicraft_run", json!({"command": "file.export_video", "params": {"path": "a.mp4", "ffmpeg": "/bin/sh"}})),
+            tool(&mut s, "anicraft_run_script", json!({"steps": [{"command": "file.export_video", "params": {"path": "a.mp4", "ffmpeg": "/bin/sh"}}]})),
+        ] {
+            assert_eq!(r["isError"], true);
+            assert!(r["content"][0]["text"].as_str().unwrap().contains("ANICRAFT_FFMPEG"), "{r}");
+        }
     }
 
     #[test]

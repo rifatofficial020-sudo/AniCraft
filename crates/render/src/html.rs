@@ -56,12 +56,36 @@ pub struct HtmlOptions {
     pub sound: bool,
     /// Scale the movie to fit the browser window (else it shows at its stage size).
     pub fit: bool,
+    /// Glyph outlines the page carries for text fields (ADR 0107): the caller reads them from
+    /// the fonts (this crate has none) for the characters fields ask to embed, where the
+    /// fonts' licences allow.
+    pub fonts: Vec<EmbeddedFace>,
 }
 
 impl Default for HtmlOptions {
     fn default() -> Self {
-        HtmlOptions { title: "AniCraft movie".into(), sound: true, fit: true }
+        HtmlOptions { title: "AniCraft movie".into(), sound: true, fit: true, fonts: Vec::new() }
     }
+}
+
+/// The em size [`EmbeddedFace`] outlines and advances are given at.
+pub const EMBED_EM: f32 = 1000.0;
+/// Most glyphs the page carries over all faces.
+pub const MAX_EMBEDDED_GLYPHS: usize = 16_384;
+
+/// One face's glyphs for the page (ADR 0107): the page draws a dynamic field's changed text
+/// with them when every character of a stretch is here, else with the browser's fonts.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EmbeddedFace {
+    pub family: String,
+    pub bold: bool,
+    pub italic: bool,
+    /// The face's ascent and line height at [`EMBED_EM`].
+    pub ascent: f32,
+    pub line_height: f32,
+    /// Each character's advance and outline at [`EMBED_EM`] (the pen on the baseline at the
+    /// origin, y down).
+    pub glyphs: Vec<(char, f32, Arc<Path>)>,
 }
 
 /// Counts of what the export holds.
@@ -576,6 +600,46 @@ impl<'a> Bake<'a> {
         if f.max_chars > 0 {
             o["mx"] = json!(f.max_chars.min(MAX_FIELD_CHARS as u32));
         }
+        // What `htmlText` reads and is read against (ADR 0107): the field's own style `st`
+        // and first paragraph's alignment `al`, exactly; the authored runs `rs` (`[characters,
+        // style]`) and paragraph alignments `ps` when the text has several; and `oc`, the
+        // actions its change event runs.
+        let align_key = |a: TextAlign| match a {
+            TextAlign::Left => "left",
+            TextAlign::Center => "center",
+            TextAlign::Right => "right",
+        };
+        let style = |s: &anicraft_doc::CharStyle| {
+            let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let mut st = json!({"f": s.font, "z": exact(s.size), "c": [b(s.color.r), b(s.color.g), b(s.color.b)]});
+            if s.bold {
+                st["b"] = json!(true);
+            }
+            if s.italic {
+                st["i"] = json!(true);
+            }
+            if s.underline {
+                st["u"] = json!(true);
+            }
+            if s.letter_spacing != 0.0 {
+                st["ls"] = exact(s.letter_spacing);
+            }
+            if !s.url.is_empty() {
+                st["url"] = json!(s.url);
+            }
+            st
+        };
+        o["st"] = style(&t.char_style());
+        o["al"] = json!(align_key(t.para_style().align));
+        if t.has_runs() {
+            o["rs"] = Value::Array(t.styled_runs().iter().map(|r| json!([r.chars, style(&r.style)])).collect());
+        }
+        if !t.paragraphs.is_empty() {
+            o["ps"] = Value::Array(t.paragraph_styles().iter().map(|q| json!(align_key(q.align))).collect());
+        }
+        if !f.on_change.is_empty() {
+            o["oc"] = actions(&f.on_change);
+        }
         // Authored text in several colours: its pieces, each in its colour (ADR 0085).
         if !t.fills.is_empty() {
             let pieces: Vec<Value> = t.fill_paths().iter().map(|(c, _, p)| json!([self.path(p), self.paint(&Paint::Solid(*c))])).collect();
@@ -1018,6 +1082,30 @@ pub fn movie(doc: &Document, opts: &HtmlOptions) -> Movie {
         "images": b.images,
         "sounds": b.sounds,
     });
+    let mut json = json;
+    // Embedded glyphs: `fonts` is a list of faces `{f: family, b, i, a: ascent, lh: line
+    // height, g: {character: [advance, path]}}`, sizes at 1000 px to the em.
+    let mut budget = MAX_EMBEDDED_GLYPHS;
+    let fonts: Vec<Value> = opts
+        .fonts
+        .iter()
+        .filter(|f| !f.glyphs.is_empty() && f.ascent.is_finite() && f.line_height.is_finite())
+        .map(|f| {
+            let mut g = Map::new();
+            for (ch, advance, outline) in f.glyphs.iter().filter(|g| g.1.is_finite()) {
+                if budget == 0 {
+                    break;
+                }
+                budget -= 1;
+                g.insert(ch.to_string(), json!([num(*advance, 100.0), b.path(outline)]));
+            }
+            json!({"f": f.family, "b": f.bold, "i": f.italic, "a": num(f.ascent, 100.0), "lh": num(f.line_height, 100.0), "g": g})
+        })
+        .collect();
+    if !fonts.is_empty() {
+        json["fonts"] = Value::Array(fonts);
+        json["paths"] = json!(b.path_d);
+    }
     let stats = HtmlStats {
         timelines: json["timelines"].as_array().map_or(0, Vec::len),
         frames,

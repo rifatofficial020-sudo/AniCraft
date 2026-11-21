@@ -715,7 +715,7 @@ impl ScriptHost for Mono {
     fn run(&mut self, _: &PluginScript, _: &ScriptContext<'_>) -> ScriptRun {
         ScriptRun::default()
     }
-    fn lay_out_field(&mut self, block: &TextBlock, shown: &str) -> Option<FieldLook> {
+    fn lay_out_field(&mut self, block: &TextBlock, shown: &str, _: Option<&crate::html_text::RichStyles>) -> Option<FieldLook> {
         let f = block.field.as_ref()?;
         Some(crate::field::mono_look(shown, 10.0, 10.0, f.wrap_width(block.box_width)))
     }
@@ -811,3 +811,121 @@ fn typing_is_deterministic() {
     assert_eq!(a, b);
     assert_eq!(text_of(&a.state, 6).as_deref(), Some("deterministX"));
 }
+
+// ----- htmlText, change events, maxChars and restrict (ADR 0107) ------------------------------
+
+/// A click into the name field (element 6), End, then `typed` at the text's end.
+fn type_into_name(d: &Document, st: &PlayerState, typed: &str) -> Step {
+    let mut ev = vec![Event::Down(Vec2::new(20.0, 55.0)), Event::Up(Vec2::new(20.0, 55.0)), Event::KeyDown(35)];
+    ev.extend(typed.chars().map(Event::Char));
+    input(d, st, &ev, &mut Mono)
+}
+
+#[test]
+fn html_text_sets_styled_runs_and_reads_back() {
+    let d = field_doc("stop();\nscore_txt.htmlText = \"<p align=\\\"center\\\">Score: <b>12</b> <font color=\\\"#ff0000\\\">hot</font></p><script>trace(1)</script>\";\ntrace(score_txt.text);\ntrace(score_txt.htmlText);\ntrace(name_txt.htmlText);");
+    let s = start(&d, &mut Mono);
+    assert_eq!(text_of(&s.state, 5).as_deref(), Some("Score: 12 hot"));
+    let st = s.state.fields.get(&vec![ElementId(5)]).unwrap();
+    let rich = st.rich.as_ref().expect("styled");
+    assert_eq!(rich.runs.iter().map(|r| (r.chars, r.style.bold, r.style.color.r > 0.5)).collect::<Vec<_>>(), vec![(7, false, false), (2, true, false), (1, false, false), (3, false, true)]);
+    assert_eq!(rich.paragraphs[0].align, crate::TextAlign::Center);
+    assert!(s.output.contains(&"Score: 12 hot".to_string()), "{:?}", s.output);
+    // Read back in the subset, in the field's own font and size; nothing of the script tag.
+    let html = s.output.iter().find(|l| l.starts_with("<p align=\"center\">")).expect("htmlText traced");
+    assert!(html.contains("<font face=\"Mono\" size=\"10\" color=\"#000000\"><b>12</b></font>") && html.contains("color=\"#ff0000\">hot</font></p>") && !html.contains("script"), "{html}");
+    // A field no script touched reads its authored text and style.
+    assert!(s.output.contains(&"<p align=\"left\"></p>".to_string()), "{:?}", s.output);
+    // Setting `text` afterwards puts it back in the field's own style.
+    let d = field_doc("score_txt.htmlText = \"<b>a</b>\";\nscore_txt.text = \"plain\";\ntrace(score_txt.htmlText);");
+    let s = start(&d, &mut Mono);
+    assert!(s.state.fields.get(&vec![ElementId(5)]).unwrap().rich.is_none());
+    assert!(s.output.contains(&"<p align=\"left\"><font face=\"Mono\" size=\"10\" color=\"#000000\">plain</font></p>".to_string()), "{:?}", s.output);
+    // Typing into a styled input field continues the style before the caret.
+    let d = field_doc("stop();\nname_txt.htmlText = \"<b>ab</b>\";");
+    let s = start(&d, &mut Mono);
+    let s = type_into_name(&d, &s.state, "c");
+    let st = s.state.fields.get(&vec![ElementId(6)]).unwrap();
+    assert_eq!(st.text.as_deref(), Some("abc"));
+    let runs = &st.rich.as_ref().unwrap().runs;
+    assert_eq!((runs.len(), runs[0].chars, runs[0].style.bold), (1, 3, true));
+    // Not a field, or null: a message, and the movie goes on.
+    let d = field_doc("score_txt.htmlText = null;");
+    assert!(start(&d, &mut Mono).output.iter().any(|l| l.contains("`htmlText` is set to text")));
+}
+
+#[test]
+fn change_events_fire_once_per_edit_by_the_viewer() {
+    let d = field_doc(
+        "stop();\nvar n:int = 0;\nfunction onChange(e:Event):void { n++; trace(\"change \" + n + \": \" + e.target.text + \" \" + (e.currentTarget == name_txt)); }\nname_txt.addEventListener(Event.CHANGE, onChange);\nname_txt.addEventListener(Event.CHANGE, onChange);\nname_txt.text = \"set by script\";\nscore_txt.addEventListener(Event.CHANGE, onChange);",
+    );
+    let s = start(&d, &mut Mono);
+    assert!(s.output.is_empty(), "a script setting text fires nothing: {:?}", s.output);
+    assert_eq!(s.state.listeners.get(&vec![ElementId(6)]).map(Vec::len), Some(1), "the same listener is added once");
+    // Three characters: three events, each after its edit, with the field as target.
+    let s = type_into_name(&d, &s.state, "abc");
+    let changes: Vec<&String> = s.output.iter().filter(|l| l.starts_with("change")).collect();
+    assert_eq!(changes.len(), 3, "{:?}", s.output);
+    assert_eq!(changes[2].as_str(), "change 3: set by scriptabc true");
+    // Caret moves, selecting and keys that change nothing fire nothing; a deletion fires once.
+    let s2 = input(&d, &s.state, &[Event::KeyDown(37), Event::KeyDown(36), Event::SelectAll, Event::KeyDown(13), Event::KeyDown(9)], &mut Mono);
+    assert!(s2.output.iter().all(|l| !l.starts_with("change")), "{:?}", s2.output);
+    let s3 = input(&d, &s.state, &[Event::KeyDown(8)], &mut Mono);
+    assert_eq!(s3.output.iter().filter(|l| l.starts_with("change")).count(), 1, "{:?}", s3.output);
+    // Backspace at the start of an empty field changes nothing and fires nothing.
+    let d2 = field_doc("stop();\nname_txt.addEventListener(Event.CHANGE, function (e:Event):void { trace(\"change\"); });");
+    let s = start(&d2, &mut Mono);
+    let s = input(&d2, &s.state, &[Event::Down(Vec2::new(20.0, 55.0)), Event::Up(Vec2::new(20.0, 55.0)), Event::KeyDown(8), Event::KeyDown(46)], &mut Mono);
+    assert!(s.output.is_empty(), "{:?}", s.output);
+    // Removing the listener stops it; other instances don't send change events.
+    let d3 = field_doc("stop();\nfunction f(e:Event):void { trace(\"change\"); }\nname_txt.addEventListener(Event.CHANGE, f);\nname_txt.removeEventListener(Event.CHANGE, f);");
+    let s = start(&d3, &mut Mono);
+    assert!(type_into_name(&d3, &s.state, "a").output.is_empty());
+    // The same events and state give the same output (the player stays deterministic).
+    let s = start(&d, &mut Mono);
+    assert_eq!(type_into_name(&d, &s.state, "xy"), type_into_name(&d, &s.state, "xy"));
+}
+
+#[test]
+fn a_fields_change_actions_run_in_its_timeline() {
+    let mut d = field_doc("stop();");
+    // The name field traces on every change (the action IR's side of Event.CHANGE).
+    let layer = Arc::make_mut(&mut Arc::make_mut(&mut d.scenes[0]).timeline.layers[0]);
+    let kf = Arc::make_mut(&mut layer.keyframes[0]);
+    for e in &mut kf.elements {
+        if e.id == ElementId(6)
+            && let ElementKind::Text(t) = &mut Arc::make_mut(e).kind
+        {
+            Arc::make_mut(t).field.as_mut().unwrap().on_change = vec![Action::Trace { message: "edited".into() }];
+        }
+    }
+    let s = start(&d, &mut Mono);
+    let s = type_into_name(&d, &s.state, "ab");
+    assert_eq!(s.output, vec!["edited".to_string(), "edited".to_string()]);
+    // It is saved with the field and older files open without it.
+    let ElementKind::Text(t) = &d.scenes[0].timeline.layers[0].keyframes[0].elements[1].kind else { panic!() };
+    let json = serde_json::to_string(t.field.as_ref().unwrap()).unwrap();
+    assert!(json.contains("\"on_change\""), "{json}");
+    let back: TextField = serde_json::from_str(&json).unwrap();
+    assert_eq!(&back, t.field.as_ref().unwrap());
+    assert!(!serde_json::to_string(&TextField::new(TextKind::Input)).unwrap().contains("on_change"), "fields without one save as before");
+}
+
+#[test]
+fn max_chars_and_restrict_limit_what_the_viewer_types() {
+    let d = field_doc("stop();\ntrace(name_txt.maxChars, name_txt.restrict);\nname_txt.maxChars = 4;\nname_txt.restrict = \"A-Z0-9\";\ntrace(name_txt.maxChars, name_txt.restrict);");
+    let s = start(&d, &mut Mono);
+    assert_eq!(s.output, vec!["0 null".to_string(), "4 A-Z0-9".to_string()]);
+    let s = type_into_name(&d, &s.state, "aB-c1D2E3");
+    assert_eq!(text_of(&s.state, 6).as_deref(), Some("B1D2"), "only capitals and digits, four of them");
+    // A script may still set anything: the limits are the viewer's.
+    let d = field_doc("stop();\nname_txt.restrict = \"\";\nname_txt.maxChars = 2;\nname_txt.text = \"longer than two\";");
+    let s = start(&d, &mut Mono);
+    assert_eq!(text_of(&s.state, 6).as_deref(), Some("longer than two"));
+    assert_eq!(type_into_name(&d, &s.state, "x").state.fields.get(&vec![ElementId(6)]).and_then(|f| f.text.clone()).as_deref(), Some("longer than two"), "an empty restrict lets nothing in");
+    // null lifts the restriction.
+    let d = field_doc("stop();\nname_txt.restrict = \"x\";\nname_txt.restrict = null;");
+    let s = start(&d, &mut Mono);
+    assert_eq!(text_of(&type_into_name(&d, &s.state, "ok").state, 6).as_deref(), Some("ok"));
+}
+

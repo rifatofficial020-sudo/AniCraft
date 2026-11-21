@@ -55,7 +55,7 @@ closes before anything runs.
 
 ```json
 {"id": 1, "token": "…", "method": "hello"}
-{"id": 1, "ok": true, "result": {"app": "AniCraft", "version": "0.2.1", "protocol": 1}}
+{"id": 1, "ok": true, "result": {"app": "AniCraft", "version": "0.2.1", "protocol": 2}}
 ```
 
 `id` is any JSON value and comes back as it was. A reply is `{"id", "ok": true, "result"}` or
@@ -65,11 +65,18 @@ closes before anything runs.
 |---|---|---|
 | `hello` | | `{app, version, protocol}` |
 | `tools.list` | | the tools, exactly as MCP `tools/list` lists them (`docs/mcp.md`) |
-| `tools.call` | `{name, arguments}` | exactly what MCP `tools/call` returns: `{content: […], isError}` |
+| `tools.call` | `{name, arguments, roots?}` | exactly what MCP `tools/call` returns: `{content: […], isError}` |
 
 `tools.call` runs the same code as the headless MCP server. A tool that fails (a command's error)
 is a result with `"isError": true`; a malformed call (an unknown tool, a missing `name`) is an
 `"ok": false` reply.
+
+`roots` is `{"read": [folder, …], "write": folder}`: the automation roots (ADR 0124,
+`docs/mcp.md`) the call's commands may read from and write to, as absolute paths of folders that
+exist. The window applies them to that call only. **A call without `roots` may touch no file**:
+commands that only edit the document run, and any that would read or write a file is refused.
+`anicraft-cli mcp --bridge` sends the roots it was started with. This is protocol 2; the bridge
+does not send commands to a window that reports protocol 1, which would ignore the roots.
 
 ```json
 {"id": 2, "token": "…", "method": "tools.call", "params": {"name": "anicraft_run", "arguments": {"command": "draw.rect", "params": {"x": 10, "y": 10, "w": 50, "h": 50}}}}

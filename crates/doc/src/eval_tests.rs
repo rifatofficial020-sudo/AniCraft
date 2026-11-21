@@ -832,3 +832,49 @@ fn keep_area_off_is_bit_exact_with_a_tween_that_never_had_it_and_files_stay_smal
     let back: Document = serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
     assert!(back.scenes[0].timeline.layers[0].keyframes[0].tween.as_ref().unwrap().keep_area);
 }
+
+/// A chain of symbols, each holding two instances of the next and the last one a square: 2^depth
+/// squares from `depth` symbols, with no cycle anywhere and no nesting deeper than the cap.
+fn doubling_doc(depth: u64) -> Document {
+    let mut d = Document::default();
+    let instance = |id: u64, symbol: u64, x: f32| Element {
+        id: ElementId(id),
+        name: String::new(),
+        transform: Affine::translate(x, 0.0),
+        color: ColorEffect::default(),
+        kind: ElementKind::Symbol { symbol: SymbolId(symbol), loop_mode: Default::default(), first_frame: 0, blend: Default::default(), filters: Vec::new(), events: Vec::new(), pivot: None },
+    };
+    for level in 0..depth {
+        let mut layer = Layer::new(LayerId(1000 + level), "l");
+        layer.keyframes = vec![Arc::new(Keyframe::new(0, 1))];
+        if level + 1 == depth {
+            push(&mut layer, 0, shape_el(5000, 0.0));
+        } else {
+            push(&mut layer, 0, instance(2000 + level, 101 + level, 0.0));
+            push(&mut layer, 0, instance(3000 + level, 101 + level, 1.0));
+        }
+        let timeline = Timeline { layers: vec![Arc::new(layer)] };
+        d.library.push(Arc::new(Symbol { id: SymbolId(100 + level), name: format!("s{level}"), kind: SymbolKind::Graphic, linkage: None, scale_grid_kept: None, scale_grid: None, timeline }));
+    }
+    layer0(&mut d).keyframes = vec![Arc::new(Keyframe::new(0, 1))];
+    push(layer0(&mut d), 0, instance(1, 100, 0.0));
+    d
+}
+
+/// #13: the depth cap alone lets symbols that double at each level expand without end. One
+/// evaluation, and one bounds query, visit at most `MAX_EVAL_ELEMENTS` elements and then stop.
+#[test]
+fn symbols_that_double_at_each_level_stay_within_the_allowance() {
+    // Below the allowance nothing is left out: 2^10 squares.
+    let small = doubling_doc(11);
+    assert_eq!(evaluate(&small, 0).items.len(), 1 << 10);
+    assert!(!small.timeline(0).layers[0].keyframes[0].elements[0].bounds(&small).is_empty());
+    // 2^30 squares would take minutes and gigabytes; the allowance ends it in well under a second.
+    let hostile = doubling_doc(31);
+    let started = std::time::Instant::now();
+    let items = evaluate(&hostile, 0).items.len();
+    assert!(items > 0 && items <= crate::MAX_EVAL_ELEMENTS as usize, "{items}");
+    let bounds = hostile.timeline(0).layers[0].keyframes[0].elements[0].bounds(&hostile);
+    assert!(!bounds.is_empty(), "what was reached still counts");
+    assert!(started.elapsed() < std::time::Duration::from_secs(30), "{:?}", started.elapsed());
+}

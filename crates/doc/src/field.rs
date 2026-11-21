@@ -7,7 +7,8 @@
 //! [`FieldLook`] whenever a field's text changes and keeps it in the state; drawing a state then
 //! needs nothing else.
 
-use crate::{FIELD_GUTTER, LineType, MAX_FIELD_CHARS, TextBlock, TextField, TextKind};
+use crate::html_text::RichStyles;
+use crate::{FIELD_GUTTER, LineType, MAX_FIELD_CHARS, Rgba, TextBlock, TextField, TextKind};
 use anicraft_geom::{Path, Vec2};
 use std::sync::Arc;
 
@@ -53,6 +54,9 @@ impl CaretLine {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FieldLook {
     pub outline: Arc<Path>,
+    /// The outline cut by colour, when the text has several (`htmlText`, ADR 0107): drawn in
+    /// place of `outline`. Empty: all of it in the field's colour.
+    pub pieces: Arc<[(Rgba, Arc<Path>)]>,
     /// Top line first; never empty.
     pub lines: Arc<[CaretLine]>,
     /// From one line's top to the next's.
@@ -106,6 +110,13 @@ pub struct FieldState {
     pub anchor: u32,
     /// How far the text has scrolled to keep the caret in view (pixels, never negative).
     pub scroll: Vec2,
+    /// The text's styles once a script set `htmlText` (ADR 0107); `None`: the field's own
+    /// style (or, while `text` is `None`, the authored runs).
+    pub rich: Option<Arc<RichStyles>>,
+    /// `maxChars` once a script set it (`None`: the field's own).
+    pub max_chars: Option<u32>,
+    /// `restrict` once a script set it: the characters a viewer may type (`None`: any).
+    pub restrict: Option<String>,
 }
 
 impl FieldState {
@@ -147,6 +158,45 @@ pub fn chars(s: &str) -> u32 {
 pub fn fit(field: &TextField, text: &str) -> String {
     let _ = field;
     text.replace("\r\n", "\n").replace('\r', "\n").chars().take(MAX_FIELD_CHARS).collect()
+}
+
+/// Whether `restrict` lets a viewer type `c` (ADR 0107), as ActionScript's
+/// `TextField.restrict` reads: the characters listed are allowed, `a-z` is a range, a `^`
+/// turns what follows into characters that are not allowed (and back), and `\` before `-`,
+/// `^` or `\` makes it a plain character. A string starting with `^` allows everything else;
+/// an empty string allows nothing.
+pub fn allowed(restrict: &str, c: char) -> bool {
+    let r: Vec<char> = restrict.chars().take(1024).collect();
+    let mut ok = r.first() == Some(&'^');
+    let mut include = true;
+    let mut i = 0;
+    // One character of the list at `i` (escapes read), and the index after it.
+    let item = |i: usize| -> Option<(char, usize)> {
+        match r.get(i).copied()? {
+            '\\' => r.get(i + 1).map(|c| (*c, i + 2)),
+            ch => Some((ch, i + 1)),
+        }
+    };
+    while i < r.len() {
+        if r.get(i) == Some(&'^') {
+            include = !include;
+            i += 1;
+            continue;
+        }
+        let Some((lo, next)) = item(i) else { break };
+        i = next;
+        let mut hi = lo;
+        if r.get(i) == Some(&'-')
+            && let Some((end, after)) = item(i + 1)
+        {
+            hi = end;
+            i = after;
+        }
+        if (lo..=hi).contains(&c) {
+            ok = include;
+        }
+    }
+    ok
 }
 
 /// What an editing key does (the ActionScript key codes the player receives).
@@ -212,11 +262,17 @@ impl Editor<'_> {
             return Changed::default();
         }
         let one = !self.field.lines.multiline();
-        let mut add: String = s.chars().filter(|c| !c.is_control() || (*c == '\n' && !one)).collect();
+        let restrict = self.st.restrict.clone();
+        let mut add: String = s.chars().filter(|c| !c.is_control() || (*c == '\n' && !one)).filter(|c| *c == '\n' || restrict.as_deref().is_none_or(|r| allowed(r, *c))).collect();
+        // Typing only what the field refuses does nothing (it doesn't delete the selection).
+        if add.is_empty() && !s.is_empty() {
+            return Changed::default();
+        }
         let (a, b) = self.st.selection();
         let value = self.st.value(self.block).to_string();
         let kept = chars(&value) - (b - a);
-        let room = if self.field.max_chars > 0 { self.field.max_chars.saturating_sub(kept) } else { u32::MAX };
+        let max = self.st.max_chars.unwrap_or(self.field.max_chars);
+        let room = if max > 0 { max.saturating_sub(kept) } else { u32::MAX };
         let room = room.min((MAX_FIELD_CHARS as u32).saturating_sub(kept));
         if chars(&add) > room {
             add = add.chars().take(room as usize).collect();
@@ -229,6 +285,12 @@ impl Editor<'_> {
         next.push_str(&add);
         next.push_str(slice(&value, b, u32::MAX));
         let caret = a + chars(&add);
+        // Styled text keeps its runs: what is typed continues the style before it (ADR 0085).
+        if let Some(rich) = &self.st.rich {
+            let runs = crate::rich_text::type_into_runs(&rich.runs, a, b, chars(&add));
+            let paragraphs = crate::rich_text::edit_paragraphs(&rich.paragraphs, &value, a, b, &add);
+            self.st.rich = Some(Arc::new(RichStyles { runs, paragraphs }));
+        }
         self.st.text = Some(next);
         self.st.caret = caret;
         self.st.anchor = caret;
@@ -382,7 +444,7 @@ pub(crate) fn mono_look(text: &str, cw: f32, lh: f32, wrap: Option<f32>) -> Fiel
     }
     lines.push(CaretLine { start, end: i, stops });
     let n = lines.len();
-    FieldLook { outline: Arc::new(outline), lines: lines.into(), line_height: lh, width, height: n as f32 * lh }
+    FieldLook { outline: Arc::new(outline), pieces: Arc::from(Vec::new()), lines: lines.into(), line_height: lh, width, height: n as f32 * lh }
 }
 
 #[cfg(test)]

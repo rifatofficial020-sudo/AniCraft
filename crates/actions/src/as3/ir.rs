@@ -375,9 +375,26 @@ pub enum Prop {
     /// `field.length`: a bare `text` is a variable.
     Text,
     Length,
+    /// A text field's text as HTML (ADR 0107): the subset Flash text fields took, read back
+    /// from its styled runs.
+    HtmlText,
+    /// The most characters a viewer may type into an input field (0: no limit).
+    MaxChars,
+    /// The characters a viewer may type into an input field (`null`: any), as ActionScript's
+    /// `TextField.restrict` writes them.
+    Restrict,
 }
 
 impl Prop {
+    /// A member of a text field only (`field.text`, `field.htmlText`, …).
+    pub fn is_field(self) -> bool {
+        matches!(self, Prop::Text | Prop::Length | Prop::HtmlText | Prop::MaxChars | Prop::Restrict)
+    }
+    /// A text field member a script may also set.
+    pub fn field_settable(self) -> bool {
+        matches!(self, Prop::Text | Prop::HtmlText | Prop::MaxChars | Prop::Restrict)
+    }
+
     pub fn from_name(s: &str) -> Option<Prop> {
         Some(match s {
             "x" => Prop::X,
@@ -402,6 +419,9 @@ impl Prop {
         match s {
             "text" => Some(Prop::Text),
             "length" => Some(Prop::Length),
+            "htmlText" => Some(Prop::HtmlText),
+            "maxChars" => Some(Prop::MaxChars),
+            "restrict" => Some(Prop::Restrict),
             _ => Prop::from_name(s),
         }
     }
@@ -422,6 +442,9 @@ impl Prop {
             Prop::Name => "name",
             Prop::Text => "text",
             Prop::Length => "length",
+            Prop::HtmlText => "htmlText",
+            Prop::MaxChars => "maxChars",
+            Prop::Restrict => "restrict",
         }
     }
     /// The instance property a script may also set.
@@ -535,6 +558,9 @@ pub enum LValue {
     Prop { at: Place, p: Property },
     /// A text field's text (`field.text = …`, `field.appendText(…)` as `+=`).
     Text { at: Place },
+    /// Another member of a text field a script sets (`htmlText`, `maxChars`, `restrict`;
+    /// ADR 0107).
+    Field { at: Place, p: Prop },
 }
 
 /// An expression.
@@ -644,6 +670,8 @@ pub enum ListenEvent {
     /// `KeyboardEvent.KEY_DOWN` / `KEY_UP` on the stage.
     KeyDown,
     KeyUp,
+    /// `Event.CHANGE` on an input text field: the viewer changed its text (ADR 0107).
+    Change,
 }
 
 impl ListenEvent {
@@ -657,6 +685,7 @@ impl ListenEvent {
             ListenEvent::EnterFrame => "enter_frame",
             ListenEvent::KeyDown => "key_down",
             ListenEvent::KeyUp => "key_up",
+            ListenEvent::Change => "change",
         }
     }
     /// The pointer event it is, for mouse listeners.

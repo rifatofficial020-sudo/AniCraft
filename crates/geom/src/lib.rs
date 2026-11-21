@@ -23,7 +23,7 @@ pub mod trace;
 pub mod walk;
 
 pub use affine::{Affine, Decomposed};
-pub use fit::fit_curve;
+pub use fit::{fit_curve, fit_curve_with};
 pub use path::{FillRule, POLYSTAR_MAX_SIDES, Path, PathCmd, Polyline, polystar_corners, segment_distance, star_inner_radius};
 
 use serde::{Deserialize, Serialize};

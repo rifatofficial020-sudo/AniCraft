@@ -403,7 +403,7 @@ fn subselect_rect(s: &mut Session, p: &Value) -> Result<Value> {
 /// The other curve at the anchor of handle `slot` of `old` (stage space) when the anchor is smooth
 /// there: the one edge leaving it whose handle lies opposite this one ([`rawgeom::smooth_at`]), in
 /// any raw shape on the layer (or in `el` alone, a drawing object). Oriented from the anchor.
-fn opposite_handle(els: &[Arc<Element>], el: &Element, raw: bool, old: &Cubic, slot: usize) -> Option<rawgeom::Seg> {
+pub(crate) fn opposite_handle(els: &[Arc<Element>], el: &Element, raw: bool, old: &Cubic, slot: usize) -> Option<rawgeom::Seg> {
     let (a, h) = if slot == 1 { (old[0], old[1]) } else { (old[3], old[2]) };
     let dragged = rawgeom::Seg { c: if slot == 1 { *old } else { [old[3], old[2], old[1], old[0]] }, line: false };
     let tol = 1.5 * SNAP;

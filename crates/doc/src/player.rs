@@ -20,6 +20,7 @@ use crate::actions::as3::{Compiled, Decls, Problem};
 use crate::actions::{Action, ButtonEvent, EventHandler, FrameRef, FrameScript, PluginScript, Property, Seg, Target};
 use crate::eval::{Play, evaluate_shown, evaluate_symbol, guide_walk};
 use crate::field::{Changed, Edit, Editor, FieldLook, FieldState, chars, fit, scroll_to_caret};
+use crate::html_text::{self, RichStyles};
 use crate::sound::Started;
 use crate::{BlendMode, ColorTransform, DisplayList, Document, Element, ElementId, ElementKind, FIELD_GUTTER, Group, LayerKind, MAX_SYMBOL_DEPTH, Rgba, SoundSync, SymbolId, SymbolKind, TextBlock, TextField, TextKind, Timeline};
 use anicraft_geom::{Affine, Vec2};
@@ -367,8 +368,10 @@ pub trait ScriptHost {
     /// Lays out `shown` (a field's text as it is drawn) in `block`'s style and box (ADR 0066):
     /// the fonts live above this crate. `None`: it can't, and the field keeps its authored
     /// outline until its text changes (then it draws only its box).
-    fn lay_out_field(&mut self, block: &TextBlock, shown: &str) -> Option<FieldLook> {
-        let _ = (block, shown);
+    /// `rich`: the styles of the text when a script set them with `htmlText` (ADR 0107);
+    /// `None`: the block's own first style.
+    fn lay_out_field(&mut self, block: &TextBlock, shown: &str, rich: Option<&RichStyles>) -> Option<FieldLook> {
+        let _ = (block, shown, rich);
         None
     }
 }
@@ -1102,13 +1105,29 @@ impl<'a, 'h> Run<'a, 'h> {
                 Prop::MouseX => num(short(self.st.mouse.x)),
                 Prop::MouseY => num(short(self.st.mouse.y)),
                 Prop::Name => Ok(Value::str("root1")),
-                Prop::Text | Prop::Length => Err("the main timeline isn't a text field".into()),
+                Prop::Text | Prop::Length | Prop::HtmlText | Prop::MaxChars | Prop::Restrict => Err("the main timeline isn't a text field".into()),
             };
         }
-        if matches!(p, Prop::Text | Prop::Length) {
-            let Some((t, _)) = n.field() else { return Err(format!("“{}” is {}, not a text field", n.name, kind_name(n.kind))) };
-            let v = self.st.fields.get(&n.path).map_or(t.text.as_str(), |f| f.value(t));
-            return Ok(if p == Prop::Text { Value::str(v) } else { Value::Num(crate::actions::as3::ir::text_len(v) as f64) });
+        if p.is_field() {
+            let Some((t, f)) = n.field() else { return Err(format!("“{}” is {}, not a text field", n.name, kind_name(n.kind))) };
+            let st = self.st.fields.get(&n.path);
+            let v = st.map_or(t.text.as_str(), |f| f.value(t));
+            return Ok(match p {
+                Prop::Text => Value::str(v),
+                Prop::Length => Value::Num(crate::actions::as3::ir::text_len(v) as f64),
+                Prop::MaxChars => Value::Num(f64::from(st.and_then(|s| s.max_chars).unwrap_or(f.max_chars))),
+                Prop::Restrict => st.and_then(|s| s.restrict.as_deref()).map_or(Value::Null, Value::str),
+                // The text's styles as HTML: what a script set, the authored runs while the
+                // text is the authored one, else the field's own style.
+                _ => {
+                    let styles = match st {
+                        Some(FieldState { rich: Some(r), .. }) => (**r).clone(),
+                        Some(FieldState { text: Some(_), .. }) => RichStyles { runs: vec![crate::TextRun { chars: u32::MAX, style: t.char_style() }], paragraphs: vec![t.para_style()] },
+                        _ => RichStyles { runs: t.styled_runs(), paragraphs: t.paragraph_styles() },
+                    };
+                    Value::str(&html_text::write(v, &styles))
+                }
+            });
         }
         let ov = self.st.props.get(&n.path).copied().unwrap_or_default();
         let d = decompose64(&n.local);
@@ -1133,7 +1152,7 @@ impl<'a, 'h> Run<'a, 'h> {
                 let v = if p == Prop::MouseX { (m[3] * x - m[2] * y) / det } else { (m[0] * y - m[1] * x) / det };
                 num(fround_short(v))
             }
-            Prop::Text | Prop::Length => Err("not a text field".into()),
+            Prop::Text | Prop::Length | Prop::HtmlText | Prop::MaxChars | Prop::Restrict => Err("not a text field".into()),
             Prop::CurrentFrame | Prop::TotalFrames | Prop::CurrentLabel => {
                 if n.kind != NodeKind::MovieClip {
                     return Err(format!("“{}” is {}; only movie clips and the main timeline have frames", n.name, kind_name(n.kind)));
@@ -1178,10 +1197,13 @@ impl<'a, 'h> Run<'a, 'h> {
         let Some(node) = self.nodes.get(i) else { return };
         let ok = match event {
             ListenEvent::EnterFrame => node.kind != NodeKind::Graphic,
+            ListenEvent::Change => node.kind == NodeKind::Text,
             _ => matches!(node.kind, NodeKind::Button | NodeKind::MovieClip),
         };
         if !ok {
-            let why = if node.kind == NodeKind::Root { "the main timeline doesn't get pointer events here".to_string() } else { format!("“{}” is {}; only buttons and movie clips get pointer events", node.name, kind_name(node.kind)) };
+            let why = if event == ListenEvent::Change {
+                format!("“{}” is {}; only text fields send change events", node.name, kind_name(node.kind))
+            } else if node.kind == NodeKind::Root { "the main timeline doesn't get pointer events here".to_string() } else { format!("“{}” is {}; only buttons and movie clips get pointer events", node.name, kind_name(node.kind)) };
             return self.out(format!("{what}: {why}"));
         }
         let (path, name) = (node.path.clone(), node.name.clone());
@@ -1447,7 +1469,7 @@ impl<'a, 'h> Run<'a, 'h> {
         let Some(f) = t.field.as_ref() else { return };
         let st = self.st.fields.entry(path.to_vec()).or_default();
         let shown = f.shown(st.value(&t));
-        st.look = self.host.lay_out_field(&t, &shown).map(Arc::new);
+        st.look = self.host.lay_out_field(&t, &shown, st.rich.as_deref()).map(Arc::new);
         let len = chars(st.value(&t));
         st.caret = st.caret.min(len);
         st.anchor = st.anchor.min(len);
@@ -1458,8 +1480,53 @@ impl<'a, 'h> Run<'a, 'h> {
     fn set_field_text(&mut self, path: &[ElementId], text: &str) {
         let Some((t, _)) = self.field_node(path) else { return };
         let Some(f) = t.field.as_ref() else { return };
-        self.st.fields.entry(path.to_vec()).or_default().text = Some(fit(f, text));
+        let st = self.st.fields.entry(path.to_vec()).or_default();
+        st.text = Some(fit(f, text));
+        // Plain text is in the field's own style, as ActionScript's `text` is.
+        st.rich = None;
         self.relayout(path);
+    }
+
+    /// A script sets another member of field `path` (ADR 0107): `htmlText` (read into text and
+    /// styles, sanitised), `maxChars` or `restrict`.
+    fn set_field_member(&mut self, path: &[ElementId], p: Prop, v: &Value) {
+        let Some((t, _)) = self.field_node(path) else { return };
+        let st = self.st.fields.entry(path.to_vec()).or_default();
+        match p {
+            Prop::HtmlText => {
+                let parsed = html_text::parse(&v.text(), &t.char_style(), &t.para_style());
+                st.text = Some(parsed.text);
+                st.rich = Some(Arc::new(parsed.styles));
+                self.relayout(path);
+            }
+            Prop::MaxChars => st.max_chars = Some((v.number().clamp(0.0, crate::MAX_FIELD_CHARS as f64)) as u32),
+            Prop::Restrict => st.restrict = (!matches!(v, Value::Null | Value::Undefined)).then(|| v.text().chars().take(1024).collect()),
+            _ => {}
+        }
+    }
+
+    /// The viewer changed field `path`'s text (ADR 0107): its change actions run in the
+    /// timeline it is on, then the listeners scripts added for `Event.CHANGE`, in the order
+    /// added. Once per edit; text a script sets fires nothing, as in ActionScript.
+    fn changed(&mut self, path: &[ElementId]) {
+        self.refresh();
+        let Some(n) = self.index_of(path).and_then(|i| self.nodes.get(i)) else { return };
+        let actions = n.field().map(|(_, f)| f.on_change.clone()).filter(|a| !a.is_empty());
+        let owner_path = self.nodes.get(n.owner).map(|o| o.path.clone());
+        let listeners: Vec<Listening> = self.st.listeners.get(path).map(|l| l.iter().filter(|l| l.event == ListenEvent::Change).cloned().collect()).unwrap_or_default();
+        if actions.is_none() && listeners.is_empty() {
+            return;
+        }
+        if let (Some(actions), Some(owner)) = (actions, owner_path) {
+            self.run_list(&owner, &actions, false);
+        }
+        for l in listeners {
+            if self.halted {
+                return;
+            }
+            self.call_listener(&l, EventInfo { key: None, target: Some(path.to_vec()), current: Some(path.to_vec()) });
+        }
+        self.settle();
     }
 
     /// Runs an edit on the focused field (laying it out first if it never was).
@@ -1475,6 +1542,7 @@ impl<'a, 'h> Run<'a, 'h> {
         let changed = go(&mut Editor { block: &t, field: &f, st }, look.as_deref());
         if changed.text {
             self.relayout(&path);
+            self.changed(&path);
         } else if changed.caret {
             scroll_to_caret(&t, &f, self.st.fields.entry(path).or_default());
         }
@@ -1747,6 +1815,21 @@ impl World for Script<'_, '_, '_> {
         }
         let path = n.path.clone();
         self.r.set_field_text(&path, &text);
+        Ok(())
+    }
+
+    fn set_field(&mut self, at: &Place, p: Prop, v: Value) -> Result<(), Option<String>> {
+        if !self.r.budget() {
+            return Err(None);
+        }
+        let from = self.from().map_err(Some)?;
+        let i = self.r.place(from, self.ev.as_ref(), at).map_err(Some)?;
+        let Some(n) = i.and_then(|i| self.r.nodes.get(i)) else { return Err(Some("the stage isn't a text field".into())) };
+        if n.field().is_none() {
+            return Err(Some(format!("“{}” is {}, not a text field", n.name, kind_name(n.kind))));
+        }
+        let path = n.path.clone();
+        self.r.set_field_member(&path, p, &v);
         Ok(())
     }
 

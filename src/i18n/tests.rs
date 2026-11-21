@@ -334,11 +334,59 @@ fn georgian_is_offered_only_when_its_face_is_embedded() {
     // ... and through the Proportional family install_fonts builds. Not Monospace: epaint's
     // has_glyph is a false negative there (the Georgian face is that chain's replacement-glyph face).
     let ctx = egui::Context::default();
-    crate::theme::install_fonts(&ctx, None, None);
+    crate::theme::install_fonts(&ctx, None, None, &[]);
     ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear(); // fonts apply at the start of a frame
     let prop = egui::FontId::proportional(14.0);
     assert!(ctx.fonts_mut(|f| f.has_glyphs(&prop, &letters)), "Proportional lacks Georgian letters");
     println!("georgian face test: ran, {} letters covered", letters.chars().count());
+}
+
+#[test]
+fn hebrew_is_not_offered_yet_but_its_face_draws_hebrew_names() {
+    let he = [("he", "", "@id\tlanguage.name\tעברית\n")];
+    // Right to left needs bidi layout in egui (ADR 0040): with or without a face, not offered.
+    assert!(!ready_codes().contains(&"he"));
+    for georgian_face in [false, true] {
+        assert!(!Languages::new(&he, &ready_with(georgian_face)).0.list.iter().any(|l| l.code == "he"));
+    }
+    // The catalog itself loads cleanly once the code is ready.
+    assert!(Languages::new(&he, &["he"]).0.list.iter().any(|l| l.code == "he"));
+    let face = crate::theme::hebrew_font();
+    if std::env::var("CRAFT_FONTS_REQUIRED").is_ok_and(|v| v == "1") {
+        assert!(face.is_some(), "CRAFT_FONTS_REQUIRED=1 but this build embeds no valid NotoSansHebrew-Regular.ttf (craft-fonts `Hebr`)");
+    }
+    let Some(face) = face else {
+        println!("hebrew face test: skipped, this build embeds no Hebrew face");
+        return;
+    };
+    let letters: String = ('\u{05D0}'..='\u{05EA}').collect();
+    let fonts = anicraft_engine::text::Fonts::from_faces([face.to_vec()]);
+    let laid = fonts.layout(&letters, &anicraft_engine::text::Style::default()).expect("layout");
+    assert_eq!(laid.missing, 0, "the face lacks some of U+05D0..U+05EA");
+    // ... and through the Proportional family install_fonts builds (see the Georgian test).
+    let ctx = egui::Context::default();
+    crate::theme::install_fonts(&ctx, None, None, &[]);
+    ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+    let prop = egui::FontId::proportional(14.0);
+    assert!(ctx.fonts_mut(|f| f.has_glyphs(&prop, &letters)), "Proportional lacks Hebrew letters");
+    // Georgian still draws with the Hebrew face behind it in the chain.
+    if crate::theme::georgian_font().is_some() {
+        let georgian: String = ('\u{10D0}'..='\u{10FA}').collect();
+        assert!(ctx.fonts_mut(|f| f.has_glyphs(&prop, &georgian)), "Proportional lost Georgian letters");
+    }
+    println!("hebrew face test: ran, {} letters covered", letters.chars().count());
+}
+
+#[test]
+fn right_to_left_codes_are_recognised_by_language_and_script() {
+    for rtl in ["he", "he-IL", "he-Hebr-IL", "he-x-test", "iw", "iw_IL", "iw_IL.UTF-8", "ar", "fa-IR", "ku-Arab-IQ", "zh-yue-Arab"] {
+        assert!(is_rtl_code(rtl), "{rtl}");
+    }
+    for ltr in ["en", "ka", "ku-Latn-TR", "sd-Deva-IN", "en-x-arab", "", "-", "pseudo"] {
+        assert!(!is_rtl_code(ltr), "{ltr}");
+    }
+    // No right-to-left language is offered, so the interface never is.
+    assert!(!is_rtl());
 }
 
 #[test]
@@ -422,6 +470,22 @@ fn system_locales_and_preferences_resolve() {
     assert_eq!(code("xx-new", Some("ru-RU")), "ru", "a code this build lacks follows the system");
     assert_eq!(code(PSEUDO, Some("de")), "pseudo");
     assert_eq!(code(AUTO, Some("pseudo")), "en", "the system never picks the pseudo-locale");
+}
+
+#[test]
+fn legacy_iw_locale_tags_normalize_to_hebrew() {
+    let embedded = [("he", "\tSave\tשמור\n", "@id\tlanguage.name\tעברית\n\tOpen\tפתח\n")];
+    let (l, problems) = Languages::new(&embedded, &["he"]);
+    assert!(problems.is_empty(), "{problems:?}");
+    let code = |pref: &str, sys: Option<&str>| l.get(l.resolve(pref, sys)).code.clone();
+    for tag in ["he", "he-IL", "iw", "iw-IL", "iw_IL.UTF-8"] {
+        assert_eq!(code(AUTO, Some(tag)), "he", "{tag}");
+    }
+    for pref in ["he", "HE", "iw", "IW"] {
+        assert_eq!(code(pref, None), "he", "{pref}");
+    }
+    // Only the whole first subtag is the legacy code: `iwx` is some other language.
+    assert_eq!(code(AUTO, Some("iwx-IL")), "en");
 }
 
 #[test]

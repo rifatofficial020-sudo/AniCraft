@@ -200,7 +200,7 @@ fn a_call_through_the_port_matches_the_headless_server() {
 #[test]
 fn a_call_that_waited_past_its_deadline_does_not_run() {
     let (reply, answer) = channel();
-    let r = Request { name: "anicraft_run".into(), arguments: json!({"command": "draw.rect", "params": {"x": 0, "y": 0, "w": 5, "h": 5}}), deadline: Instant::now(), reply };
+    let r = Request { roots: Arc::new(Roots::none()), name: "anicraft_run".into(), arguments: json!({"command": "draw.rect", "params": {"x": 0, "y": 0, "w": 5, "h": 5}}), deadline: Instant::now(), reply };
     assert!(r.expired() && r.changes_document());
     let mut s = Session::default();
     r.run(&mut s);
@@ -250,6 +250,74 @@ fn the_bridge_drives_the_app_and_says_when_it_has_gone() {
     let r = b.call("anicraft_run", &json!({"command": "draw.rect", "params": {"x": 0, "y": 0, "w": 9, "h": 9}}));
     assert!(r.as_ref().map_or(true, |v| v["isError"] == true), "{r:?}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The window applies the roots a call carries, and a call without them touches no file: a
+/// client that speaks the control protocol itself gets no more than the bridge does.
+#[test]
+fn calls_through_the_port_stay_inside_the_roots_they_carry() {
+    let r = crate::tests::Roots3::new("port");
+    let app = App::start(Session::default());
+    let mut c = app.connect();
+    let mut call = |roots: Value, command: &str, path: String| {
+        let line = json!({"id": 1, "token": TOKEN, "method": "tools.call", "params": {"name": "anicraft_run", "roots": roots, "arguments": {"command": command, "params": {"path": path, "confirm": true}}}});
+        send(&mut c, &line.to_string())
+    };
+    let roots = json!({"read": [r.path(&["work"])], "write": r.path(&["out"])});
+    let said = |v: &Value| v["result"]["content"][0]["text"].as_str().unwrap_or_default().to_string();
+    let none = call(Value::Null, "file.save_as", r.path(&["out", "a.anicraft"]));
+    assert!(none["result"]["isError"] == true && said(&none).contains("no automation write root"), "{none}");
+    assert_eq!(call(roots.clone(), "file.save_as", r.path(&["out", "a.anicraft"]))["result"]["isError"], false);
+    let outside = call(roots.clone(), "file.save_as", r.path(&["secret", "a.anicraft"]));
+    assert!(outside["result"]["isError"] == true && said(&outside).contains("automation write root"), "{outside}");
+    assert!(call(roots, "file.open", r.path(&["secret", "s.json"]))["result"]["isError"] == true);
+    // Roots that are not absolute folders that exist are refused as a whole.
+    for bad in [json!({"read": ["work"], "write": r.path(&["out"])}), json!({"read": r.path(&["work"])}), json!({"write": r.path(&["nowhere"])}), json!("x")] {
+        assert_eq!(call(bad.clone(), "file.save_as", r.path(&["out", "b.anicraft"]))["ok"], false, "{bad}");
+    }
+    assert!(!std::path::Path::new(&r.path(&["secret", "a.anicraft"])).exists() && !std::path::Path::new(&r.path(&["out", "b.anicraft"])).exists());
+}
+
+/// The bridge sends its roots with every call, and won't hand commands to an AniCraft from
+/// before roots (protocol 1), which would run them anywhere.
+#[test]
+fn the_bridge_carries_its_roots_and_refuses_an_older_app() {
+    let r = crate::tests::Roots3::new("bridge");
+    let file = r.dir.join(CONTROL_FILE);
+    let app = App::start(Session::default());
+    std::fs::write(&file, ControlFile { port: app.port, token: TOKEN.into(), pid: 1, version: String::new() }.to_json().to_string()).unwrap();
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, app.port));
+    let run = |b: &mut Bridge, path: String| b.call("anicraft_run", &json!({"command": "file.save_as", "params": {"path": path}})).unwrap();
+    let mut b = Bridge::with_token_file(addr, Some(file.clone())).with_roots(&r.roots).unwrap();
+    assert_eq!(run(&mut b, r.path(&["out", "a.anicraft"]))["isError"], false);
+    let refused = run(&mut b, r.path(&["secret", "a.anicraft"]));
+    assert!(refused["isError"] == true && refused["content"][0]["text"].as_str().unwrap().contains("automation write root"), "{refused}");
+    // A bridge given no roots can still edit, but touches no file.
+    let mut bare = Bridge::with_token_file(addr, Some(file.clone()));
+    assert_eq!(run(&mut bare, r.path(&["out", "b.anicraft"]))["isError"], true);
+    assert_eq!(bare.call("anicraft_run", &json!({"command": "draw.rect", "params": {"x": 0, "y": 0, "w": 9, "h": 9}})).unwrap()["isError"], false);
+    drop(app);
+
+    // An app that answers `hello` with protocol 1, and would run anything it is sent.
+    let old = TcpListener::bind("127.0.0.1:0").unwrap();
+    let old_addr = old.local_addr().unwrap();
+    let served = std::thread::spawn(move || {
+        let (stream, _) = old.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut out = stream;
+        let mut seen = Vec::new();
+        while let Ok(Some(line)) = read_line(&mut reader, MAX_LINE) {
+            let v: Value = serde_json::from_str(&line).unwrap();
+            seen.push(v["method"].as_str().unwrap_or_default().to_string());
+            writeln!(out, "{}", json!({"id": v["id"], "ok": true, "result": {"app": "AniCraft", "version": "0.2.0", "protocol": 1}})).unwrap();
+        }
+        seen
+    });
+    let mut b = Bridge::with_token_file(old_addr, Some(file)).with_roots(&r.roots).unwrap();
+    let e = b.call_tool("anicraft_run", &json!({"command": "file.save_as", "params": {"path": r.path(&["secret", "c.anicraft"])}})).unwrap_err();
+    assert!(matches!(&e, BridgeError::NotRunning(m) if m.contains("older version")), "{e:?}");
+    drop(b);
+    assert_eq!(served.join().unwrap(), ["hello"], "the command was never sent");
 }
 
 /// A window that closes frees its port: the same run can open another window (ADR 0092) and

@@ -212,7 +212,34 @@ fn bend_segment(s: &mut Session, p: &Value) -> Result<Value> {
     let old = rawgeom::segment_cubic(&path, cmd).map(|c| rawgeom::transform(&c, &m)).ok_or_else(|| EngineError::Param(format!("no segment {cmd} on this shape")))?;
     let new = rawgeom::bend(&old, t, d).ok_or_else(|| EngineError::Param("cannot bend that segment".into()))?;
     let raw = mergeable(el).is_some();
-    let changed = edit_edge(s, id, cmd, &old, &new, raw)?;
+    // Both handles move, so the curves beyond its ends that were smooth there turn with them
+    // (as when a handle is dragged, ADR 0045), and the ends stay smooth.
+    let starts = crate::cmds_rawsub::opposite_handle(&els, el, raw, &old, 1);
+    let ends = crate::cmds_rawsub::opposite_handle(&els, el, raw, &old, 2);
+    let mut changed = edit_edge(s, id, cmd, &old, &new, raw)?;
+    let mut turns = Vec::new();
+    match (starts, ends) {
+        // One curve on both ends (a two-segment loop): turn both its handles at once.
+        (Some(f), Some(g)) if rawgeom::same_edge(&f, &g.reversed(), 1.5 * SNAP) => {
+            let (a, b) = (f.c[0], f.c[3]);
+            turns.push((f.c, [a, rawgeom::turned_opposite(a, new[1], f.c[1]), rawgeom::turned_opposite(b, new[2], f.c[2]), b]));
+        }
+        (f, g) => {
+            for (f, h) in [(f, new[1]), (g, new[2])] {
+                if let Some(f) = f {
+                    let a = f.c[0];
+                    turns.push((f.c, [a, rawgeom::turned_opposite(a, h, f.c[1]), f.c[2], f.c[3]]));
+                }
+            }
+        }
+    }
+    for (was, turned) in turns {
+        for e in follow_edge(s, (!raw).then_some(id), &was, &turned)? {
+            if !changed.contains(&e) {
+                changed.push(e);
+            }
+        }
+    }
     let point = cubic_point(&new, t.clamp(0.02, 0.98));
     if raw && merge_after {
         remerge_in_place(s, &changed)?;

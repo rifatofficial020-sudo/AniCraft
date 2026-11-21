@@ -14,6 +14,7 @@ pub fn specs() -> Vec<CommandSpec> {
     let c = |id, label, menu, shortcut, params, mutates, run| CommandSpec { id, label, menu, shortcut, params, mutates, run };
     vec![
         c("draw.drop", "Drop", "", None, "{} the selected raw shapes cut and join the raw shapes they touch (after a move), on each layer", true, (|s, p| s.each_layer(true, |s| drop(s, p))) as crate::RunFn),
+        c("draw.float", "Float", "", None, "{} the selected raw shapes stay whole, on top of the drawing, until they are deselected: then they cut and join what they lie on (as the editor leaves a moved selection, ADR 0122)", true, float),
         c("element.select_connected", "Select Connected", "", None, "{x, y, add?, slop?} a raw stroke and the strokes joined to it, or a raw fill and the strokes on and in it", false, select_connected),
     ]
 }
@@ -365,8 +366,44 @@ pub(crate) fn drop_selected(s: &mut Session) -> Result<Value> {
     Ok(json!({"dropped": n, "selected": s.selection.id_list()}))
 }
 
-/// The raw shapes `ids` of the active keyframe, left whole on top by a floating paste, go into
-/// the drawing where they lie.
+/// `draw.float`: the selected raw shapes float (ADR 0122). In Animate a selection moved onto
+/// other artwork does not cut it while it stays selected: it can be moved on, or back, and
+/// what is under it is untouched until the selection lets go (#487). They go on top of their
+/// layers, where the merge will put them, so nothing jumps when they settle
+/// (`Session::settle_floating`).
+fn float(s: &mut Session, _: &Value) -> Result<Value> {
+    float_selected(s)
+}
+
+/// [`float`] for every layer with selected raw shapes.
+pub(crate) fn float_selected(s: &mut Session) -> Result<Value> {
+    let frame = s.frame;
+    // Shapes already floating on this frame (a paste, an earlier move) stay so.
+    let mut items: Vec<(anicraft_doc::LayerId, ElementId)> = s.floating.take().filter(|f| f.frame == frame).map(|f| f.items).unwrap_or_default();
+    let mut n = 0;
+    for layer in s.selected_layers() {
+        let sel = s.selection.on(layer);
+        let raised = s.with_layer(layer, |s| -> Result<Vec<ElementId>> {
+            let kf = s.editable_keyframe()?;
+            let (top, rest): (Vec<Arc<Element>>, Vec<Arc<Element>>) = std::mem::take(&mut kf.elements).into_iter().partition(|e| sel.contains(&e.id) && mergeable(e).is_some());
+            let ids = top.iter().map(|e| e.id).collect();
+            kf.elements = rest;
+            kf.elements.extend(top);
+            Ok(ids)
+        })?;
+        n += raised.len();
+        for id in raised {
+            if !items.contains(&(layer, id)) {
+                items.push((layer, id));
+            }
+        }
+    }
+    s.floating = (!items.is_empty()).then_some(crate::Floating { items, frame });
+    Ok(json!({"floating": n}))
+}
+
+/// The raw shapes `ids` of the active keyframe, left whole on top by a floating paste or move, go
+/// into the drawing where they lie.
 pub(crate) fn settle(s: &mut Session, ids: &[ElementId]) -> Result<()> {
     let kf = s.editable_keyframe()?;
     let mut floating = Vec::new();

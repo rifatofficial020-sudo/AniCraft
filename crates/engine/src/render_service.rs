@@ -45,9 +45,31 @@ pub struct FrameJob {
     /// A symbol open in place, in front of the picture (ADR 0045): onion skin composes its own
     /// frames (ADR 0051). Set with [`FrameJob::inside`].
     pub front: Option<Arc<Front>>,
+    /// The reference videos' pictures for this frame (ADR 0116): the stage's alone, never an
+    /// export's. Set with [`FrameJob::with_reference`].
+    pub reference: Option<Arc<Vec<crate::video::RefFrame>>>,
 }
 
 impl FrameJob {
+    /// The same job with the reference videos' pictures `frames` under the artwork, keyed
+    /// apart by which pictures they are.
+    pub fn with_reference(mut self, frames: Option<Arc<Vec<crate::video::RefFrame>>>) -> FrameJob {
+        if let Some(f) = frames.filter(|f| !f.is_empty()) {
+            let mix = |k: u64| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (k, "video").hash(&mut h);
+                for r in f.iter() {
+                    (r.element.0, r.serial).hash(&mut h);
+                }
+                h.finish()
+            };
+            self.key = mix(self.key);
+            self.scene = mix(self.scene);
+            self.reference = Some(f);
+        }
+        self
+    }
+
     /// The same job seen through the scene's camera (`on`), keyed apart from the plain one.
     pub fn through_camera(mut self, on: bool) -> FrameJob {
         if on && !self.camera {
@@ -86,10 +108,14 @@ impl FrameJob {
     /// symbol's own timeline when there is one (ADR 0051).
     pub fn display_list(&self) -> DisplayList {
         let onion = self.onion.as_ref().filter(|o| o.shows());
-        match (&self.front, onion) {
+        let mut dl = match (&self.front, onion) {
             (Some(front), Some(skin)) => display_list_inside(&self.doc, self.frame, front, skin),
             _ => display_list_for(&self.doc, self.frame, self.onion.as_ref(), self.camera),
+        };
+        if let Some(frames) = &self.reference {
+            crate::video::fill(&mut dl, frames);
         }
+        dl
     }
 }
 
@@ -207,7 +233,7 @@ pub fn frame_key(state: StateId, frame: u32, view: &View, onion: Option<&OnionSk
 /// A job whose `scene` is derived from the same inputs as its key.
 pub fn make_job(state: StateId, doc: &Document, frame: u32, view: View, onion: Option<&OnionSkin>) -> FrameJob {
     let onion = onion.filter(|o| o.shows()).copied();
-    FrameJob { key: frame_key(state, frame, &view, onion.as_ref()), raster: 0, scene: scene_key(state, frame, onion.as_ref()), doc: doc.clone(), frame, view, onion, camera: false, front: None }
+    FrameJob { key: frame_key(state, frame, &view, onion.as_ref()), raster: 0, scene: scene_key(state, frame, onion.as_ref()), doc: doc.clone(), frame, view, onion, camera: false, front: None, reference: None }
 }
 
 /// A job for rasterizer `raster` (from [`RenderService::raster_id`]; 0 is the CPU oracle, and

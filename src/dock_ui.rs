@@ -201,6 +201,7 @@ impl App {
     /// Brings a panel forward, reopening it where it was if it was closed; in a dock collapsed
     /// to icons it opens over the stage.
     pub fn show_panel(&mut self, p: Panel) {
+        self.unhide_panels();
         if !self.dock.is_shown(p) {
             self.dock.show(p);
             self.dock_changed();
@@ -212,6 +213,11 @@ impl App {
 
     /// The Window menu's items: close a panel on screen, bring any other forward.
     pub fn toggle_panel(&mut self, p: Panel) {
+        // Asked for while the panels are hidden: they all come back, with this one in front.
+        if self.unhide_panels() {
+            self.show_panel(p);
+            return;
+        }
         if !self.panel_visible(p) && self.dock.is_open(p) {
             self.show_panel(p);
             return;
@@ -226,6 +232,52 @@ impl App {
         self.dock_changed();
     }
 
+    /// A panel's Window menu item, and its key (#456): closes the panel when it is in front,
+    /// brings it forward otherwise.
+    pub fn window_menu_panel(&mut self, p: Panel) {
+        if p == Panel::MovieExplorer && !self.panel_visible(p) {
+            crate::movie_explorer::open(self);
+        } else {
+            self.toggle_panel(p);
+        }
+    }
+
+    /// Window › Hide Panels (F4, as in Animate; #456): every panel closes and the stage takes
+    /// the window; the same key brings them back exactly as they were. The hidden state is for
+    /// now only: it is never what a workspace remembers, so a restart shows the panels.
+    pub fn toggle_hide_panels(&mut self) {
+        if self.unhide_panels() {
+            return;
+        }
+        let open: Vec<Panel> = Panel::ALL.into_iter().filter(|p| self.dock.is_open(*p)).collect();
+        if open.is_empty() {
+            return;
+        }
+        self.hidden_panels = Some(self.dock.clone());
+        for p in open {
+            self.dock.close(p);
+        }
+        self.dock_view.epoch += 1;
+        self.dock_view.placed.clear();
+        self.dock_view.flyout = None;
+        let key = self.keymap.primary("view.hide_panels").map(crate::platform::shortcut_label);
+        self.status_ok(match key {
+            Some(k) => tr!("Panels hidden: {key} brings them back", key = k),
+            None => tr!("Panels hidden: Window › Show Panels brings them back").to_string(),
+        });
+    }
+
+    /// Brings back the panels Hide Panels hid. True when there were any.
+    pub fn unhide_panels(&mut self) -> bool {
+        match self.hidden_panels.take() {
+            Some(l) => {
+                self.set_layout(l);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Keeps the arrangement as the current workspace's, to be saved.
     pub fn dock_changed(&mut self) {
         self.prefs.workspaces.keep(&self.dock);
@@ -234,6 +286,7 @@ impl App {
 
     /// Window › Workspace: switches to a workspace, as it was last arranged.
     pub fn switch_workspace(&mut self, key: &str) {
+        self.unhide_panels();
         self.prefs.workspaces.keep(&self.dock);
         if let Some(l) = self.prefs.workspaces.switch(key) {
             self.set_layout(l);
@@ -242,6 +295,7 @@ impl App {
 
     /// Window › Workspace › Reset: the current workspace as built or saved.
     pub fn reset_workspace(&mut self) {
+        self.hidden_panels = None;
         let l = self.prefs.workspaces.reset();
         self.set_layout(l);
         let name = crate::i18n::t_dyn(crate::dock::Workspaces::name(&self.prefs.workspaces.current)).into_owned();
@@ -1368,6 +1422,46 @@ mod tests {
 
     pub(crate) fn frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) {
         ctx.run_ui(input(events), |ui| app.frame(ui)).textures_delta.clear();
+    }
+
+    /// #456: every panel opens and closes from the keyboard, and F4 hides them all and brings
+    /// them back as they were, without the hidden state becoming the workspace's.
+    #[test]
+    fn panels_toggle_from_the_keyboard_and_f4_hides_them_all() {
+        use egui::{Key, Modifiers};
+        let (mut app, ctx) = app();
+        settle(&ctx, &mut app);
+        let press = |ctx: &egui::Context, app: &mut App, key: Key, modifiers: Modifiers| {
+            frame(ctx, app, vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }]);
+            settle(ctx, app);
+        };
+        let ctrl = Modifiers::COMMAND;
+        assert!(app.panel_visible(Panel::Library) && app.panel_visible(Panel::Timeline));
+        press(&ctx, &mut app, Key::L, ctrl);
+        assert!(!app.dock.is_open(Panel::Library), "Ctrl+L closes the Library");
+        press(&ctx, &mut app, Key::L, ctrl);
+        assert!(app.panel_visible(Panel::Library), "and opens it again where it was");
+        press(&ctx, &mut app, Key::T, ctrl | Modifiers::ALT);
+        assert!(!app.dock.is_open(Panel::Timeline));
+        press(&ctx, &mut app, Key::T, ctrl | Modifiers::ALT);
+        assert!(app.panel_visible(Panel::Timeline));
+
+        let before = app.dock.clone();
+        let kept = app.prefs.workspaces.layout();
+        press(&ctx, &mut app, Key::F4, Modifiers::NONE);
+        assert!(Panel::ALL.into_iter().all(|p| !app.dock.is_open(p)), "F4 hides every panel");
+        assert_eq!(app.prefs.workspaces.layout(), kept, "the workspace keeps its panels");
+        press(&ctx, &mut app, Key::F4, Modifiers::NONE);
+        assert_eq!(app.dock, before, "F4 again: exactly as they were");
+        // A panel asked for while they are hidden brings them all back, with it in front.
+        press(&ctx, &mut app, Key::F4, Modifiers::NONE);
+        press(&ctx, &mut app, Key::F9, ctrl);
+        assert!(app.panel_visible(Panel::Swatches) && app.panel_visible(Panel::Timeline) && app.panel_visible(Panel::Library));
+        assert!(app.hidden_panels.is_none());
+        // Hidden panels do not outlive a workspace change.
+        app.toggle_hide_panels();
+        app.switch_workspace("animator");
+        assert!(app.hidden_panels.is_none() && app.dock.is_open(Panel::Timeline));
     }
 
     pub(crate) fn settle(ctx: &egui::Context, app: &mut App) {

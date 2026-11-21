@@ -133,8 +133,17 @@ last run's lines after Test Movie closes.
 
 ### The Window menu
 
-The **Window** menu has the workspaces, every panel (**Actions** is **F9**, **Movie Explorer**
-**Alt+F3**), the **Brush Library** and **Onion Skin**. At the bottom are **Next Document**,
+The **Window** menu has the workspaces, every panel, the **Brush Library** and **Onion Skin**.
+Each panel opens and closes from the keyboard too, with Animate's keys: **Timeline**
+**Ctrl+Alt+T**, **Tools** **Ctrl+F2**, **Properties** **Ctrl+F3**, **Library** **Ctrl+L**,
+**Actions** **F9**, **Output** **F2**, **Colour** **Ctrl+Shift+F9**, **Swatches** **Ctrl+F9**,
+**History** **Ctrl+F10** and **Movie Explorer** **Alt+F3**; the menu shows each key. **Align**
+has none (Animate's Ctrl+K is the command palette here): give it, **Layer Depth** or the
+**Motion Editor** one in the shortcut editor. **Hide Panels** (**F4**) closes every panel so
+the stage has the whole window, and the same key brings them back exactly where they were.
+
+With one menu open, moving the pointer over another menu's title opens that menu. Where a
+panel or a list holds more than fits, its scroll bar is always shown beside it. At the bottom are **Next Document**,
 **Previous Document** and the open documents, with a tick by the one you're looking at.
 
 ## Document tabs
@@ -208,6 +217,7 @@ lets you change them (see [Preferences, shortcuts and accessibility](preferences
 | Zoom in | **View › Zoom In** (**Ctrl+=**), or click with the **Zoom** tool (**Z**) |
 | Zoom out | **View › Zoom Out** (**Ctrl+-**), or **Alt**-click with the Zoom tool |
 | Fit the whole stage in the window | **View › Fit in Window** (**Ctrl+0**, or **Ctrl+2**) |
+| Fit the stage with the mouse | Double-click the **Hand** tool |
 | See the stage at actual size | **View › 100%** (**Ctrl+1**) |
 | Jump to a set zoom | the arrow beside the zoom field at the right of the edit bar: Fit in window, 25 % to 800 % |
 | Type a zoom | click the zoom field, type a percentage (5 to 6400) and press **Enter** |

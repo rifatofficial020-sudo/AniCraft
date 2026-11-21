@@ -29,6 +29,10 @@ accepts `webpki-root-certs` 1.0.12 under CDLA-Permissive-2.0 for Mozilla certifi
 in by the HTTPS verifier. It applies only to that data crate and version; the code licence
 allowlist is unchanged.
 
+Data tables (ADR 0118) read CSV and TSV through `craft-csv` (MIT OR Apache-2.0; its only
+dependency is `thiserror`), pinned to the same reviewed commit of `storytold/craft-libs` as
+`craft-mime` and `craft-gif`. No new licence.
+
 **Shared-library exceptions (approved by the project lead, 2026-11-17).** The move to the shared
 Craft crates brought two licences the allowlist doesn't name. Both are accepted as crate-scoped
 exceptions in `deny.toml`, and the allowlist itself is unchanged:
@@ -46,7 +50,7 @@ tracked with that team in storytold/craft-libs#2100. CI runs `cargo deny check l
 sources` in its own job again (the shared gate doesn't).
 
 ```sh
-cargo deny check licenses bans sources   # policy in deny.toml; must pass before every commit
+cargo deny check licenses bans sources   # checks licences, bans and sources against deny.toml; AGENTS.md (rule 33) decides when it runs
 cargo deny check advisories              # RustSec security advisories (needs network)
 ```
 
@@ -234,6 +238,7 @@ No new crate. The installers are built with tools that are not Rust dependencies
 | GPU renderer (M3) | **As built** (ADR 0019): tile binning with per-row backdrops and per-pixel exact area coverage, written from the public descriptions of Vello and the sparse-strips work (Apache-2.0 OR MIT) and our own oracle's coverage integral; no third-party shader or code copied. Uses `wgpu` (MIT OR Apache-2.0), `pollster` and `bytemuck`, all already in the tree through eframe; no new licence. | Same rule: public papers and permissive code only. |
 | PNG, GIF, SVG, WebP | Royalty-free (GIF's LZW patents expired in 2003–2004). | OK to implement. |
 | **Video export** | H.264/HEVC/AAC are covered by patent pools. VP9, AV1 and Opus are royalty-free. | **Never bundle encoders for patent-pool codecs.** MP4/H.264 only by piping to a user-installed ffmpeg. Default to WebM (VP9/AV1). **As built** (`file.export_video`): AniCraft starts the user's ffmpeg (found via a parameter, `ANICRAFT_FFMPEG` or the PATH) with an argument list, never a shell, writes raw RGBA frames to its stdin, and ships no codec code; the default file type is `.webm` (VP9). |
+| **Video import** (M5, ADR 0116) | Decoding H.264, HEVC and AAC is covered by the same patent pools as encoding them. | **No video decoder in-tree, of any format.** `file.import_video` and reference layers start the user's own ffmpeg (found as Export Video finds it) with an argument list, never a shell, and read uncompressed pictures (Netpbm binary PPM) from its standard output and an uncompressed WAV for the sound; AniCraft's code handles only those two open, unencumbered formats, with every size checked. ffmpeg is not bundled, linked or downloaded; when it is missing the message says how to install it. CI installs the distribution's ffmpeg package on the Linux runner as a test tool only. No dependency and no licence was added. |
 | **Sound** (M5, ADR 0020) | WAV/PCM is unencumbered; Vorbis and Opus are royalty-free; the MP3 patents expired in 2017; AAC is in a patent pool. | Decode WAV, Ogg Vorbis and MP3 in-process (pure-Rust, permissive decoders; no encoders). The video soundtrack is encoded by the user's ffmpeg: Opus for WebM (the default), AAC only for MP4, never by code we ship. Exported audio is uncompressed WAV. |
 | **XFL / FLA import** (M4) | Adobe's proprietary formats, without a public specification. | Clean room: work only from files users or we author, public community docs and observation. Never use Adobe code, SDKs or decompiled software. Interoperability-focused (generally protected in EU Software Directive art. 6 and US DMCA §1201(f)); **confirm with counsel before shipping**. |
 | **ActionScript compatibility** (M6, ADR 0013) | A programming language; no known patent pool. Implemented from ECMA-262 (3rd edition) and Adobe's public ActionScript 3.0 references. | Clean room as for XFL: public documents and self-authored files only; never Adobe compilers, SDKs or player code. Keep and run a timeline subset only; no bytecode VM. Tier 1 (keeping scripts, built) reads only the XFL `<Actionscript>` element, linkage attributes and publish settings from self-authored files. |

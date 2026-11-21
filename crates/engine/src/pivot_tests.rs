@@ -237,3 +237,30 @@ fn layer_opacity_is_set_read_checked_and_undone() {
     run(&mut s, "layer.set_opacity", json!({"opacity": 100}));
     assert!(s.display_list().groups.is_empty());
 }
+
+/// #466: a bitmap imported to the stage turns about the centre of its box, as in Animate, not
+/// about its top-left corner (where the bitmap's own origin is).
+#[test]
+fn an_imported_bitmap_turns_about_its_centre() {
+    let dir = std::env::temp_dir().join(format!("anicraft-pivot-bitmap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("photo.png");
+    std::fs::write(&png, anicraft_render::encode_png(40, 20, &[255u8; 40 * 20 * 4]).unwrap()).unwrap();
+    let mut s = Session::new(anicraft_doc::Document::default());
+    run(&mut s, "file.import", json!({"path": png.display().to_string(), "x": 100, "y": 50}));
+    std::fs::remove_dir_all(&dir).ok();
+    run(&mut s, "edit.select_all", json!({}));
+    assert_eq!(s.selection_bounds(), Rect::new(100.0, 50.0, 140.0, 70.0));
+    // Free Transform's point: the centre of the box, and not one the artist moved.
+    let (at, moved) = s.transformation_point().expect("the bitmap is selected");
+    assert!(near(at, Vec2::new(120.0, 60.0)) && !moved, "{at:?} {moved}");
+    // The origin modes that have a point for a bitmap give the same one.
+    for mode in [crate::TransformOrigin::Selection, crate::TransformOrigin::Center, crate::TransformOrigin::Registration] {
+        let origins = crate::cmds_modify::transform_origins(&s, mode);
+        assert!(matches!(origins.as_slice(), [(_, p)] if near(*p, Vec2::new(120.0, 60.0))), "{mode:?}: {:?}", origins.iter().map(|o| o.1).collect::<Vec<_>>());
+    }
+    // A quarter turn keeps the centre where it is: a 20 × 40 box round the same point.
+    run(&mut s, "modify.rotate_cw", json!({}));
+    let b = s.selection_bounds();
+    assert!(near(b.min, Vec2::new(110.0, 40.0)) && near(b.max, Vec2::new(130.0, 80.0)), "{b:?}");
+}

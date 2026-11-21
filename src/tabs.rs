@@ -176,6 +176,11 @@ impl Tabs {
         self.active
     }
 
+    /// The shown tab's id (it stays the tab's as tabs open, close and move).
+    pub fn active_id(&self) -> u64 {
+        self.slots.get(self.active).map_or(0, |s| s.id)
+    }
+
     fn index_of(&self, id: u64) -> Option<usize> {
         self.slots.iter().position(|s| s.id == id)
     }

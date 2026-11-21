@@ -37,6 +37,8 @@ pub fn plugin_may_call(id: &str) -> std::result::Result<(), &'static str> {
         "edit.cut" | "edit.copy" | "edit.paste" | "edit.paste_in_place" | "timeline.cut_frames" | "timeline.copy_frames" | "timeline.paste_frames" | "frames.cut" | "frames.copy" | "frames.paste" | "ease.copy" | "ease.paste" => {
             Err("plug-ins don't use your clipboard")
         }
+        // A reference video is a file on this computer, read by a program AniCraft starts.
+        "layer.set_video" => Err("plug-ins can't read video files or start ffmpeg"),
         _ => match id.split('.').next().unwrap_or("") {
             "file" => Err("plug-ins can't open, save, import, export or publish files"),
             // Reading the settings is harmless; changing them changes what Publish writes where.
@@ -55,6 +57,9 @@ pub fn plugin_may_call(id: &str) -> std::result::Result<(), &'static str> {
             // The document's swatches are document data; swatch files are files.
             "swatch" if matches!(id, "swatch.import" | "swatch.export") => Err("plug-ins can't read or write swatch files"),
             "swatch" => Ok(()),
+            // Data tables and bindings are the document's (ADR 0118); a table file is a file.
+            "data" if id == "data.import_table" => Err("plug-ins can't read files: pass the values to data.set_table"),
+            "data" => Ok(()),
             "plugin" => Err("plug-ins can't install, run or remove plug-ins"),
             // Saved commands are files in your preferences (ADR 0097), and running one from a
             // plug-in would let the two call each other.
@@ -225,6 +230,11 @@ fn plugin_err(e: anicraft_plugins::Error) -> EngineError {
 
 fn install(s: &mut Session, p: &Value) -> Result<Value> {
     let path = PathBuf::from(str_req(p, "path")?);
+    // The registry reads and copies files itself: the automation roots are asked here (ADR 0124).
+    crate::access::check(&path, crate::access::Access::Read)?;
+    if let Some(folder) = s.plugins.folder() {
+        crate::access::check(folder, crate::access::Access::Write)?;
+    }
     let inst = s.plugins.install_file(&path).map_err(plugin_err)?;
     Ok(json!({
         "installed": describe(s, &inst.plugin),
@@ -260,6 +270,12 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     let id = str_req(p, "id")?;
+    if let Some(plugin) = s.plugins.get(id)
+        && s.plugins.owns_file(&plugin)
+        && let Some(src) = plugin.source()
+    {
+        crate::access::check(src, crate::access::Access::Write)?;
+    }
     let rm = s.plugins.remove(id).map_err(plugin_err)?;
     Ok(json!({"removed": rm.plugin.id(), "name": rm.plugin.manifest().name, "deleted": rm.deleted.map(|d| d.display().to_string())}))
 }
@@ -269,7 +285,20 @@ fn reload(s: &mut Session, p: &Value) -> Result<Value> {
         if f.trim().is_empty() {
             return Err(EngineError::Param("'folder' is empty".into()));
         }
+        crate::access::check(std::path::Path::new(f), crate::access::Access::Read)?;
         s.plugins.set_folder(Some(PathBuf::from(f)));
+    }
+    if let Some(folder) = s.plugins.folder() {
+        crate::access::check(folder, crate::access::Access::Read)?;
+        // Each file too: a link in the folder may lead out of the roots.
+        const MOST: usize = 65_536;
+        let entries = crate::vfs::list(folder, MOST);
+        if crate::access::active() && entries.len() >= MOST {
+            return Err(EngineError::State("the plug-ins folder holds too many files to check against the automation roots".into()));
+        }
+        for entry in entries {
+            crate::access::check(&entry, crate::access::Access::Read)?;
+        }
     }
     let rep = s.plugins.reload().map_err(plugin_err)?;
     Ok(json!({

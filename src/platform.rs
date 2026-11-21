@@ -619,6 +619,7 @@ pub fn unavailable(cmd: &str) -> Option<&'static str> {
     }
     match cmd {
         "file.export_video" => Some(tr_noop!("Video export runs ffmpeg, which a web browser can't start: use the desktop app, or export an animated GIF or a PNG sequence")),
+        "file.import_video" | "file.video_info" | "layer.set_video" => Some(tr_noop!("Importing video runs ffmpeg, which a web browser can't start: use the desktop app, or import the frames as PNG images")),
         "plugin.install" | "plugin.remove" | "plugin.reload" => Some(tr_noop!("Plug-ins are installed into a folder on your computer: use the desktop app")),
         "desktop.integrate" | "desktop.remove" | "desktop.status" => Some(tr_noop!("The applications menu belongs to an AppImage on Linux: use the desktop app")),
         "file.save_as_template" => Some(tr_noop!("Your templates are kept in a folder on your computer: use the desktop app (the built-in templates work here)")),
@@ -982,6 +983,8 @@ pub fn filters(cmd: &str) -> (&'static str, &'static [&'static str]) {
         "file.export_audio" => (tr_noop!("WAV sound"), &["wav"]),
         "file.export_sprite_sheet" => (tr_noop!("PNG sprite sheet"), &["png"]),
         "file.export_video" => (tr_noop!("Video (WebM or MP4)"), &["webm", "mp4"]),
+        // Whatever the ffmpeg on this computer reads (ADR 0116); these are the common ones.
+        "file.import_video" | "layer.set_video" => (tr_noop!("Video"), &["mp4", "mov", "m4v", "webm", "mkv", "avi", "mpg", "mpeg", "wmv", "flv", "ogv", "gif"]),
         // Opening also imports .fla archives and .xfl packages.
         "file.open" => (tr_noop!("Documents"), &["anicraft", "fla", "xfl"]),
         "plugin.install" => (tr_noop!("WebAssembly plug-in"), &["wasm"]),
@@ -990,13 +993,14 @@ pub fn filters(cmd: &str) -> (&'static str, &'static [&'static str]) {
         "filter.preset_export" | "filter.preset_import" => (tr_noop!("Filter preset file"), &["json"]),
         "swatch.export" => (tr_noop!("Swatch file"), &["json"]),
         "swatch.import" => (tr_noop!("Swatch file or GIMP palette"), &["json", "gpl"]),
+        "data.import_table" => (tr_noop!("Data table (CSV, TSV or JSON)"), &["csv", "tsv", "tab", "txt", "json"]),
         _ => (tr_noop!("AniCraft document"), &["anicraft"]),
     }
 }
 
 /// Commands that read a file the user picks (the others write one, or a folder of them).
 pub fn reads_file(cmd: &str) -> bool {
-    matches!(cmd, "file.open" | "plugin.install" | "file.import" | "file.import_to_library" | "brush.preset_import" | "filter.preset_import" | "swatch.import" | "macro.run" | "macro.import")
+    matches!(cmd, "file.open" | "plugin.install" | "file.import" | "file.import_video" | "layer.set_video" | "file.import_to_library" | "brush.preset_import" | "filter.preset_import" | "swatch.import" | "data.import_table" | "macro.run" | "macro.import")
 }
 
 /// Shows the platform's own dialog (Windows common dialog, macOS panel, Linux XDG portal), with
@@ -1007,7 +1011,7 @@ pub fn file_dialog(cmd: &str, title: &str, default_name: &str) -> Option<PathBuf
     let (label, d) = (crate::i18n::t(label), rfd::FileDialog::new().set_title(title));
     match cmd {
         c if reads_file(c) => d.add_filter(label, exts).pick_file(),
-        "file.export_png_sequence" => d.pick_folder(),
+        "file.export_png_sequence" | "file.export_svg_sequence" => d.pick_folder(),
         _ => d.add_filter(label, exts).set_file_name(default_name).save_file(),
     }
 }
@@ -1048,7 +1052,7 @@ pub fn start_file_dialog(cmd: &str, title: &str, default_name: &str, window: &ef
         // rfd begins the sheet here, on the main thread, as AppKit needs.
         let answer: Answer = match cmd {
             c if reads_file(c) => Box::pin(d.add_filter(label, exts).pick_file()),
-            "file.export_png_sequence" => Box::pin(d.pick_folder()),
+            "file.export_png_sequence" | "file.export_svg_sequence" => Box::pin(d.pick_folder()),
             _ => Box::pin(d.add_filter(label, exts).set_file_name(default_name).save_file()),
         };
         let _ = sheet_tx.send(answer);

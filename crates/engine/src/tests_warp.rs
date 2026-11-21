@@ -172,7 +172,7 @@ fn a_bitmap_bends_in_every_renderer_and_export() {
     // SVG bakes the bent image; the HTML page reports it.
     let svg = crate::cmds_file::frame_svg(&s.doc, 0);
     assert!(svg.contains("<image x="));
-    let html = anicraft_render::html::to_html(&s.doc, &anicraft_render::html::HtmlOptions { title: "t".into(), sound: false, fit: false }).unwrap();
+    let html = anicraft_render::html::to_html(&s.doc, &anicraft_render::html::HtmlOptions { title: "t".into(), sound: false, fit: false, fonts: Vec::new() }).unwrap();
     assert!(html.report.keys().any(|k| k.starts_with("warped bitmaps")), "{:?}", html.report);
 }
 
