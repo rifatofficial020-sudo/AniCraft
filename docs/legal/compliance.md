@@ -33,6 +33,10 @@ Data tables (ADR 0118) read CSV and TSV through `craft-csv` (MIT OR Apache-2.0; 
 dependency is `thiserror`), pinned to the same reviewed commit of `storytold/craft-libs` as
 `craft-mime` and `craft-gif`. No new licence.
 
+Text that mixes directions (ADR 0130) resolves embedding levels through `craft-text` (MIT OR
+Apache-2.0, `storytold/craft-libs`, pinned by `rev`) with only its `bidi` feature, which brings
+`unicode-bidi` and `unicode-bidi-mirroring` (both MIT OR Apache-2.0). No new licence.
+
 **Shared-library exceptions (approved by the project lead, 2026-11-17).** The move to the shared
 Craft crates brought two licences the allowlist doesn't name. Both are accepted as crate-scoped
 exceptions in `deny.toml`, and the allowlist itself is unchanged:

@@ -10,7 +10,7 @@ use crate::params::*;
 use crate::{CommandSpec, EngineError, Result, Session};
 use anicraft_doc::{ColorEffect, Element, ElementId, ElementKind, MAX_WIDTH_POINTS, Paint, Rgba, Shape, Stroke, WidthPoint, WidthProfile};
 use anicraft_geom::planar;
-use anicraft_geom::brush::{MAX_SAMPLES, Sample, Tilt, Tip, TipShape, centre_stroke, outline_shaped};
+use anicraft_geom::brush::{MAX_SAMPLES, Sample, Shaping, Tilt, Tip, TipShape, centre_stroke, outline_shaped};
 use anicraft_geom::{Affine, FillRule, Path, PathCmd, Vec2};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -237,31 +237,97 @@ fn paint_stacks(p: &Paint) -> bool {
     }
 }
 
-fn draw_brush(s: &mut Session, p: &Value) -> Result<Value> {
+/// What a Brush stroke's outline is traced from: the samples (their pressure already through
+/// the brush's curve), the tip, the shaping, and how closely the hand and the outline are
+/// followed. Tracing is the slow part of a long stroke and depends on nothing else, so the
+/// editor does it on another thread and hands the result to `draw.brush` (ADR 0129).
+#[derive(Clone, Debug, PartialEq)]
+pub struct StrokeRequest {
+    pts: Vec<Sample>,
+    tip: Tip,
+    shaping: Shaping,
+    smoothing: f32,
+    tol: f32,
+}
+
+impl StrokeRequest {
+    /// The filled outline (`geom::brush::outline_shaped`). Bounded for any stroke: the grid by
+    /// `MAX_CELLS`, the sampling by `MAX_STAMP_WORK`, the loops by `MAX_LOOPS`.
+    pub fn trace(&self) -> Path {
+        outline_shaped(&self.pts, &self.tip, &self.shaping, self.smoothing, self.tol)
+    }
+
+    /// Traces the outline: what [`Session::staged_stroke`] takes.
+    pub fn prepare(self) -> PreparedStroke {
+        let path = self.trace();
+        PreparedStroke { request: self, path }
+    }
+
+    /// How many samples the stroke has.
+    pub fn samples(&self) -> usize {
+        self.pts.len()
+    }
+}
+
+/// A stroke's outline, traced ahead of the command that paints it.
+#[derive(Clone, Debug)]
+pub struct PreparedStroke {
+    request: StrokeRequest,
+    path: Path,
+}
+
+impl PreparedStroke {
+    /// The same request with another outline, so a test can tell a taken outline from a traced
+    /// one.
+    #[cfg(test)]
+    pub(crate) fn with_path(self, path: Path) -> PreparedStroke {
+        PreparedStroke { path, ..self }
+    }
+}
+
+/// The request `draw.brush` with params `p` would trace. An error is the command's own (the
+/// same params fail the same way there).
+pub fn stroke_request(s: &Session, p: &Value) -> Result<StrokeRequest> {
+    stroke_inputs(s, p).map(|x| x.0)
+}
+
+/// [`stroke_request`], with the brush it paints with and the opacity its pressure gives it.
+fn stroke_inputs(s: &Session, p: &Value) -> Result<(StrokeRequest, BrushPreset, f32)> {
     let pts = bounded_samples(p)?;
     let b = brush_param(s, p)?;
     let tip = b.tip();
-    let size = tip.size;
-    let as_stroke = opt_bool(p, "as_stroke")?.unwrap_or(false);
     let unit = ranged(p, "unit", 0.001..=1000.0, 1.0)?;
-    let mode_key = opt_str(p, "mode")?.unwrap_or("normal");
-    let mode = PaintMode::from_key(mode_key).ok_or_else(|| EngineError::Param(format!("unknown paint mode '{mode_key}' (normal, fills, behind, selection or inside)")))?;
-    let color = opt_color(p, "color")?.unwrap_or(if as_stroke { s.style.stroke } else { s.style.fill });
-    let color = Rgba { a: color.a * pressure_opacity(&b, &pts), ..color };
-    let object = object_param(s, p)?;
+    let opacity = pressure_opacity(&b, &pts);
     // Pressure through the curve (ADR 0068) before it sizes the tip.
     let pts: Vec<Sample> = pts.iter().map(|x| Sample { pressure: b.size_pressure(x.pressure), ..*x }).collect();
-
     // Smoothing and accuracy are screen distances, so a stroke looks the same at any zoom: at 50
     // the centre line may wander 3.3 screen points from the hand, at 0 a third of a point.
     // The outline is fitted within a third of a screen point, or a hundredth of the size for
     // small brushes (so a small dab is still round).
-    let (smoothing, tol) = (unit * (0.3 + b.smoothing * 0.06), (unit * 0.35).min(size * 0.01));
+    let (smoothing, tol) = (unit * (0.3 + b.smoothing * 0.06), (unit * 0.35).min(tip.size * 0.01));
+    Ok((StrokeRequest { pts, tip, shaping: b.shaping(), smoothing, tol }, b, opacity))
+}
+
+fn draw_brush(s: &mut Session, p: &Value) -> Result<Value> {
+    // An outline traced ahead is this stroke's or nobody's: it never waits for a later one.
+    let staged = s.staged_stroke.take();
+    let (request, b, opacity) = stroke_inputs(s, p)?;
+    let pts = &request.pts;
+    let (smoothing, tol) = (request.smoothing, request.tol);
+    let as_stroke = opt_bool(p, "as_stroke")?.unwrap_or(false);
+    let mode_key = opt_str(p, "mode")?.unwrap_or("normal");
+    let mode = PaintMode::from_key(mode_key).ok_or_else(|| EngineError::Param(format!("unknown paint mode '{mode_key}' (normal, fills, behind, selection or inside)")))?;
+    let color = opt_color(p, "color")?.unwrap_or(if as_stroke { s.style.stroke } else { s.style.fill });
+    let color = Rgba { a: color.a * opacity, ..color };
+    let object = object_param(s, p)?;
     if as_stroke {
-        return paint_stroke(s, &pts, &b, smoothing, tol, color, object);
+        return paint_stroke(s, pts, &b, smoothing, tol, color, object);
     }
     let start = pts.first().map_or(Vec2::ZERO, |x| x.at);
-    let mut path = outline_shaped(&pts, &tip, &b.shaping(), smoothing, tol);
+    let mut path = match staged {
+        Some(ahead) if ahead.request == request => ahead.path,
+        _ => request.trace(),
+    };
     if !path.cmds.iter().any(|c| matches!(c, PathCmd::CubicTo(..) | PathCmd::LineTo(..))) {
         return Err(EngineError::Param("the stroke is too small to paint".into()));
     }

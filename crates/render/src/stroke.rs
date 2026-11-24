@@ -703,7 +703,7 @@ pub fn outline_variable_strokes(dl: &DisplayList) -> std::borrow::Cow<'_, Displa
             items.push(DisplayItem { path: std::sync::Arc::new(outline), transform: Affine::IDENTITY, fill: Some(anicraft_doc::Paint::Solid(st.color)), stroke: None, fill_rule: anicraft_geom::FillRule::NonZero, image: None, ..it.clone() });
         }
     }
-    std::borrow::Cow::Owned(DisplayList { links: Vec::new(), clip_modes: dl.clip_modes.clone(), items, clip_parents: dl.clip_parents.clone(), groups: dl.groups.clone() })
+    std::borrow::Cow::Owned(DisplayList { links: Vec::new(), clip_modes: dl.clip_modes.clone(), items, clip_parents: dl.clip_parents.clone(), groups: dl.groups.clone(), left_out: dl.left_out })
 }
 
 #[cfg(test)]
@@ -931,9 +931,9 @@ mod tests {
                 assert!(apart < 1.0 / 255.0, "{what}, {how}: {apart}");
                 // 3. Against the truth: each pixel sampled 16 × 16 times against the pieces.
                 //    (Checked for the plain styles; a sample grid is good to a sixteenth.)
-                let (pieces, _) = piece_loops(&lines, hw, &outline, profile.as_ref(), None, false);
-                let before = coverage(&pieces, FillRule::NonZero);
                 if how == "round" || how == "dashes whose round caps overlap" {
+                    let (pieces, _) = piece_loops(&lines, hw, &outline, profile.as_ref(), None, false);
+                    let before = coverage(&pieces, FillRule::NonZero);
                     for y in (0..300).step_by(7) {
                         for x in 0..400 {
                             let c = drawn[y * 400 + x];
@@ -974,7 +974,7 @@ mod tests {
             smooth: true,
             warp: None,
         };
-        let dl = DisplayList { links: Vec::new(), clip_modes: Vec::new(), items: vec![item], clip_parents: Vec::new(), groups: Vec::new() };
+        let dl = DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items: vec![item], clip_parents: Vec::new(), groups: Vec::new() };
         let view = crate::View { transform: Affine::IDENTITY, width: 400, height: 300, background: Some(anicraft_doc::Rgba::WHITE) };
         let (pm, _) = crate::render(&dl, &view).unwrap();
         pm.data.iter().map(|p| 1.0 - p[0]).collect()

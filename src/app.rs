@@ -376,6 +376,9 @@ pub struct App {
     /// The tool in hand last frame (picking the Camera tool adds a camera).
     pub last_tool: Tool,
     pub status: Option<Status>,
+    /// The frame shown was not all drawn when the stage last looked (ADR 0128): the status bar
+    /// has said so, and says it again only after a frame that was whole.
+    pub left_out_said: bool,
     pub prompt: Option<Prompt>,
     /// The Convert to Symbol dialog, and what it chose last (ADR 0053).
     pub convert: Option<crate::convert_symbol::ConvertDialog>,
@@ -474,6 +477,9 @@ pub struct App {
     /// A filter preset being named in Properties (ADR 0091).
     pub filter_naming: crate::panels::FilterNaming,
     pub brush_samples: Vec<(anicraft_engine::geom::Vec2, Option<f32>)>,
+    /// Brush strokes drawn but not yet painted: their outlines are being traced on another
+    /// thread (ADR 0129). Oldest first.
+    pub ink: Vec<crate::ink::Pending>,
     pub pen_pressure: Option<f32>,
     /// Whether a pointer event has carried a pen's tilt this session (ADR 0093). Until one has,
     /// the brushes' Tilt options stay hidden: they would do nothing.
@@ -802,6 +808,7 @@ impl App {
             camera_preview: false,
             last_tool: Tool::Select,
             status: None,
+            left_out_said: false,
             prompt: None,
             convert: None,
             layer_props: None,
@@ -856,6 +863,7 @@ impl App {
             brush_lib: crate::brush_panel::BrushLibraryView::default(),
             filter_naming: Default::default(),
             brush_samples: Vec::new(),
+            ink: Vec::new(),
             pen_pressure: None,
             pen_tilt_seen: false,
             eraser: crate::erasertool::EraserOptions::default(),
@@ -1011,6 +1019,16 @@ impl App {
         self.status = Some(Status { text: text.into(), error: true, at: 0.0 });
     }
 
+    /// What a text command had to say about the fonts it used, in the status bar: a font that
+    /// isn't installed, letters drawn from another font, characters no font has (ADR 0012,
+    /// ADR 0130). The block looks right either way, so this is the only place it is said.
+    pub fn text_note(&mut self, result: &Value) {
+        if let Some(note) = result["note"].as_str() {
+            // The engine's English, translated when a catalog has that exact message.
+            self.status_ok(crate::i18n::t_dyn(note).into_owned());
+        }
+    }
+
     /// Runs an engine command, reporting failures in the status bar.
     /// After a move, selected raw shapes float over what they landed on, and merge with it when
     /// they are deselected, as in Animate (ADR 0122, #487): until then they can be moved on.
@@ -1031,6 +1049,9 @@ impl App {
     }
 
     pub fn run(&mut self, id: &str, params: Value) -> Option<Value> {
+        // Strokes still on their way in are painted first: commands run in the order they
+        // were asked for (ADR 0129).
+        crate::ink::flush(self);
         let result = self.s.execute(id, &params);
         if platform::WEB && id.starts_with("file.") {
             // In a browser, what a save or an export wrote is in memory: hand it to the
@@ -3711,6 +3732,7 @@ impl App {
             }
             "plugin.run" | "plugin.install" | "plugin.remove" | "plugin.reload" => crate::plugins_ui::status(self, id, v),
             id if id.starts_with("macro.") => crate::macros_ui::done(self, id, v),
+            id if id.starts_with("text.") => self.text_note(v),
             "timeline.remove_frame" => {
                 let n = v["removed"].as_u64().unwrap_or(1);
                 self.status_ok(if n == 1 { tr!("Removed frame — {undo} to undo", undo = self.undo_key()).to_string() } else { trn!("Removed {n} frame — {undo} to undo", "Removed {n} frames — {undo} to undo", n, undo = self.undo_key()) });
@@ -4759,6 +4781,9 @@ impl App {
             }
         }
         self.handle_screenshot(&ctx);
+        // Brush strokes whose outlines are traced go into the document, before this frame's
+        // input can edit it (ADR 0129).
+        crate::ink::frame(self, &ctx);
         // An assistant's edits (ADR 0104), before anything draws: they show in this frame.
         #[cfg(not(target_arch = "wasm32"))]
         crate::remote::poll(self, &ctx);

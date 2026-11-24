@@ -2,6 +2,7 @@
 //! server (`mcp`). Every operation goes through the engine's command registry.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod bench_stroke;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod control;
 pub mod mcp;
@@ -46,6 +47,10 @@ USAGE:
   anicraft-cli bench [--layers N] [--shapes N] [--frames N]   performance probe (use --release)
   anicraft-cli bench --check yes         the default scenario against the budgets in
                                          docs/performance.md; fails when one is missed
+  anicraft-cli bench --stroke <samples>  one long Brush stroke: painting it, picking it, moving
+                                         it and the merge when it is deselected (ADR 0129)
+  anicraft-cli bench --stroke-file <file.anicraft>
+                                         the same steps on a document's own artwork
   anicraft-cli serve [file|--sample] [--automation-read-root <folder> --automation-write-root <folder>]
                                          JSON-lines on stdin/stdout:
         {\"id\":1,\"cmd\":\"draw.rect\",\"params\":{\"x\":10,\"y\":10,\"w\":50,\"h\":50}}
@@ -579,6 +584,9 @@ pub fn check_budgets(out: &Value) -> (Vec<Value>, Vec<String>) {
 /// `cargo run --release -p anicraft-cli -- bench`. With `--check yes`, the default scenario
 /// is compared with [`TIME_BUDGETS`] and a missed budget is an error.
 pub fn bench(a: &Args) -> Result<String, String> {
+    if a.flag("stroke").is_some() || a.flag("stroke-file").is_some() {
+        return bench_stroke::bench_stroke(a);
+    }
     let check = a.flag("check").is_some_and(|v| v == "yes" || v == "true");
     if check {
         if cfg!(debug_assertions) {
@@ -1019,6 +1027,33 @@ pub(crate) mod tests {
         if cfg!(debug_assertions) {
             assert!(run(&["bench".into(), "--check".into(), "yes".into()]).unwrap_err().contains("release"));
         }
+    }
+
+    /// `bench --stroke` walks the reporter's steps of #519 (paint, pick, move, float, deselect,
+    /// undo) and `--stroke-file` the same on a document: the stroke becomes one merged shape,
+    /// the merge on deselect keeps it, and undo puts the drawing back as it was.
+    #[test]
+    fn stroke_bench_paints_moves_and_merges_a_long_stroke() {
+        let out: Value = serde_json::from_str(&run(&["bench".into(), "--stroke".into(), "400".into()]).unwrap()).unwrap();
+        assert_eq!(out["samples"], 400);
+        assert_eq!(out["merged"], true);
+        let segments = out["segments"].as_u64().unwrap();
+        assert!(segments > 50, "a scribble has an outline of many curves: {segments}");
+        assert_eq!(out["segments_after"].as_u64(), Some(segments), "undo takes the move and its merge back");
+        for step in ["draw_brush_ms", "hit_test_us", "move_ms", "float_ms", "deselect_merge_ms", "undo_ms", "render_ms"] {
+            assert!(out[step].as_f64().is_some_and(|v| v >= 0.0), "{step} was timed: {out}");
+        }
+        assert!(run(&["bench".into(), "--stroke".into(), "many".into()]).unwrap_err().contains("number of samples"));
+        // The same steps on a saved document's artwork.
+        let dir = std::env::temp_dir().join(format!("anicraft-cli-stroke-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("stroke.anicraft");
+        let mut s = Session::default();
+        s.execute("draw.brush", &json!({"points": bench_stroke::scribble(200), "size": 8, "object": false})).unwrap();
+        s.execute("file.save", &json!({"path": file.display().to_string()})).unwrap();
+        let out: Value = serde_json::from_str(&run(&["bench".into(), "--stroke-file".into(), file.display().to_string()]).unwrap()).unwrap();
+        assert!(out["samples"].is_null() && out["elements"].as_u64() == Some(1) && out["deselect_merge_ms"].is_number(), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

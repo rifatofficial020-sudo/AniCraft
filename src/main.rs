@@ -525,4 +525,7 @@ mod parenting_ui_tests;
 #[cfg(test)]
 mod tilt_ui_tests;
 #[cfg(test)]
+mod long_stroke_tests;
+mod ink;
+#[cfg(test)]
 mod zoom_tests;

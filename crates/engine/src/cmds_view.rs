@@ -67,8 +67,7 @@ pub(crate) fn aids_json(s: &Session) -> Value {
 }
 
 fn color_hex(c: anicraft_doc::Rgba) -> String {
-    let c = c.sanitized();
-    if c.a >= 1.0 { c.to_hex() } else { format!("{}{:02x}", c.to_hex(), (c.a * 255.0).round() as u8) }
+    c.to_hex_alpha()
 }
 
 fn guides_json(s: &Session) -> Value {

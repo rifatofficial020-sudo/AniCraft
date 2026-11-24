@@ -422,7 +422,8 @@ Both dialogs remember what you entered. Each command is one undo step.
 ## Transforming artwork
 
 With the **Free Transform** tool (**Q**), drag a handle (a corner or the middle of an edge) to
-**scale** (**Shift** keeps the proportions, **Alt** scales about the transformation point),
+**scale** (the opposite handle stays where it is; **Shift** keeps the proportions, **Alt**
+scales about the transformation point instead),
 the line between two handles to **skew** (the opposite edge stays where it is; **Alt** skews
 about the transformation point), just outside a corner to **rotate** (the pointer turns
 into a curved arrow there; **Shift** snaps to 15°), or inside the box to **move**.

@@ -371,12 +371,13 @@ pub fn export(s: &mut Session, p: &Value, kind: Kind) -> Result<Value> {
     let mut shown: Vec<(u64, u64)> = Vec::new();
     let mut encoded: Vec<Encoded> = Vec::new();
     let mut prev: Option<Vec<u8>> = None;
+    let cut = crate::left_out::LeftOut::default();
     let frames: Vec<u32> = (from..=to).collect();
     for (b, chunk) in frames.chunks(batch).enumerate() {
         let images: Vec<Vec<u8>> = chunk
             .par_iter()
             .map(|&f| {
-                let (pm, _) = render(&anicraft_doc::evaluate(doc, f), &view)?;
+                let (pm, _) = render(&cut.evaluate(doc, f), &view)?;
                 crate::publish::tick(job, 1)?;
                 Ok(pm.to_rgba8())
             })
@@ -437,7 +438,7 @@ pub fn export(s: &mut Session, p: &Value, kind: Kind) -> Result<Value> {
         }
     };
     crate::vfs::write(&path, &bytes)?;
-    Ok(json!({
+    Ok(cut.noted(json!({
         "written": path.display().to_string(),
         "frames": n,
         "stored_frames": encoded.len(),
@@ -446,7 +447,7 @@ pub fn export(s: &mut Session, p: &Value, kind: Kind) -> Result<Value> {
         "height": h,
         "loop": plays,
         "ms": started.elapsed().as_millis() as u64,
-    }))
+    })))
 }
 
 #[cfg(test)]

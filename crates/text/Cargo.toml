@@ -14,6 +14,8 @@ fontdb.workspace = true
 # Shaping (a HarfBuzz port) and outlines/metrics: both already in the tree through egui.
 harfrust = "0.12"
 skrifa = { version = "0.44", default-features = false, features = ["std"] }
+# The Unicode bidi algorithm (UAX #9): embedding levels, line reordering (ADR 0130).
+craft-text.workspace = true
 
 [lints]
 workspace = true

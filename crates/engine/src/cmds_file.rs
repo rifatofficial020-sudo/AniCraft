@@ -1,5 +1,6 @@
 //! File, edit-history and document commands.
 
+use crate::left_out::LeftOut;
 use crate::params::*;
 use crate::{CommandSpec, EngineError, Result, Session, format};
 use anicraft_doc::{Document, MAX_STAGE_EDGE, Stage, sample};
@@ -261,7 +262,12 @@ pub(crate) fn scale_param(p: &Value) -> Result<f32> {
 
 /// Renders movie frame `frame` (scenes in order) of `doc` to PNG bytes.
 pub fn render_png(doc: &Document, frame: u32, scale: f32) -> Result<Vec<u8>> {
-    let dl = anicraft_doc::evaluate(doc, frame);
+    render_png_noting(doc, frame, scale, &LeftOut::default())
+}
+
+/// [`render_png`], noting in `cut` a frame whose artwork was left out (ADR 0128).
+pub fn render_png_noting(doc: &Document, frame: u32, scale: f32, cut: &LeftOut) -> Result<Vec<u8>> {
+    let dl = cut.evaluate(doc, frame);
     let (pm, _) = render(&dl, &View::stage(doc, scale))?;
     Ok(pm.encode_png()?)
 }
@@ -270,9 +276,10 @@ fn export_png(s: &mut Session, p: &Value) -> Result<Value> {
     let path = PathBuf::from(str_req(p, "path")?);
     let frame = opt_u32(p, "frame")?.unwrap_or(s.frame);
     // `frame` is within the current scene; the renderer takes movie frames.
-    let bytes = render_png(&s.doc, s.doc.scene_start(s.scene).saturating_add(frame), scale_param(p)?)?;
+    let cut = LeftOut::default();
+    let bytes = render_png_noting(&s.doc, s.doc.scene_start(s.scene).saturating_add(frame), scale_param(p)?, &cut)?;
     crate::vfs::write(&path, &bytes)?;
-    Ok(json!({"written": path.display().to_string(), "bytes": bytes.len(), "frame": frame}))
+    Ok(cut.noted(json!({"written": path.display().to_string(), "bytes": bytes.len(), "frame": frame})))
 }
 
 /// Largest file Import to Stage reads.
@@ -524,9 +531,16 @@ fn import_image(s: &mut Session, path: &std::path::Path, bytes: Vec<u8>) -> Resu
     Ok(anicraft_svg::SvgImport::single(w, h, vec![anicraft_svg::ImportedElement { name, transform: anicraft_geom::Affine::IDENTITY, alpha: 1.0, kind: anicraft_doc::ElementKind::Shape(shape) }]))
 }
 
-/// Movie frame `frame` as a standalone SVG document (vectors, gradients and masks kept).
+/// [`frame_svg_noting`] for a frame known to be whole: what tests compare a written file with.
+#[cfg(test)]
 pub fn frame_svg(doc: &Document, frame: u32) -> String {
-    anicraft_render::svg::to_svg(&anicraft_doc::evaluate(doc, frame), &doc.stage)
+    frame_svg_noting(doc, frame, &LeftOut::default())
+}
+
+/// Movie frame `frame` as a standalone SVG document (vectors, gradients and masks kept),
+/// noting in `cut` a frame whose artwork was left out (ADR 0128).
+pub fn frame_svg_noting(doc: &Document, frame: u32, cut: &LeftOut) -> String {
+    anicraft_render::svg::to_svg(&cut.evaluate(doc, frame), &doc.stage)
 }
 
 fn export_svg(s: &mut Session, p: &Value) -> Result<Value> {
@@ -535,9 +549,10 @@ fn export_svg(s: &mut Session, p: &Value) -> Result<Value> {
     if frame >= s.frame_count() {
         return Err(EngineError::Param(format!("frame {} is past the end (the timeline has {} frames)", u64::from(frame) + 1, s.frame_count())));
     }
-    let svg = frame_svg(&s.doc, s.doc.scene_start(s.scene).saturating_add(frame));
+    let cut = LeftOut::default();
+    let svg = frame_svg_noting(&s.doc, s.doc.scene_start(s.scene).saturating_add(frame), &cut);
     crate::vfs::write(&path, svg.as_bytes())?;
-    Ok(json!({"written": path.display().to_string(), "bytes": svg.len(), "frame": frame}))
+    Ok(cut.noted(json!({"written": path.display().to_string(), "bytes": svg.len(), "frame": frame})))
 }
 
 /// Export Sprite Sheet: movie frames in a grid on one PNG (transparent unless `background`),
@@ -578,10 +593,11 @@ fn export_sprite_sheet(s: &mut Session, p: &Value) -> Result<Value> {
     let doc = &s.doc;
     // A publish counts the frames, and stops between them when cancelled (ADR 0060).
     let job = s.job.as_deref();
+    let cut = LeftOut::default();
     let frames: Vec<anicraft_render::Pixmap> = (from..=to)
         .into_par_iter()
         .map(|f| {
-            let (pm, _) = render(&anicraft_doc::evaluate(doc, f), &view)?;
+            let (pm, _) = render(&cut.evaluate(doc, f), &view)?;
             crate::publish::tick(job, 1)?;
             Ok(pm)
         })
@@ -631,7 +647,7 @@ fn export_sprite_sheet(s: &mut Session, p: &Value) -> Result<Value> {
     let text = serde_json::to_string_pretty(&atlas).map_err(|e| EngineError::Format(e.to_string()))?;
     crate::vfs::write(&path, &png)?;
     crate::vfs::write(&json_path, text)?;
-    Ok(json!({"written": path.display().to_string(), "map": json_path.display().to_string(), "frames": n, "columns": cols, "rows": rows, "width": sheet_w, "height": sheet_h}))
+    Ok(cut.noted(json!({"written": path.display().to_string(), "map": json_path.display().to_string(), "frames": n, "columns": cols, "rows": rows, "width": sheet_w, "height": sheet_h})))
 }
 
 /// The ffmpeg to run: `ffmpeg` param, else `ANICRAFT_FFMPEG`, else `ffmpeg` on the PATH.
@@ -714,11 +730,12 @@ fn export_video(s: &mut Session, p: &Value) -> Result<Value> {
     let doc = &s.doc;
     let job = s.job.as_deref();
     let mut written = 0u32;
+    let cut = LeftOut::default();
     let mut failure: Option<EngineError> = None;
     if let Some(mut stdin) = child.stdin.take() {
         let frames: Vec<u32> = (from..=to).collect();
         'batches: for batch in frames.chunks(8) {
-            let images: Vec<Vec<u8>> = match batch.par_iter().map(|&f| render(&anicraft_doc::evaluate(doc, f), &view).map(|(pm, _)| pm.to_rgba8())).collect::<std::result::Result<_, _>>() {
+            let images: Vec<Vec<u8>> = match batch.par_iter().map(|&f| render(&cut.evaluate(doc, f), &view).map(|(pm, _)| pm.to_rgba8())).collect::<std::result::Result<_, _>>() {
                 Ok(v) => v,
                 Err(e) => {
                     failure = Some(e.into());
@@ -754,7 +771,7 @@ fn export_video(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::Format(format!("ffmpeg could not make the video ({status}): {}", if tail.is_empty() { "no message".to_string() } else { tail.join(" | ") })));
     }
     let bytes = crate::vfs::len(&path).unwrap_or(0);
-    Ok(json!({"written": path.display().to_string(), "frames": written, "bytes": bytes, "width": w, "height": h, "fps": fps, "audio": track.is_some()}))
+    Ok(cut.noted(json!({"written": path.display().to_string(), "frames": written, "bytes": bytes, "width": w, "height": h, "fps": fps, "audio": track.is_some()})))
 }
 
 fn export_sequence(s: &mut Session, p: &Value) -> Result<Value> {
@@ -775,16 +792,17 @@ fn export_sequence(s: &mut Session, p: &Value) -> Result<Value> {
     let doc = &s.doc;
     let job = s.job.as_deref();
     let mut files = 0usize;
+    let cut = LeftOut::default();
     let frames: Vec<u32> = (from..=to).collect();
     for batch in frames.chunks(64) {
-        let pngs = batch.par_iter().map(|&f| render_png(doc, f, scale)).collect::<Result<Vec<_>>>()?;
+        let pngs = batch.par_iter().map(|&f| render_png_noting(doc, f, scale, &cut)).collect::<Result<Vec<_>>>()?;
         for (f, png) in batch.iter().zip(pngs) {
             crate::vfs::write(&dir.join(format!("frame_{:05}.png", f + 1)), png)?;
             files += 1;
         }
         crate::publish::tick(job, batch.len() as u64)?;
     }
-    Ok(json!({"frames": files, "dir": dir.display().to_string()}))
+    Ok(cut.noted(json!({"frames": files, "dir": dir.display().to_string()})))
 }
 
 /// Export SVG Sequence (#504): every movie frame as its own SVG file, named like the PNG
@@ -804,9 +822,10 @@ fn export_svg_sequence(s: &mut Session, p: &Value) -> Result<Value> {
     let doc = &s.doc;
     let job = s.job.as_deref();
     let (mut files, mut bytes) = (0usize, 0u64);
+    let cut = LeftOut::default();
     let frames: Vec<u32> = (from..=to).collect();
     for batch in frames.chunks(16) {
-        let svgs: Vec<String> = batch.par_iter().map(|&f| frame_svg(doc, f)).collect();
+        let svgs: Vec<String> = batch.par_iter().map(|&f| frame_svg_noting(doc, f, &cut)).collect();
         for (f, svg) in batch.iter().zip(svgs) {
             bytes = bytes.saturating_add(svg.len() as u64);
             crate::vfs::write(&dir.join(format!("frame_{:05}.svg", f + 1)), svg.as_bytes())?;
@@ -814,7 +833,7 @@ fn export_svg_sequence(s: &mut Session, p: &Value) -> Result<Value> {
         }
         crate::publish::tick(job, batch.len() as u64)?;
     }
-    Ok(json!({"frames": files, "bytes": bytes, "dir": dir.display().to_string()}))
+    Ok(cut.noted(json!({"frames": files, "bytes": bytes, "dir": dir.display().to_string()})))
 }
 
 /// Largest GIF we produce (frames × pixels), keeping memory and time bounded.
@@ -921,11 +940,12 @@ fn export_gif(s: &mut Session, p: &Value) -> Result<Value> {
     let doc = &s.doc;
     let job = s.job.as_deref();
     let delays = gif_delays(n as usize, doc.stage.fps);
+    let cut = LeftOut::default();
     let frames: Vec<(craft_gif::write::PreparedFrame, u16)> = (from..to.saturating_add(1))
         .into_par_iter()
         .zip(delays.into_par_iter())
         .map(|(f, delay)| {
-            let (pm, _) = render(&anicraft_doc::evaluate(doc, f), &view)?;
+            let (pm, _) = render(&cut.evaluate(doc, f), &view)?;
             let rgba = pm.to_rgba8();
             let frame = craft_gif::write::prepare_frame(u32::from(w), u32::from(h), rgba, 10)
                 .map_err(|e| EngineError::Format(e.to_string()))?;
@@ -943,7 +963,7 @@ fn export_gif(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     crate::vfs::write(&path, &bytes)?;
-    Ok(json!({"written": path.display().to_string(), "frames": n, "bytes": bytes.len(), "width": w, "height": h}))
+    Ok(cut.noted(json!({"written": path.display().to_string(), "frames": n, "bytes": bytes.len(), "width": w, "height": h})))
 }
 
 fn set_stage(s: &mut Session, p: &Value) -> Result<Value> {

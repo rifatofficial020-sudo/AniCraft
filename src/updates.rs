@@ -25,6 +25,7 @@ pub(crate) fn safe_to_install(app: &crate::app::App) -> bool {
         && app.pen.is_none()
         && app.pencil.is_empty()
         && app.brush_samples.is_empty()
+        && app.ink.is_empty()
         && app.raw_touched.is_empty()
         && app.drag == crate::app::Drag::None
         && app.motion_drag.is_none()

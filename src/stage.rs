@@ -230,6 +230,21 @@ fn to_v(p: Pos2) -> Vec2 {
     Vec2::new(p.x, p.y)
 }
 
+/// Says in the status bar, once each time it starts, that the frame shown is not all there: its
+/// artwork took more than a frame's allowance of work, so the rest was left out (ADR 0128). A
+/// picture with parts missing and nothing said would read as lost work. Not asked while
+/// playing, where it would cost an evaluation every frame; the frame playback stops on is.
+fn note_left_out(app: &mut App) {
+    if app.playing {
+        return;
+    }
+    let cut = app.s.display_list().left_out;
+    if cut && !app.left_out_said {
+        app.status_err(tr!("Some artwork on this frame is left out: it holds more than AniCraft draws at once. Nothing is lost. Look for symbols nested many times over."));
+    }
+    app.left_out_said = cut;
+}
+
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     // View › Rulers along the top and the left (ADR 0076); the stage view in what is left.
     let (canvas, bars) = crate::rulers::layout(app, ui.max_rect());
@@ -237,6 +252,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     crate::camera_tool::on_tool_change(app);
     crate::shape_envelope::settle(app);
     crate::camera_tool::tick(app, ui.ctx(), now);
+    note_left_out(app);
     let canvas_was = std::mem::replace(&mut app.stage_cache.canvas, canvas);
     let laid_out = std::mem::replace(&mut app.stage_cache.laid_out, true);
     // While a colour picker popup is open the stage is its eyedropper (ADR 0109): a click
@@ -765,7 +781,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             Drag::BindMarquee { start, cur } => crate::bind_tool::drag_end(app, start, cur, shift, command),
             Drag::BindPaint { .. } => crate::bind_tool::paint_end(app),
             Drag::Pencil => crate::pathtools::commit_pencil(app, xf),
-            Drag::Brush => crate::brushtool::commit(app, xf),
+            Drag::Brush => crate::brushtool::commit(app, ui.ctx(), xf),
             Drag::Eraser => crate::erasertool::commit(app, xf),
             // Raw shapes merge where they landed, in the drag's step (ADR 0051).
             Drag::MultiMove { .. } | Drag::MultiTransform { .. } => crate::onion::drag_end(app),
@@ -820,7 +836,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 Tool::Brush if !panning => {
                     // A click paints a dab.
                     crate::brushtool::start(app, to_v(sp), pressure, now);
-                    crate::brushtool::commit(app, xf);
+                    crate::brushtool::commit(app, ui.ctx(), xf);
                 }
                 Tool::Eraser if !panning => {
                     if app.eraser.faucet {
@@ -1383,6 +1399,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     crate::widthtool::draw_overlay(app, &painter, xf, pointer.filter(|p| canvas.contains(*p)));
     crate::gradient_tool::draw_overlay(app, &painter, xf, pointer.filter(|p| canvas.contains(*p) && !panning));
     crate::shape_envelope::draw_overlay(app, &painter, xf, pointer.filter(|p| canvas.contains(*p) && !panning));
+    // Strokes on their way into the document (ADR 0129), under the one in hand.
+    crate::ink::draw(app, &painter, xf);
     crate::brushtool::draw_overlay(app, &painter, xf, pointer.filter(|p| canvas.contains(*p) && !panning && !paused));
     crate::erasertool::draw_overlay(app, &painter, xf, pointer.filter(|p| canvas.contains(*p) && !panning && !paused));
     // After this frame's edits, so a drag on the path shows where it is now.
@@ -2621,16 +2639,33 @@ fn exclude_overlying_artwork(fills: &mut Vec<Rect>, above: &[anicraft_engine::do
 
 /// Remove areas covered by `occluders` from a collection of rectangles.
 /// Each overlapping rectangle may produce up to four smaller rectangles.
+///
+/// Both lists are rows of runs, thousands of each for a long brush stroke, so a span is only
+/// compared with the occluders in its own rows: they are looked up by their top edge. Comparing
+/// every span with every occluder took seconds a frame on such a stroke (#519).
 fn subtract_spans(spans: &mut Vec<Rect>, occluders: &[Rect]) {
     let mut remaining = Vec::new();
     let mut pieces = Vec::new();
     let mut next = Vec::new();
+    // The occluders by top edge (their order among equals kept), and the tallest of them: one
+    // that reaches down into a span starts less than that above the span's top.
+    let mut by_top: Vec<usize> = (0..occluders.len()).collect();
+    let top_of = |i: usize| occluders.get(i).map_or(f32::INFINITY, |o| o.top());
+    by_top.sort_by(|&a, &b| top_of(a).total_cmp(&top_of(b)));
+    let tallest = occluders.iter().fold(0.0f32, |h, o| h.max(o.height()));
+    let mut rows: Vec<usize> = Vec::new();
 
     for span in spans.drain(..) {
         pieces.clear();
         pieces.push(span);
+        let from = by_top.partition_point(|&i| top_of(i) <= span.top() - tallest);
+        let to = by_top.partition_point(|&i| top_of(i) < span.bottom());
+        rows.clear();
+        rows.extend(by_top.get(from..to).unwrap_or(&[]));
+        // In the order they were given, so the pieces come out as they always did.
+        rows.sort_unstable();
 
-        for &occluder in occluders {
+        for &occluder in rows.iter().filter_map(|&i| occluders.get(i)) {
             // Skip occluders that cannot touch the original span.
             let overlap = span.intersect(occluder);
             if overlap.width() <= 0.0 || overlap.height() <= 0.0 {
@@ -2772,6 +2807,34 @@ mod pattern_tests {
             smooth: true,
             warp: None,
         }
+    }
+
+    /// #519: occluders are looked up by row instead of each being tried against every span.
+    /// What is left is the same as trying them all: every point of a span is kept exactly when
+    /// no occluder covers it, whatever the occluders' heights and order.
+    #[test]
+    fn spans_lose_exactly_what_the_occluders_in_their_rows_cover() {
+        // A fixed scatter: rows of runs, and occluders one row to many rows tall, unsorted.
+        let n = |i: u32, k: u32, m: u32| (i.wrapping_mul(2_654_435_761).wrapping_add(k.wrapping_mul(40_503)) >> 7) % m;
+        let spans: Vec<Rect> = (0..300).map(|i| Rect::from_min_size(pos2(n(i, 1, 180) as f32, (n(i, 2, 50) * 4) as f32), vec2(4.0 + n(i, 3, 40) as f32, 4.0))).collect();
+        let occluders: Vec<Rect> = (0..400).map(|i| Rect::from_min_size(pos2(n(i, 4, 190) as f32 + 0.5, n(i, 5, 200) as f32 + 0.25), vec2(1.0 + n(i, 6, 25) as f32, if i % 7 == 0 { 30.0 } else { 1.0 }))).collect();
+        let mut left = spans.clone();
+        subtract_spans(&mut left, &occluders);
+        let inside = |rects: &[Rect], p: Pos2| rects.iter().any(|r| r.contains(p));
+        let mut kept = 0;
+        for y in 0..420 {
+            for x in 0..460 {
+                let p = pos2(x as f32 * 0.5 + 0.13, y as f32 * 0.5 + 0.11);
+                let want = inside(&spans, p) && !inside(&occluders, p);
+                assert_eq!(inside(&left, p), want, "at {p:?}");
+                kept += usize::from(want);
+            }
+        }
+        assert!(kept > 1000, "the scatter leaves something to compare: {kept}");
+        // Nothing to take away leaves the spans as they were.
+        let mut same = spans.clone();
+        subtract_spans(&mut same, &[]);
+        assert_eq!(same, spans);
     }
 
     /// A thin opaque foreground shape must hide the selection
@@ -4622,15 +4685,17 @@ pub fn commit_text(app: &mut App) {
             let mut p = te.edit_params();
             p["x"] = json!(te.at.x);
             p["y"] = json!(te.at.y);
-            app.run("text.create", p);
+            if let Some(made) = app.run("text.create", p) {
+                app.text_note(&made);
+            }
         }
         Some(_) if te.text == te.original => {}
         Some(id) => {
             app.run("element.select", json!({"ids": [id.0]}));
             if te.text.trim().is_empty() {
                 app.run("edit.delete", json!({}));
-            } else {
-                app.run("text.edit", te.edit_params());
+            } else if let Some(edited) = app.run("text.edit", te.edit_params()) {
+                app.text_note(&edited);
             }
         }
     }
@@ -5349,6 +5414,70 @@ mod pointer_tests {
         assert_eq!(arrowheads, 2, "the curved arrow is drawn at the pointer");
         let (icon, arrowheads) = hover(&mut app, corner - vec2(40.0, 30.0), 1.3);
         assert_eq!((icon, arrowheads), (CursorIcon::Move, 0), "inside the box: move");
+    }
+
+    /// #117: a symbol instance that is skewed still answers Free Transform on the stage. Its
+    /// box is the slanted one its artwork has, the handles are on that box's corners, and a
+    /// drag from a corner scales it, one from just outside a corner turns it, and one on an
+    /// edge skews it further: each changes the instance, and each is one undo step.
+    #[test]
+    fn free_transform_handles_work_on_a_skewed_symbol() {
+        let (mut app, ctx, at) = scene();
+        app.run("edit.select_all", json!({}));
+        app.run("edit.delete", json!({}));
+        app.run("draw.rect", json!({"x": 300, "y": 200, "w": 200, "h": 100, "fill": "#3366ff", "stroke": null, "object": true}));
+        app.run("modify.convert_to_symbol", json!({"name": "Slanted"}));
+        // Slant it: the top slides right of the bottom.
+        app.run("modify.transform", json!({"a": 1, "b": 0, "c": -0.6, "d": 1, "e": 150, "f": 0}));
+        app.tool = Tool::Transform;
+        let mut t = 2.0;
+        let mut frame = |app: &mut App, events: Vec<Event>| {
+            t += 0.05;
+            run_frame(&ctx, app, t, events);
+        };
+        frame(&mut app, Vec::new());
+        let instance = |app: &App| app.s.selected_elements().first().map(|(_, e)| e.transform).expect("the instance is selected");
+        let box_of = |app: &App| crate::xform::frame(app).expect("a selection has a box");
+        let slanted = box_of(&app);
+        let [tl, tr, br, bl] = slanted.corners();
+        assert!((tl.x - bl.x).abs() > 30.0 && (tl.y - tr.y).abs() < 1.0, "the box slants with the instance: {tl:?} {tr:?} {br:?} {bl:?}");
+        let mut drag = |app: &mut App, from: Vec2, to: Vec2| {
+            let (a, b) = (at(from.x, from.y), at(to.x, to.y));
+            frame(app, vec![Event::PointerMoved(a)]);
+            frame(app, vec![button(a, true)]);
+            for i in 1..=5 {
+                frame(app, vec![Event::PointerMoved(a + (b - a) * (i as f32 / 5.0))]);
+            }
+            frame(app, vec![button(b, false)]);
+            frame(app, Vec::new());
+        };
+        let steps = |app: &App| app.s.history().undo_len();
+        // The bottom right corner, pulled away from the box: larger, and still as slanted.
+        let (before, undo) = (instance(&app).decompose(), steps(&app));
+        let out = (br - tl).normalized() * 60.0;
+        drag(&mut app, br, br + out);
+        let after = instance(&app).decompose();
+        assert!(after.sx > before.sx * 1.1 && after.sy > before.sy * 1.1, "scaled from the corner handle: {before:?} to {after:?}");
+        assert_eq!(steps(&app), undo + 1, "one undo step");
+        let now = box_of(&app);
+        assert!(now.corners()[0].distance(tl) < 1.0, "the opposite corner stays where it was");
+        // Just outside the top right corner: a turn.
+        let (before, undo) = (instance(&app).decompose(), steps(&app));
+        let [_, tr, _, _] = now.corners();
+        let outside = tr + (tr - now.handle(0, 0)).normalized() * (14.0 / app.view.zoom);
+        drag(&mut app, outside, outside + Vec2::new(40.0, 120.0));
+        let after = instance(&app).decompose();
+        assert!((after.rotation - before.rotation).abs().to_degrees() > 5.0, "turned from outside the corner: {before:?} to {after:?}");
+        assert_eq!(steps(&app), undo + 1);
+        // The top edge between its handles, slid along itself: more slant, the bottom edge kept.
+        let now = box_of(&app);
+        let (undo, bottom) = (steps(&app), now.handle(0, 1));
+        let on_edge = now.handle(-1, -1).lerp(now.handle(0, -1), 0.5);
+        let along = (now.handle(1, -1) - now.handle(-1, -1)).normalized() * 50.0;
+        drag(&mut app, on_edge, on_edge + along);
+        let skewed = box_of(&app);
+        assert!(skewed.handle(0, -1).distance(now.handle(0, -1)) > 20.0 && skewed.handle(0, 1).distance(bottom) < 1.0, "the top edge slid, the bottom stayed");
+        assert_eq!(steps(&app), undo + 1);
     }
 
     /// A double-click: press, release, `gap` seconds, press, release (each its own frame).

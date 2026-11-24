@@ -929,3 +929,36 @@ fn max_chars_and_restrict_limit_what_the_viewer_types() {
     assert_eq!(text_of(&type_into_name(&d, &s.state, "ok").state, 6).as_deref(), Some("ok"));
 }
 
+
+/// ADR 0128: a step looks at the movie many times (the instance tree after every change, a hit
+/// test for every pointer event), and all of it comes out of one allowance. Movie clips that
+/// double at each level, each over a thousand plain shapes, stop the step with a line in the
+/// Output panel instead of holding the window; the next step is bounded the same way.
+#[test]
+fn a_step_over_a_movie_too_large_to_look_at_stops_and_says_so() {
+    let mut d = crate::eval::tests::doubling_doc(31);
+    for sym in &mut d.library {
+        let sym = Arc::make_mut(sym);
+        sym.kind = SymbolKind::MovieClip;
+        let mut artwork = Layer::new(LayerId(7000), "artwork");
+        artwork.keyframes = vec![kf(0, 1, (0..1000).map(|i| rect(50_000 + i, 0.0, 0.0, 4.0, 4.0)).collect(), vec![], "")];
+        sym.timeline.layers.push(Arc::new(artwork));
+    }
+    let first = start(&d, &mut NoScripts);
+    assert!(first.output.iter().any(|l| l.contains("left out")), "{:?}", first.output);
+    let next = step(&d, &first.state, &[Event::Move(Vec2::new(1.0, 1.0)), Event::Down(Vec2::new(1.0, 1.0))], &mut NoScripts);
+    assert_eq!(next.output.iter().filter(|l| l.contains("left out")).count(), 1, "said once a step: {:?}", next.output);
+    // What draws the movie and its hit areas marks the same.
+    assert!(evaluate_player(&d, &next.state).left_out);
+    // Buttons instead: every button's hit area is a frame's worth of artwork, and the overlay
+    // shows them all from one allowance.
+    for sym in &mut d.library {
+        Arc::make_mut(sym).kind = SymbolKind::Button;
+    }
+    assert!(hit_overlay(&d, &PlayerState::default(), Rgba::WHITE, 0.4).left_out);
+    assert_eq!(hit(&d, &PlayerState::default(), Vec2::new(-500.0, -500.0)), None);
+    // An ordinary movie is not marked.
+    let small = sample::interactive();
+    let s = run(&small, 3);
+    assert!(!s.output.iter().any(|l| l.contains("left out")) && !evaluate_player(&small, &s.state).left_out);
+}

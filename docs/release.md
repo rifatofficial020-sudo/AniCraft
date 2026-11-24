@@ -8,7 +8,7 @@ commands, with migration on load (ADR 0003).
 | Version | Stage | Meaning |
 |---|---|---|
 | `0.1.0` | early alpha | M0 + M1 done: authoring core, Animate file import, GIF/PNG export, editable shortcuts. |
-| `0.2.0`, … | alpha | Further milestones from `docs/roadmap.md`. |
+| `0.2.0`, … | alpha | Further work from `docs/roadmap.md` (milestones up to M8, then the backlog). |
 
 The version lives in one place, `[workspace.package]` in `Cargo.toml`, and the stage in
 `RELEASE_STAGE` (`src/app.rs`). The About window, the CLI's `serve` handshake and the
@@ -19,10 +19,11 @@ and a `v<version>` tag, created when its draft release is published (below).
 
 * `main` is the development branch. It begins with one commit, "Initial commit v0.1.0 early
   alpha"; `AUTHORS.md` credits everyone whose work it contains.
-* Work happens on topic branches (`feat/svg-export`, `fix/…`, `docs/…`), with one roadmap step
+* Work happens on topic branches (`feat/svg-export`, `fix/…`, `docs/…`), with one roadmap item
   per pull request. A PR is ready when build, tests, clippy (`-D warnings`) and
   `cargo deny check licenses bans sources` pass, the screenshot check looks right, and
-  `docs/roadmap.md` › Honest status and `CHANGELOG.md` (Unreleased) are updated.
+  `docs/roadmap.md` › Honest status, the feature's row in `docs/parity.md` and `CHANGELOG.md`
+  (Unreleased) are updated.
 * PRs are merged into `main` on GitHub, and nobody commits or pushes to `main` directly (the
   hooks in `scripts/git-hooks` refuse it locally; branch protection should require PRs on the
   remote).

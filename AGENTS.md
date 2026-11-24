@@ -63,7 +63,7 @@ The key words MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are used as in RFC 2119
 ## This repository
 <!-- craft-agents:end -->
 
-AniCraft is an open-source, native, clean-room 2D animation studio (Adobe Animate class), written in Rust only (egui/eframe UI). The product name is written **AniCraft**; machine names are lowercase (`anicraft-*`). `docs/` has the design: ADRs in `docs/adr/`, UI guidelines, roadmap and status in `docs/roadmap.md`.
+AniCraft is an open-source, native, clean-room 2D animation studio (Adobe Animate class), written in Rust only (egui/eframe UI). The product name is written **AniCraft**; machine names are lowercase (`anicraft-*`). `docs/` has the design: ADRs in `docs/adr/`, UI guidelines, the prioritised backlog and status in `docs/roadmap.md` (a guideline, not a timeline: ADR 0125), and parity with the reference app in `docs/parity.md`.
 
 ## Workspace map
 

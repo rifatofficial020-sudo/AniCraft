@@ -71,8 +71,7 @@ pub fn apply_set(app: &mut App, edit: &FillEdit, selection: bool) {
 
 /// `#rrggbb`, or `#rrggbbaa` when not opaque.
 fn hex(c: Rgba) -> String {
-    let c = c.sanitized();
-    if c.a >= 1.0 { c.to_hex() } else { format!("{}{:02x}", c.to_hex(), (c.a * 255.0).round() as u8) }
+    c.to_hex_alpha()
 }
 
 fn stops_json(stops: &[GradientStop]) -> Value {

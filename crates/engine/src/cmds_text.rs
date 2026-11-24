@@ -302,21 +302,53 @@ fn rich_parts(d: &TextBlock) -> (Vec<anicraft_text::Run>, Vec<anicraft_text::Par
 
 /// The block with its outline from laid-out pieces and its runs' fonts the families actually
 /// used; with a note when a family asked for isn't installed.
-fn finish(mut d: TextBlock, pieces: Vec<(u32, Path)>, families: &[String], paints: &[(Rgba, String)]) -> (TextBlock, Option<String>) {
-    let mut note = None;
+fn finish(mut d: TextBlock, pieces: Vec<(u32, Path)>, used: Used, paints: &[(Rgba, String)]) -> (TextBlock, Option<String>) {
+    let mut notes: Vec<String> = Vec::new();
     let mut runs = d.styled_runs();
-    for (r, used) in runs.iter_mut().zip(families) {
+    for (r, used) in runs.iter_mut().zip(used.families) {
         let asked = r.style.font.trim();
-        if note.is_none() && !asked.is_empty() && !used.eq_ignore_ascii_case(asked) {
-            note = Some(format!("“{asked}” isn't installed on this computer; used {used}"));
+        if notes.is_empty() && !asked.is_empty() && !used.eq_ignore_ascii_case(asked) {
+            notes.push(format!("“{asked}” isn't installed on this computer; used {used}"));
         }
         r.style.font.clone_from(used);
     }
+    notes.extend(borrowed_note(used.fallbacks, used.missing));
+    let note = (!notes.is_empty()).then(|| notes.join("; "));
     let paras = d.paragraph_styles();
     d.set_styles(runs, paras);
     let pieces = pieces.into_iter().map(|(k, p)| paints.get(k as usize).map_or((d.color, String::new(), p.clone()), |(c, u)| (*c, u.clone(), p))).collect();
     d.set_outline(pieces);
     (d, note)
+}
+
+/// What a layout drew a block with: each run's family, the families that lent letters the
+/// runs' own faces lack, and how many characters no face has (ADR 0130).
+struct Used<'a> {
+    families: &'a [String],
+    fallbacks: &'a [String],
+    missing: usize,
+}
+
+/// What to tell the user when a block's fonts don't have all of its letters: which families
+/// the others were drawn from, and how many show as boxes because no installed font has them.
+/// The block keeps the font that was chosen, so nothing else says so.
+pub(crate) fn borrowed_note(fallbacks: &[String], missing: usize) -> Option<String> {
+    let mut notes = Vec::new();
+    match fallbacks {
+        [] => {}
+        [one] => notes.push(format!("letters the font doesn't have are drawn in {one}")),
+        [first, rest @ ..] => {
+            let shown: Vec<&str> = rest.iter().take(3).map(String::as_str).collect();
+            let more = if rest.len() > shown.len() { " and other fonts" } else { "" };
+            notes.push(format!("letters the font doesn't have are drawn in {first}, {}{more}", shown.join(", ")));
+        }
+    }
+    match missing {
+        0 => {}
+        1 => notes.push("1 character isn't in any installed font and shows as a box".to_string()),
+        n => notes.push(format!("{n} characters aren't in any installed font and show as boxes")),
+    }
+    (!notes.is_empty()).then(|| notes.join("; "))
 }
 
 fn layout_err(e: anicraft_text::TextError) -> EngineError {
@@ -346,7 +378,7 @@ pub(crate) fn lay_out_block(d: &TextBlock) -> Result<(TextBlock, Option<String>,
             d.box_height = set.height;
             d.on_path = Some(TextPath { path: set.path, offset, flip: on.flip });
             let shift = set.shift;
-            let (b, n) = finish(d, set.pieces, &l.families, &paints);
+            let (b, n) = finish(d, set.pieces, Used { families: &l.families, fallbacks: &l.fallbacks, missing: l.missing }, &paints);
             Ok((b, n, shift))
         }
         (Some(f), None) => {
@@ -355,14 +387,16 @@ pub(crate) fn lay_out_block(d: &TextBlock) -> Result<(TextBlock, Option<String>,
             let shown = f.shown(&d.text);
             let l = field_lay(fonts, &anicraft_text::RichText { text: &shown, runs: &runs, paragraphs: &paras, width: f.wrap_width(d.box_width) }, d.align, &f, d.box_width).map_err(layout_err)?;
             d.width = f.wrap_width(d.box_width);
-            let (b, n) = finish(d, l.pieces, &l.families, &paints);
+            let used = Used { families: &l.families, fallbacks: &l.fallbacks, missing: l.missing };
+            let (b, n) = finish(d, l.pieces, used, &paints);
             Ok((b, n, Vec2::ZERO))
         }
         (None, None) => {
             let l = fonts.layout_rich(&anicraft_text::RichText { text: &d.text, runs: &runs, paragraphs: &paras, width: d.width }, false).map_err(layout_err)?;
             d.box_width = l.width;
             d.box_height = l.height;
-            let (b, n) = finish(d, l.pieces, &l.families, &paints);
+            let used = Used { families: &l.families, fallbacks: &l.fallbacks, missing: l.missing };
+            let (b, n) = finish(d, l.pieces, used, &paints);
             Ok((b, n, Vec2::ZERO))
         }
     }
@@ -388,6 +422,10 @@ fn field_lay(fonts: &Fonts, rich: &anicraft_text::RichText, align: TextAlign, fi
         for line in &mut l.carets {
             for s in &mut line.stops {
                 s.1 += shift;
+            }
+            for b in &mut line.boxes {
+                b.x0 += shift;
+                b.x1 += shift;
             }
         }
         l.width += shift;

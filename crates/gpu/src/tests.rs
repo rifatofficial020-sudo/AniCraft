@@ -212,7 +212,7 @@ fn composited_scenes() -> Vec<(&'static str, DisplayList, View)> {
     let grad = || Paint::linear(Vec2::new(0.0, 0.0), Vec2::new(120.0, 40.0), stops(&[(0.0, red), (0.5, Rgba::new(1.0, 0.9, 0.3, 1.0)), (1.0, blue)]));
     let mut out = Vec::new();
     // A mask: a gradient seen through a circle, an unclipped shape over it, and one under it.
-    let dl = DisplayList { links: Vec::new(),
+    let dl = DisplayList { left_out: false, links: Vec::new(),
         clip_modes: Vec::new(),
         items: vec![item(Path::rect(70.0, 0.0, 50.0, 100.0), Paint::Solid(green)), clipped(item(Path::rect(0.0, 0.0, 120.0, 100.0), grad()), 0), mask(Path::ellipse(50.0, 50.0, 37.3, 33.1), 0), item(Path::rect(10.0, 60.0, 30.0, 30.0), Paint::Solid(blue))],
         clip_parents: vec![None],
@@ -235,10 +235,10 @@ fn composited_scenes() -> Vec<(&'static str, DisplayList, View)> {
     }
     let mut items = stripes;
     items.extend([eo, mask(Path::ellipse(95.0, 20.0, 30.0, 18.0), 0), star]);
-    out.push(("nested masks", DisplayList { links: Vec::new(), clip_modes: Vec::new(), items, clip_parents: vec![None, Some(0)], groups: Vec::new() }, view(130, 110, Some(Rgba::new(0.95, 0.95, 0.9, 1.0)))));
+    out.push(("nested masks", DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items, clip_parents: vec![None, Some(0)], groups: Vec::new() }, view(130, 110, Some(Rgba::new(0.95, 0.95, 0.9, 1.0)))));
     // Group alpha: overlapping shapes fade as one; nested groups multiply; a group spans tiles
     // and the render bands; a top-level shape between two groups.
-    let dl = DisplayList { links: Vec::new(),
+    let dl = DisplayList { left_out: false, links: Vec::new(),
         clip_modes: Vec::new(),
         items: vec![
             in_group(item(Path::rect(5.0, 5.0, 60.0, 50.0), Paint::Solid(red)), 0),
@@ -266,9 +266,9 @@ fn composited_scenes() -> Vec<(&'static str, DisplayList, View)> {
         items.push(in_group(item(Path::ellipse(x + 12.0, 30.0, 11.0, 28.0), grad()), g));
         items.push(in_group(item(Path::rect(x + 2.0, 60.0, 20.0, 30.0), Paint::Solid(Rgba::new(0.9, 0.5, 0.2, 0.7))), g));
     }
-    out.push(("blend modes", DisplayList { links: Vec::new(), clip_modes: Vec::new(), items, clip_parents: Vec::new(), groups }, view(14 * 24, 96, Some(Rgba::new(0.3, 0.3, 0.5, 0.8)))));
+    out.push(("blend modes", DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items, clip_parents: Vec::new(), groups }, view(14 * 24, 96, Some(Rgba::new(0.3, 0.3, 0.5, 0.8)))));
     // Masks inside groups and groups inside masks, with a blend mode, on transparent.
-    let dl = DisplayList { links: Vec::new(),
+    let dl = DisplayList { left_out: false, links: Vec::new(),
         clip_modes: Vec::new(),
         items: vec![
             in_group(clipped(item(Path::rect(0.0, 0.0, 100.0, 60.0), grad()), 0), 0),
@@ -284,7 +284,7 @@ fn composited_scenes() -> Vec<(&'static str, DisplayList, View)> {
     out.push(("masks and groups", dl, view(110, 90, None)));
     // Malformed links, as the oracle treats them: a clip whose parent is later (empty, hides
     // what it clips), a group whose parent is later (top-level), a clip index past the list.
-    let dl = DisplayList { links: Vec::new(),
+    let dl = DisplayList { left_out: false, links: Vec::new(),
         clip_modes: Vec::new(),
         items: vec![
             clipped(item(Path::rect(0.0, 0.0, 40.0, 40.0), Paint::Solid(red)), 0),
@@ -670,7 +670,7 @@ fn binning_shapes_the_scene_into_tiles() {
     assert!(b.index.iter().all(|&v| v == 0));
     // A group in one tile: open, the fill, close; a clipped fill: the clip's level first. In
     // the middle tile the mask has no artwork, so the clipped fill is left out there.
-    let dl = DisplayList { links: Vec::new(),
+    let dl = DisplayList { left_out: false, links: Vec::new(),
         clip_modes: Vec::new(),
         items: vec![
             in_group(item(Path::rect(1.0, 1.0, 4.0, 4.0), Paint::Solid(Rgba::BLACK)), 0),
@@ -699,7 +699,7 @@ fn binning_shapes_the_scene_into_tiles() {
 
 #[test]
 fn nesting_deeper_than_the_shader_holds_goes_to_the_cpu() {
-    let deep = |n: usize| DisplayList { links: Vec::new(),
+    let deep = |n: usize| DisplayList { left_out: false, links: Vec::new(),
         clip_modes: Vec::new(),
         items: vec![in_group(item(Path::rect(0.0, 0.0, 8.0, 8.0), Paint::Solid(Rgba::BLACK)), n as u32 - 1)],
         clip_parents: Vec::new(),
@@ -712,7 +712,7 @@ fn nesting_deeper_than_the_shader_holds_goes_to_the_cpu() {
     let masks = |n: usize| {
         let mut items: Vec<DisplayItem> = (0..n).map(|c| mask(Path::rect(0.0, 0.0, 8.0, 8.0), c as u32)).collect();
         items.push(clipped(item(Path::rect(0.0, 0.0, 8.0, 8.0), Paint::Solid(Rgba::BLACK)), n as u32 - 1));
-        DisplayList { links: Vec::new(), clip_modes: Vec::new(), items, clip_parents: (0..n).map(|i| i.checked_sub(1).map(|p| p as u32)).collect(), groups: Vec::new() }
+        DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items, clip_parents: (0..n).map(|i| i.checked_sub(1).map(|p| p as u32)).collect(), groups: Vec::new() }
     };
     assert!(bin(&masks(bn::MAX_CLIP_DEPTH)).is_ok());
     assert_eq!(bin(&masks(bn::MAX_CLIP_DEPTH + 1)).err(), Some(NeedsFull::Clips));
@@ -883,7 +883,7 @@ fn gpu_hands_back_what_it_does_not_draw_and_stays_usable() {
             .collect();
         let mut it = in_group(item(Path::rect(2.0, 2.0, 8.0, 8.0), Paint::Solid(Rgba::BLACK)), depth as u32 - 1);
         it.color = ColorTransform::alpha(0.5);
-        DisplayList { links: Vec::new(), clip_modes: Vec::new(), items: vec![it], clip_parents: Vec::new(), groups }
+        DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items: vec![it], clip_parents: Vec::new(), groups }
     };
     let deep = nested(MAX_FILTER_DEPTH + 1);
     assert!(matches!(g.render(&deep, &view(12, 12, None), Output::Premul8), Err(GpuError::NeedsFull(NeedsFull::Filters))));
@@ -994,7 +994,7 @@ fn bitmap_scenes() -> Vec<(&'static str, DisplayList, View)> {
     // Inside a mask and a faded group, over a gradient.
     let grad = item(Path::rect(0.0, 0.0, 80.0, 60.0), Paint::linear(Vec2::new(0.0, 0.0), Vec2::new(80.0, 60.0), stops(&[(0.0, Rgba::BLACK), (1.0, Rgba::new(1.0, 0.8, 0.0, 1.0))])));
     let inside = in_group(clipped(bitmap_item(Path::rect(4.0, 4.0, 72.0, 52.0), &a, true, turned), 0), 0);
-    let dl = DisplayList { links: Vec::new(), clip_modes: Vec::new(), items: vec![grad, inside, mask(Path::ellipse(40.0, 30.0, 30.0, 22.0), 0)], clip_parents: vec![None], groups: vec![group(None, 0.7, BlendMode::Multiply)] };
+    let dl = DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items: vec![grad, inside, mask(Path::ellipse(40.0, 30.0, 30.0, 22.0), 0)], clip_parents: vec![None], groups: vec![group(None, 0.7, BlendMode::Multiply)] };
     out.push(("bitmap masked and multiplied", dl, view(80, 60, white)));
     // Without smoothing (ADR 0050): the nearest pixel, magnified, turned and repeated.
     let mut hard = bitmap_item(Path::rect(2.0, 3.0, 90.0, 70.0), &a, false, turned);
@@ -1087,7 +1087,7 @@ fn gpu_matches_the_oracle_on_every_filter() {
     for (name, f) in filters_to_test() {
         let mut items = vec![backdrop.clone()];
         items.extend(symbol_items(0));
-        let dl = DisplayList { links: Vec::new(), clip_modes: Vec::new(), items, clip_parents: Vec::new(), groups: vec![filtered_group(vec![f])] };
+        let dl = DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items, clip_parents: Vec::new(), groups: vec![filtered_group(vec![f])] };
         // At 1:1; zoomed, so sizes scale; and panned so the layer reaches past the surface.
         for v in [view(70, 60, Some(Rgba::WHITE)), View { transform: Affine::scale(1.5, 1.5), width: 105, height: 90, background: None }, View { transform: Affine::translate(-20.0, -15.0), width: 40, height: 33, background: Some(Rgba::WHITE) }] {
             let d = assert_parity(g, name, &dl, &v);
@@ -1112,7 +1112,7 @@ fn gpu_matches_the_oracle_on_filtered_symbols_in_context() {
     (grp.alpha, grp.blend) = (0.7, BlendMode::Multiply);
     let mut items = vec![bg.clone()];
     items.extend(symbol_items(0));
-    scenes.push(("filters in a row, faded and multiplied", DisplayList { links: Vec::new(), clip_modes: Vec::new(), items, clip_parents: Vec::new(), groups: vec![grp] }));
+    scenes.push(("filters in a row, faded and multiplied", DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items, clip_parents: Vec::new(), groups: vec![grp] }));
     // A filtered symbol inside a filtered symbol, inside a faded one.
     let mut outer = filtered_group(vec![shadow.clone()]);
     outer.parent = Some(0);
@@ -1120,22 +1120,22 @@ fn gpu_matches_the_oracle_on_filtered_symbols_in_context() {
     inner.parent = Some(1);
     let mut items = vec![bg.clone(), in_group(item(Path::rect(4.0, 40.0, 30.0, 16.0), Paint::Solid(Rgba::new(0.9, 0.6, 0.0, 1.0))), 1)];
     items.extend(symbol_items(2));
-    scenes.push(("nested filtered symbols", DisplayList { links: Vec::new(), clip_modes: Vec::new(), items, clip_parents: Vec::new(), groups: vec![group(None, 0.8, BlendMode::Normal), outer, inner] }));
+    scenes.push(("nested filtered symbols", DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items, clip_parents: Vec::new(), groups: vec![group(None, 0.8, BlendMode::Normal), outer, inner] }));
     // Masked from outside (after filtering) and inside (before).
     let mut clipped_grp = filtered_group(vec![glow.clone()]);
     clipped_grp.clip = Some(0);
     let mut items = vec![bg.clone()];
     items.extend(symbol_items(0).into_iter().map(|i| clipped(i, 0)));
     items.push(mask(Path::ellipse(36.0, 30.0, 24.0, 20.0), 0));
-    scenes.push(("masked after filtering", DisplayList { links: Vec::new(), clip_modes: Vec::new(), items, clip_parents: vec![None], groups: vec![clipped_grp] }));
+    scenes.push(("masked after filtering", DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items, clip_parents: vec![None], groups: vec![clipped_grp] }));
     let mut items = vec![bg.clone()];
     items.extend(symbol_items(0).into_iter().map(|i| clipped(i, 0)));
     items.push(in_group(mask(Path::rect(20.0, 10.0, 16.0, 40.0), 0), 0));
-    scenes.push(("masked inside the symbol", DisplayList { links: Vec::new(), clip_modes: Vec::new(), items, clip_parents: vec![None], groups: vec![filtered_group(vec![shadow.clone()])] }));
+    scenes.push(("masked inside the symbol", DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items, clip_parents: vec![None], groups: vec![filtered_group(vec![shadow.clone()])] }));
     // A bitmap inside a filtered symbol.
     let px = pixels(9, 7, 4);
     let items = vec![bg.clone(), in_group(bitmap_item(Path::ellipse(40.0, 32.0, 26.0, 20.0), &px, true, Affine::scale(4.0, 4.0)), 0)];
-    scenes.push(("filtered bitmap", DisplayList { links: Vec::new(), clip_modes: Vec::new(), items, clip_parents: Vec::new(), groups: vec![filtered_group(vec![blur, glow])] }));
+    scenes.push(("filtered bitmap", DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items, clip_parents: Vec::new(), groups: vec![filtered_group(vec![blur, glow])] }));
     for (name, dl) in scenes {
         for v in [view(80, 64, white), View { transform: Affine::translate(-37.0, -5.0).mul(&Affine::scale(1.3, 1.3)), width: 48, height: 48, background: white }] {
             let d = assert_parity(g, name, &dl, &v);

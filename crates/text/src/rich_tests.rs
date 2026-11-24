@@ -179,3 +179,185 @@ fn hostile_runs_are_capped_and_sanitized() {
     }
     assert_eq!(f.layout_rich(&RichText { text: &"x".repeat(MAX_CHARS + 1), runs: &[], paragraphs: &[], width: None }, false), Err(TextError::TooLong));
 }
+
+// Mixed directions and fallback faces (ADR 0130), on fonts made in memory (`testfont`): every
+// letter is a box half an em wide, so at size 20 a letter is 10 pixels.
+
+use crate::testfont::{self, LETTER_HEIGHT, NOTDEF_HEIGHT};
+
+const LATIN: &str = "abcdefghijklmnopqrstuvwxyz0123456789 .-";
+/// Alef, bet, gimel, dalet, he.
+const HEBREW: &str = "\u{05D0}\u{05D1}\u{05D2}\u{05D3}\u{05D4} ";
+
+fn both() -> Fonts {
+    Fonts::from_faces([testfont::font("Test Both", &format!("{LATIN}{HEBREW}"), 500)])
+}
+
+fn set(f: &Fonts, family: &str, text: &str, width: Option<f32>) -> Layout {
+    let runs = [Run { chars: usize::MAX, style: RunStyle { family: family.into(), size: 20.0, ..RunStyle::default() } }];
+    f.layout_rich(&RichText { text, runs: &runs, paragraphs: &[], width }, true).unwrap()
+}
+
+/// The characters of the glyphs on line `row`, left to right.
+fn shown(l: &Layout, row: usize) -> Vec<u32> {
+    let baseline = l.carets[row].baseline;
+    let mut on: Vec<&PlacedGlyph> = l.glyphs.iter().filter(|g| g.baseline == baseline).collect();
+    on.sort_by(|a, b| a.x.total_cmp(&b.x));
+    on.iter().map(|g| g.index).collect()
+}
+
+/// How many of a layout's glyphs are "notdef" boxes.
+fn boxes(l: &Layout) -> usize {
+    let notdef = 20.0 * f32::from(NOTDEF_HEIGHT) / f32::from(testfont::EM);
+    let letter = 20.0 * f32::from(LETTER_HEIGHT) / f32::from(testfont::EM);
+    let tall = |g: &&PlacedGlyph| g.outline.bounds().height();
+    assert!(l.glyphs.iter().filter(|g| !g.outline.cmds.is_empty()).all(|g| (tall(&g) - notdef).abs() < 0.01 || (tall(&g) - letter).abs() < 0.01));
+    l.glyphs.iter().filter(|g| !g.outline.cmds.is_empty() && (tall(g) - notdef).abs() < 0.01).count()
+}
+
+#[test]
+fn a_right_to_left_word_in_left_to_right_text_reads_from_its_right() {
+    let f = both();
+    // a b _ alef bet gimel _ c d: the Hebrew word is displayed gimel, bet, alef.
+    let l = set(&f, "Test Both", "ab \u{05D0}\u{05D1}\u{05D2} cd", None);
+    assert_eq!(shown(&l, 0), vec![0, 1, 2, 5, 4, 3, 6, 7, 8]);
+    assert_eq!((l.width, l.missing, boxes(&l)), (90.0, 0, 0));
+    let c = &l.carets[0];
+    assert!(!c.rtl);
+    // The caret before alef is at the word's right end, after gimel at its left end.
+    assert_eq!((c.x_at(3), c.x_at(4), c.x_at(5), c.x_at(6)), (60.0, 50.0, 40.0, 60.0));
+    assert_eq!(c.boxes.len(), 9);
+    assert!(c.boxes.windows(2).all(|w| w[0].x1 == w[1].x0), "boxes run left to right without gaps");
+    // Text that reads one way is laid out as it always was.
+    let plain = set(&f, "Test Both", "ab cd", None);
+    assert_eq!(shown(&plain, 0), vec![0, 1, 2, 3, 4]);
+    assert_eq!(plain.carets[0].stops, vec![(0, 0.0), (1, 10.0), (2, 20.0), (3, 30.0), (4, 40.0), (5, 50.0)]);
+}
+
+/// From outside PR #39: a number inside right-to-left text keeps its digits in order, and a
+/// wrapped right-to-left paragraph starts with its first words.
+#[test]
+fn a_right_to_left_paragraph_runs_from_the_right_and_wraps_in_reading_order() {
+    let f = both();
+    // alef bet _ 1 2 _ gimel dalet, displayed: dalet gimel _ 1 2 _ bet alef.
+    let l = set(&f, "Test Both", "\u{05D0}\u{05D1} 12 \u{05D2}\u{05D3}", None);
+    assert_eq!(shown(&l, 0), vec![7, 6, 5, 3, 4, 2, 1, 0]);
+    let c = &l.carets[0];
+    assert!(c.rtl);
+    assert_eq!((c.x_at(0), c.x_at(8)), (l.width, 0.0), "the paragraph starts at its right end and ends at its left");
+    // Wrapped: the first line holds the first word, each line displayed right to left.
+    let w = set(&f, "Test Both", "\u{05D0}\u{05D1} \u{05D2}\u{05D3}", Some(25.0));
+    assert_eq!(w.lines, 2);
+    assert_eq!((shown(&w, 0), shown(&w, 1)), (vec![1, 0], vec![4, 3]));
+    assert_eq!((w.carets[0].start, w.carets[0].end, w.carets[1].start, w.carets[1].end), (0, 3, 3, 5));
+    // Each paragraph has its own direction.
+    let two = set(&f, "Test Both", "ab\n\u{05D0}\u{05D1}", None);
+    assert_eq!((two.carets[0].rtl, two.carets[1].rtl), (false, true));
+    assert_eq!(shown(&two, 1), vec![4, 3]);
+}
+
+#[test]
+fn styled_runs_keep_their_style_through_reordering() {
+    let f = both();
+    // The first run ends inside the Hebrew word: alef is its last letter.
+    let style = |paint| RunStyle { family: "Test Both".into(), size: 20.0, underline: paint == 2, paint, ..RunStyle::default() };
+    let runs = [Run { chars: 3, style: style(1) }, Run { chars: 2, style: style(2) }];
+    let l = f.layout_rich(&RichText { text: "ab\u{05D0}\u{05D1}\u{05D2}", runs: &runs, paragraphs: &[], width: None }, true).unwrap();
+    assert_eq!(shown(&l, 0), vec![0, 1, 4, 3, 2]);
+    let paint_at = |i: u32| l.glyphs.iter().find(|g| g.index == i).unwrap().paint;
+    assert_eq!([0, 1, 2, 3, 4].map(paint_at), [1, 1, 1, 2, 2]);
+    // The underline is under the second run's two letters, which are displayed first.
+    let piece = &l.pieces.iter().find(|p| p.0 == 2).unwrap().1;
+    let b = piece.bounds();
+    assert!(b.min.x >= 20.0 && b.max.x <= 40.0, "{b:?}");
+}
+
+/// From outside PR #40: letters the chosen face lacks come from a fallback face, the block
+/// keeps its family, and a character no face has is counted.
+#[test]
+fn letters_the_face_lacks_come_from_a_fallback_face() {
+    // A listed fallback family wins over another face that has the letters.
+    let f = Fonts::from_faces([testfont::font("Test Latin", LATIN, 500), testfont::font("Noto Sans Hebrew", HEBREW, 800), testfont::font("Aaa Hebrew", HEBREW, 600)]);
+    let l = set(&f, "Test Latin", "ab \u{05D0}\u{05D1}", None);
+    assert_eq!((l.missing, boxes(&l)), (0, 0));
+    assert_eq!((l.family.as_str(), l.families.clone(), l.fallbacks.clone()), ("Test Latin", vec!["Test Latin".to_string()], vec!["Noto Sans Hebrew".to_string()]));
+    assert_eq!(l.width, 30.0 + 32.0, "the Hebrew letters are as wide as the fallback face makes them");
+    assert_eq!(shown(&l, 0), vec![0, 1, 2, 4, 3]);
+    // The line is the chosen face's line, whatever the fallback's metrics are.
+    assert_eq!(l.line_height, set(&f, "Test Latin", "ab", None).line_height);
+    // No listed family: any installed face with the letter.
+    let wide = Fonts::from_faces([testfont::font("Test Latin", LATIN, 500), testfont::font("Zzz Hebrew", HEBREW, 600)]);
+    let l = set(&wide, "Test Latin", "ab \u{05D0}\u{05D1}", None);
+    assert_eq!((l.missing, l.fallbacks.clone(), l.width), (0, vec!["Zzz Hebrew".to_string()], 30.0 + 24.0));
+    // A character no face has is counted and drawn as the chosen face's box; invisible format
+    // characters are neither.
+    let none = set(&f, "Test Latin", "a\u{05E9}", None);
+    assert_eq!((none.missing, boxes(&none), none.fallbacks.len()), (1, 1, 0));
+    let hidden = set(&f, "Test Latin", "a\u{200D}b\u{200F}", None);
+    assert_eq!((hidden.missing, boxes(&hidden)), (0, 0));
+    // Text the face has all of asks no other face.
+    assert_eq!(set(&f, "Test Latin", "abc 123", None).fallbacks, Vec::<String>::new());
+}
+
+/// From outside PR #40: a mark its letter's face lacks takes the letter along to a face with
+/// both, so the two are shaped together.
+#[test]
+fn a_letter_goes_with_its_mark_to_the_fallback_face() {
+    let f = Fonts::from_faces([testfont::font("Test Latin", LATIN, 500), testfont::font("Noto Sans", "e\u{0301}", 800)]);
+    let l = set(&f, "Test Latin", "e\u{0301}x", None);
+    assert_eq!((l.missing, boxes(&l), l.fallbacks.clone()), (0, 0, vec!["Noto Sans".to_string()]));
+    let cluster: Vec<&PlacedGlyph> = l.glyphs.iter().filter(|g| g.index == 0).collect();
+    assert_eq!(cluster.len(), 2, "the letter and its mark are one cluster");
+    assert!(cluster.iter().any(|g| g.advance == 16.0), "the letter is the fallback face's");
+    assert_eq!(l.glyphs.iter().find(|g| g.index == 2).unwrap().advance, 10.0, "the next letter stays in its face");
+    // The caret doesn't stop between a letter and its mark.
+    assert_eq!(l.carets[0].stops.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0, 2, 3]);
+}
+
+#[test]
+fn hostile_directions_lay_out_without_panicking() {
+    let f = both();
+    let nested = format!("{}ab\u{05D0}{}", "\u{2067}".repeat(300), "\u{2069}".repeat(300));
+    let texts = ["\u{202E}abc\u{202C}", "\u{05D0}\n\n\u{05D1}\r\n", "a\u{2029}\u{05D0}", "\u{0301}\u{0301}", "\u{200F}", "\u{05D0} \u{05D1}  ", " \u{05D0}", "1\u{05D0}2\u{05D1}3", nested.as_str(), "\u{202B}ab\u{05D0}\n\u{202C}\u{05D1}cd"];
+    for text in texts {
+        for width in [None, Some(1.0), Some(35.0)] {
+            let l = set(&f, "Test Both", text, width);
+            assert!(l.width.is_finite() && l.height.is_finite());
+            assert!(l.glyphs.iter().all(|g| g.x.is_finite() && g.advance.is_finite()), "{text:?}");
+            assert_eq!(l.carets.len(), l.lines);
+            for c in &l.carets {
+                assert!(c.start <= c.end && !c.stops.is_empty() && c.stops.iter().all(|s| s.1.is_finite() && (c.start..=c.end).contains(&s.0)), "{text:?} {c:?}");
+                assert!(c.boxes.iter().all(|b| b.start < b.end && b.x0 <= b.x1), "{text:?} {c:?}");
+            }
+            // Every drawn character is on exactly one line.
+            let mut seen: Vec<u32> = l.carets.iter().flat_map(|c| c.boxes.iter().map(|b| b.start)).collect();
+            let n = seen.len();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(seen.len(), n, "{text:?}");
+        }
+    }
+}
+
+/// With this computer's fonts: Arabic letters join, a number inside them keeps its digits in
+/// order at the line's left, and a face without Arabic letters borrows them (outside PRs #39
+/// and #40). Skipped where no installed face has Arabic letters.
+#[test]
+fn arabic_with_a_number_reads_the_right_way_round_in_any_face() {
+    let Some(f) = fonts() else { return };
+    let l = f.layout_glyphs("\u{0645}\u{0631}\u{062D}\u{0628}\u{0627} 2026", &Style { size: 40.0, ..Style::default() }).unwrap();
+    if l.missing > 0 {
+        eprintln!("no face here has Arabic letters: skipped");
+        return;
+    }
+    let x_of = |i: u32| l.glyphs.iter().filter(|g| g.index == i).map(|g| g.x).fold(f32::INFINITY, f32::min);
+    assert!(x_of(6) < x_of(7) && x_of(7) < x_of(8) && x_of(8) < x_of(9), "the digits read left to right");
+    assert!(x_of(9) < x_of(4) && x_of(4) < x_of(0), "the number is left of the word, whose first letter is rightmost");
+    assert!(l.carets[0].rtl);
+    // Every family draws it: one without Arabic letters says which family lent them.
+    for family in f.families().iter().take(40) {
+        let Ok(in_family) = f.layout("\u{0628}\u{064A}\u{062A} ab", &Style { family: family.clone(), size: 40.0, ..Style::default() }) else { continue };
+        assert_eq!(in_family.family, *family);
+        assert_eq!(in_family.missing, 0, "{family}: the letters it lacks come from a fallback face");
+    }
+}

@@ -97,10 +97,20 @@ impl Rgba {
         let c = |v: f32| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
         Rgba::new(c(self.r), c(self.g), c(self.b), c(self.a))
     }
+    /// Always the opaque `#rrggbb`, alpha left out: what the SVG, HTML and Lottie writers and
+    /// the layer colours put where six digits are expected (they carry opacity themselves).
+    /// [`Rgba::to_hex_alpha`] is the form that reads back as the same colour.
     pub fn to_hex(self) -> String {
         let s = self.sanitized();
         let b = |v: f32| (v * 255.0).round() as u8;
         format!("#{:02x}{:02x}{:02x}", b(s.r), b(s.g), b(s.b))
+    }
+    /// `#rrggbb`, or `#rrggbbaa` when not opaque: [`Rgba::parse_hex`] reads it back as the
+    /// same colour, to the 8 bits a channel is written in.
+    pub fn to_hex_alpha(self) -> String {
+        let s = self.sanitized();
+        let a = (s.a * 255.0).round() as u8;
+        if a == u8::MAX { s.to_hex() } else { format!("{}{a:02x}", s.to_hex()) }
     }
     /// Parses `#rrggbb`, `rrggbb` or `#rrggbbaa`.
     pub fn parse_hex(s: &str) -> Option<Rgba> {
@@ -504,12 +514,15 @@ pub struct Shape {
 
 impl PartialEq for Shape {
     fn eq(&self, o: &Shape) -> bool {
-        arc_eq(&self.path, &o.path)
-            && self.fill == o.fill
-            && self.stroke == o.stroke
-            && self.fill_rule == o.fill_rule
-            && self.merge == o.merge
-            && match (&self.warp, &o.warp) {
+        // Every field is named here, so a new one cannot be left out: a field this missed
+        // would make an edit to it alone look like no change (no undo step, no redraw).
+        let Shape { path, fill, stroke, fill_rule, merge, warp } = self;
+        arc_eq(path, &o.path)
+            && *fill == o.fill
+            && *stroke == o.stroke
+            && *fill_rule == o.fill_rule
+            && *merge == o.merge
+            && match (warp, &o.warp) {
                 (Some(a), Some(b)) => arc_eq(a, b),
                 (None, None) => true,
                 _ => false,
@@ -1103,18 +1116,18 @@ impl Element {
     }
     /// Local-space bounds (control-point bounds for shapes, `None` for symbols).
     pub fn local_bounds(&self, doc: &Document) -> Rect {
-        element_bounds(doc, self, &Affine::IDENTITY, 0, &std::cell::Cell::new(MAX_EVAL_ELEMENTS))
+        element_bounds(doc, self, &Affine::IDENTITY, 0, &eval::Work::new(MAX_EVAL_ELEMENTS))
     }
     /// Bounds in the parent's space.
     pub fn bounds(&self, doc: &Document) -> Rect {
-        element_bounds(doc, self, &self.transform, 0, &std::cell::Cell::new(MAX_EVAL_ELEMENTS))
+        element_bounds(doc, self, &self.transform, 0, &eval::Work::new(MAX_EVAL_ELEMENTS))
     }
 }
 
-/// `work` is the query's allowance of element visits ([`MAX_EVAL_ELEMENTS`]): past it the rest
-/// adds nothing, as in evaluation.
-fn element_bounds(doc: &Document, el: &Element, xf: &Affine, depth: usize, work: &std::cell::Cell<u32>) -> Rect {
-    if depth > MAX_SYMBOL_DEPTH || !eval::spend(work) {
+/// `work` is the query's allowance ([`MAX_EVAL_ELEMENTS`]): past it the rest adds nothing, as in
+/// evaluation. A shape pays for the outline measured here, and a symbol for each of its layers.
+fn element_bounds(doc: &Document, el: &Element, xf: &Affine, depth: usize, work: &eval::Work) -> Rect {
+    if depth > MAX_SYMBOL_DEPTH || !work.visit(el) {
         return Rect::EMPTY;
     }
     match &el.kind {
@@ -1132,9 +1145,12 @@ fn element_bounds(doc: &Document, el: &Element, xf: &Affine, depth: usize, work:
             r
         }
         ElementKind::Symbol { symbol, .. } => {
-            let Some(sym) = doc.symbol(*symbol) else { return Rect::EMPTY };
+            let Some(sym) = work.symbol(doc, *symbol) else { return Rect::EMPTY };
             let mut r = Rect::EMPTY;
             for layer in &sym.timeline.layers {
+                if !work.spend(1) {
+                    return r;
+                }
                 if let Some(kf) = layer.keyframes.first() {
                     for child in &kf.elements {
                         let m = xf.mul(&child.transform);
@@ -1297,7 +1313,9 @@ pub struct Keyframe {
 
 impl PartialEq for Keyframe {
     fn eq(&self, o: &Keyframe) -> bool {
-        self.start == o.start && self.duration == o.duration && self.tween == o.tween && self.motion == o.motion && self.hints == o.hints && self.label == o.label && self.sound == o.sound && self.script == o.script && self.pose == o.pose && arcs_eq(&self.elements, &o.elements)
+        // Every field is named, so a new one cannot be left out (as in `Shape::eq`).
+        let Keyframe { start, duration, elements, tween, motion, hints, label, sound, script, pose } = self;
+        *start == o.start && *duration == o.duration && *tween == o.tween && *motion == o.motion && *hints == o.hints && *label == o.label && *sound == o.sound && *script == o.script && *pose == o.pose && arcs_eq(elements, &o.elements)
     }
 }
 
@@ -1489,30 +1507,32 @@ pub const MAX_LAYER_HEIGHT: u8 = 3;
 
 impl PartialEq for Layer {
     fn eq(&self, o: &Layer) -> bool {
-        self.id == o.id
-            && self.name == o.name
-            && self.kind == o.kind
-            && self.parent == o.parent
-            && self.visible == o.visible
-            && self.locked == o.locked
-            && self.outline == o.outline
-            && self.color == o.color
-            && self.onion == o.onion
-            && self.height_rows == o.height_rows
-            && self.depth.to_bits() == o.depth.to_bits()
-            && self.depth_keys == o.depth_keys
-            && self.attached == o.attached
-            && self.volume.to_bits() == o.volume.to_bits()
-            && self.muted == o.muted
-            && self.mask_mode == o.mask_mode
-            && self.opacity.to_bits() == o.opacity.to_bits()
-            && self.rig_parent == o.rig_parent
-            && self.video == o.video
-            && match (&self.armature, &o.armature) {
+        // Every field is named, so a new one cannot be left out (as in `Shape::eq`).
+        let Layer { id, name, kind, parent, visible, locked, outline, color, onion, height_rows, keyframes, depth, depth_keys, attached, volume, muted, armature, mask_mode, opacity, rig_parent, video } = self;
+        *id == o.id
+            && *name == o.name
+            && *kind == o.kind
+            && *parent == o.parent
+            && *visible == o.visible
+            && *locked == o.locked
+            && *outline == o.outline
+            && *color == o.color
+            && *onion == o.onion
+            && *height_rows == o.height_rows
+            && depth.to_bits() == o.depth.to_bits()
+            && *depth_keys == o.depth_keys
+            && *attached == o.attached
+            && volume.to_bits() == o.volume.to_bits()
+            && *muted == o.muted
+            && *mask_mode == o.mask_mode
+            && opacity.to_bits() == o.opacity.to_bits()
+            && *rig_parent == o.rig_parent
+            && *video == o.video
+            && match (armature, &o.armature) {
                 (Some(a), Some(b)) => arc_eq(a, b),
                 (a, b) => a.is_none() && b.is_none(),
             }
-            && arcs_eq(&self.keyframes, &o.keyframes)
+            && arcs_eq(keyframes, &o.keyframes)
     }
 }
 
@@ -1635,7 +1655,8 @@ pub struct Timeline {
 
 impl PartialEq for Timeline {
     fn eq(&self, o: &Timeline) -> bool {
-        arcs_eq(&self.layers, &o.layers)
+        let Timeline { layers } = self;
+        arcs_eq(layers, &o.layers)
     }
 }
 
@@ -2075,7 +2096,9 @@ static NO_TIMELINE: Timeline = Timeline { layers: Vec::new() };
 
 impl PartialEq for Document {
     fn eq(&self, o: &Document) -> bool {
-        self.stage == o.stage && self.next_id == o.next_id && self.document_class == o.document_class && arcs_eq(&self.scenes, &o.scenes) && arcs_eq(&self.library, &o.library) && arcs_eq(&self.bitmaps, &o.bitmaps) && arcs_eq(&self.sounds, &o.sounds) && arc_eq(&self.library_tree, &o.library_tree) && arc_eq(&self.publish, &o.publish) && arc_eq(&self.aids, &o.aids) && arc_eq(&self.swatches, &o.swatches) && arc_eq(&self.eases, &o.eases) && arc_eq(&self.data, &o.data)
+        // Every field is named, so a new one cannot be left out (as in `Shape::eq`).
+        let Document { stage, scenes, library, bitmaps, sounds, library_tree, document_class, publish, swatches, aids, eases, data, next_id } = self;
+        *stage == o.stage && *next_id == o.next_id && *document_class == o.document_class && arcs_eq(scenes, &o.scenes) && arcs_eq(library, &o.library) && arcs_eq(bitmaps, &o.bitmaps) && arcs_eq(sounds, &o.sounds) && arc_eq(library_tree, &o.library_tree) && arc_eq(publish, &o.publish) && arc_eq(aids, &o.aids) && arc_eq(swatches, &o.swatches) && arc_eq(eases, &o.eases) && arc_eq(data, &o.data)
     }
 }
 
@@ -2509,6 +2532,17 @@ mod tests {
         assert_eq!(LoopMode::PlayOnce.local_frame(7, 0, 5), 4);
         assert_eq!(LoopMode::SingleFrame.local_frame(7, 3, 5), 3);
         assert_eq!(LoopMode::Loop.local_frame(u32::MAX, u32::MAX, 0), 0);
+    }
+
+    #[test]
+    fn hex_roundtrip_keeps_alpha() {
+        let c = Rgba::parse_hex("#ff000080").unwrap();
+        assert_eq!(c.to_hex_alpha(), "#ff000080");
+        assert_eq!(Rgba::parse_hex(&c.to_hex_alpha()).unwrap(), c);
+        // Six digits where six are expected, whatever the alpha: the exporters' contract.
+        assert_eq!(c.to_hex(), "#ff0000");
+        // An alpha that rounds to opaque is written as opaque, so both forms agree.
+        assert_eq!(Rgba::new(1.0, 0.0, 0.0, 0.999).to_hex_alpha(), "#ff0000");
     }
 
     #[test]

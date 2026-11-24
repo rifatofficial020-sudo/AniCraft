@@ -35,6 +35,11 @@ use crate::{Affine, Path, PathCmd, Vec2, fit_curve, trace};
 pub const MAX_CELLS: usize = 4_000_000;
 /// Most samples one stroke may have.
 pub const MAX_SAMPLES: usize = 100_000;
+/// Most cells the stroke's pieces may visit between them while the distance field is sampled
+/// (each piece visits the cells of its own bounds). A stroke that would visit more is sampled on
+/// a coarser grid, so the time one stroke takes is bounded however long it is and however often
+/// it crosses itself (#519): a fast scribble of 60 000 samples visited 190 million cells.
+pub const MAX_STAMP_WORK: usize = 1 << 24;
 /// The tip's size at zero pressure, as a fraction of its full size.
 pub const MIN_PRESSURE_SIZE: f32 = 0.1;
 
@@ -442,14 +447,7 @@ pub fn outline_shaped(samples: &[Sample], tip: &Tip, shaping: &Shaping, smoothin
     let fine: f64 = if shaping.texture > 0.0 { f64::min(fine, 1.0 / 18.0) } else { fine };
     // In stage space the tip's narrow side is `round` radii across.
     let narrow = if turns { round } else { 1.0 };
-    let mut c: f64 = (fmin / 2.5).min(fine) * narrow;
-    for _ in 0..4 {
-        let cells = ((hi.0 - lo.0) / c + 2.0 * MARGIN + 2.0) * ((hi.1 - lo.1) / c + 2.0 * MARGIN + 2.0);
-        if cells <= MAX_CELLS as f64 {
-            break;
-        }
-        c *= (cells / MAX_CELLS as f64).sqrt() * 1.01;
-    }
+    let c = cell_size(&q, (lo, hi), (fmin / 2.5).min(fine) * narrow, narrow, dabbed);
     let origin = (lo.0 - MARGIN * c, lo.1 - MARGIN * c);
     let w = ((hi.0 - lo.0) / c + 2.0 * MARGIN).ceil() + 1.0;
     let h = ((hi.1 - lo.1) / c + 2.0 * MARGIN).ceil() + 1.0;
@@ -481,9 +479,16 @@ pub fn outline_shaped(samples: &[Sample], tip: &Tip, shaping: &Shaping, smoothin
         };
         let scale = if turn.is_some() { round } else { 1.0 };
         let (ta, tb) = (to_tip(a), to_tip(b));
+        let full = top as f32;
         for y in y0 as usize..=y1 as usize {
             let py = origin.1 + (y as f64 + 0.5) * c;
-            for x in x0 as usize..=x1 as usize {
+            let Some(row) = field.get_mut(y * w + x0 as usize..=y * w + x1 as usize) else { continue };
+            for (x, cell) in (x0 as usize..).zip(row) {
+                // Deep inside paint already: nothing can raise it (a stroke that goes over
+                // itself again and again costs a comparison here, not a distance).
+                if *cell >= full {
+                    continue;
+                }
                 let px = origin.0 + (x as f64 + 0.5) * c;
                 let tx = to_tip((px, py));
                 let d = match tip.shape {
@@ -491,9 +496,7 @@ pub fn outline_shaped(samples: &[Sample], tip: &Tip, shaping: &Shaping, smoothin
                     TipShape::Square => square_dist(tx, ta, ra, tb, rb),
                 } * scale;
                 let v = (0.5 - d / c).clamp(OUTSIDE, top) as f32;
-                if let Some(cell) = field.get_mut(y * w + x)
-                    && v > *cell
-                {
+                if v > *cell {
                     *cell = v;
                 }
             }
@@ -573,6 +576,46 @@ pub fn outline_shaped(samples: &[Sample], tip: &Tip, shaping: &Shaping, smoothin
     out
 }
 
+/// The grid's cell size for the stroke through `q` (bounds `lo..hi`): `wanted`, or as much
+/// larger as keeps the grid within [`MAX_CELLS`] and the sampling within [`MAX_STAMP_WORK`].
+fn cell_size(q: &[(P, f64, f64)], (lo, hi): (P, P), wanted: f64, narrow: f64, dabbed: bool) -> f64 {
+    let mut c = wanted;
+    for _ in 0..4 {
+        let cells = ((hi.0 - lo.0) / c + 2.0 * MARGIN + 2.0) * ((hi.1 - lo.1) / c + 2.0 * MARGIN + 2.0);
+        if cells <= MAX_CELLS as f64 {
+            break;
+        }
+        c *= (cells / MAX_CELLS as f64).sqrt() * 1.01;
+    }
+    for _ in 0..6 {
+        let work = stamp_work(&thin(q, c * 0.5), c, narrow, dabbed);
+        if work <= MAX_STAMP_WORK as f64 {
+            break;
+        }
+        c *= (work / MAX_STAMP_WORK as f64).sqrt().max(1.05);
+    }
+    c
+}
+
+/// About how many cells of size `c` the pieces of the stroke through `q` visit between them:
+/// each piece's own bounds, as the field is sampled (a long segment in pieces of [`PIECE`]).
+fn stamp_work(q: &[(P, f64, f64)], c: f64, narrow: f64, dabbed: bool) -> f64 {
+    let cells = |len: (f64, f64), r: f64| {
+        let reach = 2.0 * (r.max(c / narrow) + (MARGIN - 1.0) * c);
+        ((len.0 + reach) / c + 1.0) * ((len.1 + reach) / c + 1.0)
+    };
+    if dabbed || q.len() < 2 {
+        return q.iter().map(|(_, f, _)| cells((0.0, 0.0), *f)).sum();
+    }
+    q.windows(2)
+        .map(|pair| {
+            let &[(a, ra, _), (b, rb, _)] = pair else { return 0.0 };
+            let n = (dist(a, b) / PIECE.max(16.0 * c)).ceil().clamp(1.0, 1e6);
+            n * cells(((a.0 - b.0).abs() / n, (a.1 - b.1).abs() / n), ra.max(rb))
+        })
+        .sum()
+}
+
 /// Most loops one outline keeps (a fine paper grain on a long stroke opens many holes).
 pub const MAX_LOOPS: usize = 20_000;
 /// The paper grain's size, in tip radii.
@@ -630,7 +673,9 @@ fn v64(p: Vec2) -> P {
     (f64::from(p.x), f64::from(p.y))
 }
 fn dist(a: P, b: P) -> f64 {
-    (a.0 - b.0).hypot(a.1 - b.1)
+    // Not `hypot`: nothing here is near overflow, and this runs for every cell a piece visits.
+    let (x, y) = (a.0 - b.0, a.1 - b.1);
+    (x * x + y * y).sqrt()
 }
 fn lerp(a: P, b: P, t: f64) -> P {
     (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t)
@@ -689,7 +734,7 @@ fn thin(q: &[(P, f64, f64)], gap: f64) -> Vec<(P, f64, f64)> {
 /// to the segment) is the minimum.
 fn round_dist(x: P, a: P, ra: f64, b: P, rb: f64) -> f64 {
     let d = (b.0 - a.0, b.1 - a.1);
-    let l = d.0.hypot(d.1);
+    let l = (d.0 * d.0 + d.1 * d.1).sqrt();
     let dr = rb - ra;
     let ends = || (dist(x, a) - ra).min(dist(x, b) - rb);
     if l < 1e-12 || dr.abs() >= l {
@@ -766,6 +811,53 @@ mod tests {
         // two caps.
         let p = outline(&s, &Tip::round(size), 1.0, 0.35);
         assert!(p.anchors().len() <= 16, "{} anchors", p.anchors().len());
+    }
+
+    /// A fast scribble over a 1280 × 720 stage that crosses itself again and again, with the
+    /// pressure swelling and fading: `n` samples about 16 units apart.
+    fn scribble(n: usize) -> Vec<Sample> {
+        (0..n)
+            .map(|i| i as f32 * 0.06)
+            .map(|t| Sample::new(Vec2::new(640.0 + 420.0 * (t * 0.11).sin() + 170.0 * (t * 0.83).cos(), 360.0 + 200.0 * (t * 0.07).cos() + 130.0 * (t * 0.83).sin()), 0.55 + 0.45 * (t * 0.37).sin()))
+            .collect()
+    }
+
+    /// #519: the cells a stroke's pieces visit are bounded, however long the stroke is. A
+    /// scribble of 60 000 samples would visit several times the budget on the grid its size
+    /// asks for; the grid it gets keeps it inside, and the paint is still where the hand went.
+    #[test]
+    fn a_long_scribble_is_sampled_within_the_work_budget() {
+        let s = scribble(60_000);
+        let q: Vec<(P, f64, f64)> = centre_points(&s, 3.0, 0.08, &Shaping::default()).iter().map(|p| ((f64::from(p.at.x) / 5.0, f64::from(p.at.y) / 5.0), f64::from(p.f), 0.0)).collect();
+        let (lo, hi) = q.iter().fold(((f64::MAX, f64::MAX), (f64::MIN, f64::MIN)), |(lo, hi), (p, _, _)| ((lo.0.min(p.0), lo.1.min(p.1)), (hi.0.max(p.0), hi.1.max(p.1))));
+        let wanted = 0.04;
+        let grid_only = {
+            let cells = ((hi.0 - lo.0) / wanted + 8.0) * ((hi.1 - lo.1) / wanted + 8.0);
+            wanted * (cells / MAX_CELLS as f64).sqrt().max(1.0)
+        };
+        let unbounded = stamp_work(&thin(&q, grid_only * 0.5), grid_only, 1.0, false);
+        assert!(unbounded > 2.0 * MAX_STAMP_WORK as f64, "the scenario is past the budget without the bound: {unbounded}");
+        let c = cell_size(&q, (lo, hi), wanted, 1.0, false);
+        let work = stamp_work(&thin(&q, c * 0.5), c, 1.0, false);
+        assert!(work <= MAX_STAMP_WORK as f64 * 1.05, "{work}");
+        assert!(c > grid_only && c < 0.5, "coarser, but still well under the tip's radius: {c}");
+        // The outline it gives: paint under the hand at every sample, none far from all of them.
+        let p = outline(&s, &Tip::round(10.0), 3.0, 0.3);
+        assert!(s.iter().step_by(997).all(|x| p.contains(x.at, &Affine::IDENTITY, FillRule::EvenOdd)), "paint under the hand");
+        assert!(!p.contains(Vec2::new(20.0, 20.0), &Affine::IDENTITY, FillRule::EvenOdd), "and none in the corner it never reached");
+    }
+
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn long_stroke_cost() {
+        for n in [1500, 6000, 20_000, 60_000, 100_000] {
+            for (name, size) in [("size 10", 10.0), ("size 3", 3.0), ("size 60", 60.0)] {
+                let s = scribble(n);
+                let t = std::time::Instant::now();
+                let p = outline(&s, &Tip::round(size), 3.0, 0.3);
+                println!("{n:6} samples, {name}: {:7.1} ms, {} segments", t.elapsed().as_secs_f64() * 1000.0, p.cmds.len());
+            }
+        }
     }
 
     #[test]

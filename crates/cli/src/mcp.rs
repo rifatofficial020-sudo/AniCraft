@@ -211,11 +211,20 @@ pub fn call_tool_in<H: Host + ?Sized>(h: &mut H, name: &str, args: &Value, roots
             };
             let scale = scale.min(MAX_PICTURE_EDGE / largest);
             let movie_frame = s.doc.scene_start(s.scene).saturating_add(frame);
-            let png = anicraft_render::render_frame(&s.doc, movie_frame, scale).and_then(|p| p.encode_png()).map_err(|e| e.to_string())?;
+            // A frame cut short by its allowance of work is said to be (ADR 0128).
+            let cut = anicraft_engine::left_out::LeftOut::default();
+            let dl = cut.evaluate(&s.doc, movie_frame);
+            let png = anicraft_render::render(&dl, &anicraft_render::View::stage(&s.doc, scale)).and_then(|(p, _)| p.encode_png()).map_err(|e| e.to_string())?;
+            let mut caption = format!("Frame {frame} of scene {} at {:.0}% ({}×{} stage).", s.scene, scale * 100.0, stage.width, stage.height);
+            if cut.any() {
+                caption.push_str(" Not the whole frame: ");
+                caption.push_str(anicraft_engine::left_out::WARNING);
+                caption.push('.');
+            }
             json!({
                 "content": [
                     {"type": "image", "data": anicraft_doc::base64_encode(&png), "mimeType": "image/png"},
-                    {"type": "text", "text": format!("Frame {frame} of scene {} at {:.0}% ({}×{} stage).", s.scene, scale * 100.0, stage.width, stage.height)}
+                    {"type": "text", "text": caption}
                 ],
                 "isError": false
             })

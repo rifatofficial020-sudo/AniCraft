@@ -8,14 +8,22 @@
 //! [`Fonts::layout_glyphs`] also hands back each glyph on its own ([`PlacedGlyph`]), for text
 //! placed glyph by glyph: along a path ([`on_path`], ADR 0070) or at SVG's per-character
 //! positions.
+//!
+//! Text that mixes directions (Hebrew or Arabic with Latin words and numbers) follows the
+//! Unicode bidi algorithm, and letters a run's face lacks come from a fallback face (ADR 0130).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use anicraft_geom::{Path, PathCmd, Vec2};
 use std::sync::{Arc, OnceLock};
 
 mod embed;
+mod fallback;
+mod lines;
 mod rich;
+#[cfg(test)]
+mod testfont;
 pub use embed::{EMBED_EM, Embedding, GlyphTable, MAX_EMBED_CHARS, TableGlyph};
+pub use fallback::{FALLBACK_FAMILIES, MAX_FALLBACK_FACES, needs_glyph};
 pub use rich::{MAX_FACES, MAX_RUNS, ParaStyle, RichText, Run, RunStyle, Shift, sanitize_para, sanitize_run};
 
 /// Families tried, in order, when none is asked for or the one asked for isn't installed.
@@ -72,7 +80,8 @@ pub struct Layout {
     pub height: f32,
     /// The family actually used (the one asked for, or the fallback).
     pub family: String,
-    /// Characters the font has no glyph for (drawn as its "notdef" box).
+    /// Characters no face has a glyph for, neither the run's own nor a fallback (drawn as the
+    /// run's face's "notdef" box).
     pub missing: usize,
     /// Lines laid out (at least one), and the distance between their baselines (pixels): a
     /// line that continued the block would start `lines × line_height` below its top.
@@ -92,6 +101,9 @@ pub struct Layout {
     pub pieces: Vec<(u32, Path)>,
     /// The family each run was laid out in (the one asked for, or the fallback).
     pub families: Vec<String>,
+    /// The other families letters were drawn from, because their run's face lacks them, in
+    /// the order they were first needed (ADR 0130).
+    pub fallbacks: Vec<String>,
 }
 
 /// One laid-out glyph on its own.
@@ -352,6 +364,19 @@ fn first_subpath_closed(path: &Path) -> bool {
     false
 }
 
+/// Where one cluster (a letter with its marks, or a ligature) stands on its line (ADR 0130).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CaretBox {
+    /// The characters it covers: from `start` up to `end`.
+    pub start: u32,
+    pub end: u32,
+    /// Its left and right edges.
+    pub x0: f32,
+    pub x1: f32,
+    /// It reads right to left: `start` is at its right edge.
+    pub rtl: bool,
+}
+
 /// One laid-out line's characters and caret positions. Indices count `char`s of the whole text
 /// (line breaks included); `x` is from the box's left edge, alignment applied.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -360,8 +385,15 @@ pub struct CaretLine {
     /// trailing spaces belong to it; a line break belongs to neither line).
     pub start: u32,
     pub end: u32,
-    /// `(index, x)` of the boundaries glyphs start at and of the line's end, ascending.
+    /// `(index, x)` of the boundaries clusters start at and of the line's end, ascending by
+    /// index. A cluster's boundary is at the edge it is read from, so in text that mixes
+    /// directions `x` does not rise with the index.
     pub stops: Vec<(u32, f32)>,
+    /// The paragraph reads right to left: the line starts at its right end.
+    pub rtl: bool,
+    /// The line's clusters as they are displayed, left to right (trailing spaces left out):
+    /// what a selection highlights, and the order a caret moves in.
+    pub boxes: Vec<CaretBox>,
     /// The line's top and height (to the next line's top, its line spacing included) and its
     /// baseline, from the box's top (pixels).
     pub top: f32,
@@ -434,7 +466,16 @@ impl std::error::Error for TextError {}
 pub struct Fonts {
     db: fontdb::Database,
     families: Vec<String>,
+    /// Which face, if any, has each character the fallback list didn't (`Fonts::any_face_with`).
+    wide: Remembered<char, Option<fontdb::ID>>,
+    /// The fallback families' faces by weight and slant (`Fonts::fallback_list`), found once.
+    lists: Remembered<(bool, bool), Arc<[fontdb::ID]>>,
+    /// Whether a face has a character, for the letters fallback asked about (`Fonts::covers`).
+    covered: Remembered<(fontdb::ID, char), bool>,
 }
+
+/// Answers about the fonts that are worked out once and kept (ADR 0130).
+type Remembered<K, V> = std::sync::Mutex<std::collections::HashMap<K, V>>;
 
 static FONTS: OnceLock<Fonts> = OnceLock::new();
 static EXTRA: OnceLock<Vec<Arc<[u8]>>> = OnceLock::new();
@@ -470,7 +511,7 @@ impl Fonts {
         let mut families: Vec<String> = db.faces().filter_map(|f| f.families.first().map(|(n, _)| n.clone())).filter(|n| !n.starts_with('.')).collect();
         families.sort_by_key(|f| f.to_lowercase());
         families.dedup();
-        Fonts { db, families }
+        Fonts { db, families, wide: Remembered::default(), lists: Remembered::default(), covered: Remembered::default() }
     }
 
     /// A library of just these faces (tests, and documents carrying their own fonts).

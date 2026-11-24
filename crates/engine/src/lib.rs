@@ -7,6 +7,7 @@
 
 pub mod access;
 mod anim;
+pub mod left_out;
 mod cmds_actions;
 mod cmds_bone;
 mod cmds_warp;
@@ -460,6 +461,9 @@ pub struct Session {
     /// An import the editor prepared on another thread (ADR 0116): `file.import_video` asked
     /// for the same thing takes it instead of decoding again. Never in the document.
     pub staged_video: Option<video::Prepared>,
+    /// A Brush stroke's outline the editor traced on another thread (ADR 0129): `draw.brush`
+    /// asked for the same stroke takes it instead of tracing again. Never in the document.
+    pub staged_stroke: Option<cmds_brush::PreparedStroke>,
     /// Files this session's publishes wrote: publishing again replaces them without asking.
     pub published: std::collections::BTreeSet<PathBuf>,
     /// The files opened and saved last, and pinned favourites (ADR 0059). They belong to the
@@ -598,6 +602,7 @@ impl Session {
             picture_cache: RefCell::new(None),
             job: None,
             staged_video: None,
+            staged_stroke: None,
             published: std::collections::BTreeSet::new(),
             recent: cmds_recent::RecentFiles::default(),
             brushes: brush_library::BrushLibrary::default(),
@@ -1305,8 +1310,11 @@ impl Session {
             })
             .collect();
         let symbols: Vec<Value> = self.doc.library.iter().map(|s| json!({"id": s.id.0, "name": s.name, "kind": format!("{:?}", s.kind), "frames": s.timeline.frame_count()})).collect();
+        // The frame shown, when its artwork is not all there (ADR 0128).
+        let cut = left_out::LeftOut::default();
+        cut.note(&self.display_list());
         let sounds: Vec<Value> = self.doc.sounds.iter().map(|x| json!({"id": x.id.0, "name": x.name, "format": x.format.label(), "rate": x.rate, "channels": x.channels, "seconds": x.seconds()})).collect();
-        json!({
+        cut.noted(json!({
             "stage": {"width": self.doc.stage.width, "height": self.doc.stage.height, "fps": self.doc.stage.fps, "background": self.doc.stage.background.to_hex()},
             "frames": self.frame_count(),
             "frame": self.frame,
@@ -1325,7 +1333,7 @@ impl Session {
             "dirty": self.is_dirty(),
             "history": {"undo": self.history.undo_len(), "redo": self.history.redo_len(), "bytes": self.history.bytes(), "evicted": self.history.evicted},
             "state": self.state,
-        })
+        }))
     }
 }
 

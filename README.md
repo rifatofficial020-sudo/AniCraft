@@ -197,7 +197,7 @@ The details, including the server entry for other MCP clients, are in [`docs/mcp
 > **Early alpha: not yet for production animation work.** The core document model, vector renderer,
 > egui shell, classic and shape tweens, and the first XFL and SVG imports work; much is still to come.
 
-[**docs/roadmap.md**](docs/roadmap.md) has the honest status by dimension, milestones M0–M8 and what's next.
+[**docs/roadmap.md**](docs/roadmap.md) has the prioritised backlog, where every open pull request fits, and the honest status by dimension; [**docs/parity.md**](docs/parity.md) compares AniCraft with the reference app feature by feature.
 
 **What's missing:** ActionScript beyond the timeline subset (frame scripts are kept, and those
 that control the timeline run; ADR 0013), and motion tweens from XFL.

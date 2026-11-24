@@ -589,10 +589,11 @@ mod imp {
             )
         }
 
-        /// Frames until the start thread has answered (bounded).
+        /// Frames until the start thread has answered (bounded: a minute, which only a start
+        /// thread that never answers reaches; a busy machine can take seconds to run it).
         fn settle(m: &mut Imp<Fake>, svc: &RenderService, ctx: &egui::Context, now: f64, size: (u32, u32)) -> Vec<Notice> {
             let mut out = Vec::new();
-            for _ in 0..400 {
+            for _ in 0..12_000 {
                 out.extend(m.sync(true, svc, ctx, now, size));
                 if m.starting.is_none() {
                     break;

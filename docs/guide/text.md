@@ -82,9 +82,27 @@ font and tells you, so nothing changes behind your back.
 
 ### Missing characters
 
-If a font doesn't have a character you type (an emoji, or a letter from another script), the
-character shows as an empty box. AniCraft doesn't borrow it from another font yet, so pick a font
-that covers your language.
+If your font doesn't have a character you type (a letter from another script, or a symbol),
+AniCraft draws that character with another font on your computer that has it, and tells you
+which one. The rest of the block stays in your font, and the lines keep their height. For the
+best look, pick a font that covers your language.
+
+A character that no font on your computer has shows as an empty box, and AniCraft tells you how
+many there are.
+
+### Hebrew, Arabic and other right-to-left text
+
+Right-to-left text reads the right way round, also when it is mixed with Latin words and
+numbers: a paragraph that starts with a right-to-left letter runs from the right, a number
+inside it keeps its digits in order, and a wrapped paragraph starts with its first words. Arabic
+letters join as they should. This is the same for static text, text on a path and text fields,
+and in every export.
+
+* A paragraph is still aligned as its alignment says. For a right-to-left paragraph, choose
+  **Align Right**.
+* The box you type in over the stage shows the letters in the order you typed them; the text on
+  the stage shows them as they read.
+* In a text field in Test Movie, **Left** and **Right** move the caret the way they point.
 
 ## Static, dynamic and input text
 

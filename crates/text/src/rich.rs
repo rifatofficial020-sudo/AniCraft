@@ -4,14 +4,23 @@
 //! glyphs come out grouped by the run's `paint` (the caller's colour and link), so a block with
 //! several colours draws as one filled path per colour.
 //!
+//! Text that mixes directions (ADR 0130): a run is shaped in stretches of one direction and one
+//! script, lines are found in reading order and each is then put in the order it is displayed
+//! ([`crate::lines`]); a cluster its run's face has no glyph for is shaped again in a fallback
+//! face ([`crate::fallback`]).
+//!
 //! One run in one paragraph lays out exactly as [`crate::Fonts::layout`] always has: the same
 //! outline, box, lines and carets.
 
-use crate::{Align, CaretLine, Fonts, Layout, MAX_CHARS, Pen, PlacedGlyph, TextError};
+use crate::fallback::{Coverage, MAX_FALLBACK_FACES, MAX_WIDE_SEARCHES, needs_glyph, pick_face};
+use crate::lines::{Cluster, Scripts, break_lines, place, stops};
+use crate::{Align, CaretBox, CaretLine, Fonts, Layout, MAX_CHARS, Pen, PlacedGlyph, TextError};
 use anicraft_geom::{Path, PathCmd, Vec2};
+use craft_text::bidi;
 use skrifa::MetadataProvider as _;
 use skrifa::raw::TableProvider as _;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// Most runs laid out in one block; more are joined into the last.
@@ -123,43 +132,188 @@ struct RunMetrics {
 }
 
 /// One shaped glyph, ready to place.
+#[derive(Clone)]
 struct Shaped {
     outline: Option<Arc<Path>>,
-    /// Character it starts at (of the whole text).
+    /// The character its cluster starts at (of the whole text).
     index: u32,
     run: u32,
     x_offset: f32,
     y_offset: f32,
     advance: f32,
-    space: bool,
+    /// Its face has no glyph for it: this is the face's "notdef" box.
+    notdef: bool,
 }
 
-/// A stretch of one paragraph in one run: what is shaped on its own.
+/// A stretch of one paragraph in one run, one direction and one script: what is shaped on its
+/// own.
 struct Segment {
+    para: usize,
     run: usize,
-    /// Byte range in the text, and the character its start is.
+    /// Its bytes and its characters in the text (from the first, up to the second).
     bytes: (usize, usize),
-    first_char: u32,
+    chars: (u32, u32),
+    /// Its embedding level: odd reads right to left.
+    level: u8,
+    script: Option<harfrust::Script>,
 }
 
 /// A laid-out line: its paragraph, whether it is the paragraph's first, its width, its glyphs
-/// with their pen x (from the line's start).
+/// in the order they are displayed with their pen x (from the line's left end), and where its
+/// clusters stand.
 struct Line {
     para: usize,
     first: bool,
     width: f32,
     glyphs: Vec<(Shaped, f32)>,
+    rtl: bool,
+    boxes: Vec<CaretBox>,
 }
 
-/// One paragraph: its first character, its length in characters, and its byte range (without
-/// a trailing `\r`).
+/// One paragraph: its first character, its length in characters, its byte range (without a
+/// trailing `\r`) and its embedding level (odd: it reads right to left).
 struct Para {
     start: u32,
     len: u32,
     bytes: (usize, usize),
+    level: u8,
+}
+
+/// A face ready to shape with.
+struct Face<'a> {
+    font: skrifa::FontRef<'a>,
+    shaper: harfrust::Shaper<'a>,
+    outlines: skrifa::outline::OutlineGlyphCollection<'a>,
+    /// Outlines drawn so far, by glyph and size.
+    cache: HashMap<(u32, u32), Option<Arc<Path>>>,
+}
+
+/// A stretch of text to shape in one face.
+struct Job<'t> {
+    text: &'t str,
+    /// Its paragraph's bytes (the letters around the stretch are its context) and its own.
+    para: (usize, usize),
+    bytes: (usize, usize),
+    first_char: u32,
+    run: u32,
+    rtl: bool,
+    script: Option<harfrust::Script>,
+    /// The size its glyphs are drawn at, and the extra space after each cluster (pixels).
+    size: f32,
+    letter_spacing: f32,
+}
+
+/// A cluster (or several in a row) its run's face has no glyph for, to shape in a fallback
+/// face: its segment, the glyphs it replaces there, its characters and the fallback face.
+struct Hole {
+    seg: usize,
+    glyphs: Range<usize>,
+    chars: (u32, u32),
+    face: usize,
+}
+
+/// Shapes a stretch of text. Glyphs come back in the order they are displayed (left to right),
+/// as the shaper gives them, each with the character its cluster starts at.
+fn shape(face: &mut Face<'_>, job: &Job<'_>) -> Vec<Shaped> {
+    let Some(piece) = job.text.get(job.bytes.0..job.bytes.1) else { return Vec::new() };
+    let mut to_char = vec![0u32; piece.len() + 1];
+    let mut n = 0u32;
+    for (b, _) in piece.char_indices() {
+        if let Some(slot) = to_char.get_mut(b) {
+            *slot = n;
+        }
+        n += 1;
+    }
+    if let Some(last) = to_char.last_mut() {
+        *last = n;
+    }
+    let size = skrifa::instance::Size::new(job.size);
+    let upem = f32::from(skrifa::MetadataProvider::metrics(&face.font, size, skrifa::instance::LocationRef::default()).units_per_em.max(1));
+    let scale = job.size / upem;
+    let mut buffer = harfrust::UnicodeBuffer::new();
+    buffer.push_str(piece);
+    // The letters around it in its paragraph: Arabic letters join across a change of style or
+    // face as they do inside one.
+    if let Some(before) = job.text.get(job.para.0..job.bytes.0) {
+        buffer.set_pre_context(before);
+    }
+    if let Some(after) = job.text.get(job.bytes.1..job.para.1) {
+        buffer.set_post_context(after);
+    }
+    buffer.set_direction(if job.rtl { harfrust::Direction::RightToLeft } else { harfrust::Direction::LeftToRight });
+    if let Some(script) = job.script {
+        buffer.set_script(script);
+    }
+    buffer.guess_segment_properties();
+    let out = face.shaper.shape(buffer, harfrust::ShapeOptions::new());
+    let mut list: Vec<Shaped> = Vec::with_capacity(out.glyph_infos().len());
+    for (info, pos) in out.glyph_infos().iter().zip(out.glyph_positions()) {
+        let local = to_char.get(info.cluster as usize).copied().unwrap_or(n).min(n);
+        let outlines = &face.outlines;
+        let outline = face
+            .cache
+            .entry((info.glyph_id, job.size.to_bits()))
+            .or_insert_with(|| {
+                let g = outlines.get(skrifa::GlyphId::new(info.glyph_id))?;
+                let mut p = Path::new();
+                let settings = skrifa::outline::DrawSettings::unhinted(size, skrifa::instance::LocationRef::default());
+                let mut pen = Pen { cmds: &mut p.cmds, x: 0.0, y: 0.0 };
+                let _ = g.draw(settings, &mut pen);
+                Some(Arc::new(p))
+            })
+            .clone();
+        list.push(Shaped { outline, index: job.first_char + local, run: job.run, x_offset: pos.x_offset as f32 * scale, y_offset: pos.y_offset as f32 * scale, advance: pos.x_advance as f32 * scale, notdef: info.glyph_id == 0 });
+    }
+    // Letter spacing follows each cluster, not each glyph: a letter's marks stay on it.
+    let mut i = 0;
+    while let Some(index) = list.get(i).map(|g| g.index) {
+        if list.get(i + 1).is_none_or(|next| next.index != index)
+            && let Some(g) = list.get_mut(i)
+        {
+            g.advance += job.letter_spacing;
+        }
+        i += 1;
+    }
+    list
+}
+
+/// The clusters of one segment's glyphs, in reading order: each one's glyphs (a range of
+/// `glyphs`) and its characters, from its first up to the next cluster's (`end` for the last).
+fn clusters_of(glyphs: &[Shaped], end: u32) -> Vec<(Range<usize>, u32, u32)> {
+    let mut out: Vec<(Range<usize>, u32, u32)> = Vec::new();
+    let mut i = 0;
+    while let Some(g) = glyphs.get(i) {
+        let mut j = i + 1;
+        while glyphs.get(j).is_some_and(|next| next.index == g.index) {
+            j += 1;
+        }
+        out.push((i..j, g.index, end));
+        i = j;
+    }
+    // Right-to-left glyphs come last character first.
+    out.sort_by_key(|c| c.1);
+    for k in 1..out.len() {
+        let next = out.get(k).map(|c| c.1);
+        if let (Some(c), Some(next)) = (out.get_mut(k - 1), next) {
+            c.2 = next;
+        }
+    }
+    out
 }
 
 impl Fonts {
+    /// Opens face `id` to shape with it.
+    fn with_face<R>(&self, id: fontdb::ID, f: impl FnOnce(&mut Face<'_>) -> R) -> Option<R> {
+        self.db
+            .with_face_data(id, |data, index| {
+                let font = skrifa::FontRef::from_index(data, index).ok()?;
+                let shaper_data = harfrust::ShaperData::new(&font);
+                let mut face = Face { shaper: shaper_data.shaper(&font).build(), outlines: font.outline_glyphs(), font, cache: HashMap::new() };
+                Some(f(&mut face))
+            })
+            .flatten()
+    }
+
     /// Lays styled text out ([`RichText`]). `glyphs` also hands back each glyph on its own.
     pub fn layout_rich(&self, rich: &RichText, glyphs: bool) -> Result<Layout, TextError> {
         let text = rich.text;
@@ -212,6 +366,8 @@ impl Fonts {
             families.push(faces.get(face).map_or(family, |f| f.1.clone()));
         }
         let chars: Vec<char> = text.chars().collect();
+        // Embedding levels (UAX #9), when anything in the text reads right to left.
+        let levels = Some(text).filter(|t| !t.is_ascii()).map(|t| bidi::Paragraph::new(t, bidi::Direction::Auto)).filter(bidi::Paragraph::needs_reordering);
 
         // Paragraphs at line breaks.
         let mut paras: Vec<Para> = Vec::new();
@@ -219,18 +375,25 @@ impl Fonts {
         for raw in text.split('\n') {
             let body = raw.strip_suffix('\r').unwrap_or(raw);
             let len = body.chars().count() as u32;
-            paras.push(Para { start: ch, len, bytes: (byte, byte + body.len()) });
+            let level = levels.as_ref().map_or(0, |l| l.paragraph_level_at(byte));
+            paras.push(Para { start: ch, len, bytes: (byte, byte + body.len()), level });
             byte += raw.len() + 1;
             ch += raw.chars().count() as u32 + 1;
         }
         // Byte offset of every character (and of the end).
         let mut byte_of: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
         byte_of.push(text.len());
-        // Segments: each paragraph cut at run boundaries (both in order: one pass over each).
-        let mut segs: Vec<(usize, Segment)> = Vec::new();
+        let byte_at = |c: u32| byte_of.get(c as usize).copied().unwrap_or(text.len());
+        // Segments: each paragraph cut at run boundaries (both in order: one pass over each),
+        // and each of those where the direction or the script changes.
+        let mut scripts = Scripts::new();
+        let mut segs: Vec<Segment> = Vec::new();
         let mut ri = 0usize;
         for (pi, p) in paras.iter().enumerate() {
             let (s, e) = (p.start, p.start + p.len);
+            let plain = text.get(p.bytes.0..p.bytes.1).is_none_or(str::is_ascii);
+            let script_of = if plain { Vec::new() } else { scripts.of(chars.get(s as usize..e as usize).unwrap_or(&[])) };
+            let kind = |c: u32| (levels.as_ref().map_or(0, |l| l.level_at(byte_at(c))), script_of.get((c - s) as usize).copied().flatten());
             while runs.get(ri).is_some_and(|r| r.1 <= s) && ri + 1 < runs.len() {
                 ri += 1;
             }
@@ -240,16 +403,22 @@ impl Fonts {
                     break;
                 }
                 let (a, b) = (s.max(*rs), e.min(*re));
-                if a < b {
-                    let bytes = (byte_of.get(a as usize).copied().unwrap_or(p.bytes.1), byte_of.get(b as usize).copied().unwrap_or(p.bytes.1));
-                    segs.push((pi, Segment { run: k, bytes, first_char: a }));
+                let mut from = a;
+                while from < b {
+                    let (level, script) = kind(from);
+                    let mut to = from + 1;
+                    while to < b && kind(to) == (level, script) {
+                        to += 1;
+                    }
+                    segs.push(Segment { para: pi, run: k, bytes: (byte_at(from), byte_at(to)), chars: (from, to), level, script });
+                    from = to;
                 }
                 k += 1;
             }
         }
         // The segments of each run.
         let mut segs_of_run: Vec<Vec<usize>> = vec![Vec::new(); runs.len()];
-        for (si, (_, seg)) in segs.iter().enumerate() {
+        for (si, seg) in segs.iter().enumerate() {
             if let Some(list) = segs_of_run.get_mut(seg.run) {
                 list.push(si);
             }
@@ -261,145 +430,161 @@ impl Fonts {
                 list.push(ri);
             }
         }
+        let job_for = |seg: &Segment, bytes: (usize, usize), first_char: u32, m: &RunMetrics| -> Job<'_> {
+            let para = paras.get(seg.para).map_or(bytes, |p| p.bytes);
+            let letter_spacing = runs.get(seg.run).map_or(0.0, |r| r.2.letter_spacing);
+            Job { text, para, bytes, first_char, run: seg.run as u32, rtl: seg.level % 2 == 1, script: seg.script, size: m.glyph_size, letter_spacing }
+        };
         let mut shaped: Vec<Vec<Shaped>> = (0..segs.len()).map(|_| Vec::new()).collect();
         let mut metrics: Vec<RunMetrics> = vec![RunMetrics::default(); runs.len()];
-        let mut missing = 0usize;
         for (fi, (id, _)) in faces.iter().enumerate() {
-            let ok = self.db.with_face_data(*id, |data, index| {
-                let font = skrifa::FontRef::from_index(data, index).ok()?;
-                let shaper_data = harfrust::ShaperData::new(&font);
-                let shaper = shaper_data.shaper(&font).build();
-                let outlines = font.outline_glyphs();
-                let charmap = font.charmap();
-                let os2 = font.os2().ok();
-                let mut cache: HashMap<(u32, u32), Option<Arc<Path>>> = HashMap::new();
+            let ok = self.with_face(*id, |face| {
+                let os2 = face.font.os2().ok();
                 for &ri in runs_of_face.get(fi).map_or(&[][..], Vec::as_slice) {
-                    let Some((rs, re, st)) = runs.get(ri) else { continue };
-                    let m = run_metrics(&font, os2.as_ref(), st);
+                    let Some((_, _, st)) = runs.get(ri) else { continue };
+                    let m = run_metrics(&face.font, os2.as_ref(), st);
                     if let Some(slot) = metrics.get_mut(ri) {
                         *slot = m;
                     }
-                    missing += chars.get(*rs as usize..*re as usize).unwrap_or(&[]).iter().filter(|c| !c.is_control() && !c.is_whitespace() && charmap.map(**c).is_none()).count();
-                    let size = skrifa::instance::Size::new(m.glyph_size);
-                    let upem = f32::from(skrifa::MetadataProvider::metrics(&font, size, skrifa::instance::LocationRef::default()).units_per_em.max(1));
-                    let scale = m.glyph_size / upem;
                     for &si in segs_of_run.get(ri).map_or(&[][..], Vec::as_slice) {
-                        let Some((_, seg)) = segs.get(si) else { continue };
-                        let Some(piece) = text.get(seg.bytes.0..seg.bytes.1) else { continue };
-                        let mut to_char = vec![0u32; piece.len() + 1];
-                        let mut n = 0u32;
-                        for (b, _) in piece.char_indices() {
-                            if let Some(slot) = to_char.get_mut(b) {
-                                *slot = n;
-                            }
-                            n += 1;
-                        }
-                        if let Some(last) = to_char.last_mut() {
-                            *last = n;
-                        }
-                        let mut buffer = harfrust::UnicodeBuffer::new();
-                        buffer.push_str(piece);
-                        buffer.guess_segment_properties();
-                        let out = shaper.shape(buffer, harfrust::ShapeOptions::new());
-                        let mut list: Vec<Shaped> = Vec::with_capacity(out.glyph_infos().len());
-                        for (info, pos) in out.glyph_infos().iter().zip(out.glyph_positions()) {
-                            let local = to_char.get(info.cluster as usize).copied().unwrap_or(n).min(n);
-                            let index = seg.first_char + local;
-                            let outline = cache
-                                .entry((info.glyph_id, m.glyph_size.to_bits()))
-                                .or_insert_with(|| {
-                                    let g = outlines.get(skrifa::GlyphId::new(info.glyph_id))?;
-                                    let mut p = Path::new();
-                                    let settings = skrifa::outline::DrawSettings::unhinted(size, skrifa::instance::LocationRef::default());
-                                    let mut pen = Pen { cmds: &mut p.cmds, x: 0.0, y: 0.0 };
-                                    let _ = g.draw(settings, &mut pen);
-                                    Some(Arc::new(p))
-                                })
-                                .clone();
-                            list.push(Shaped {
-                                outline,
-                                index,
-                                run: ri as u32,
-                                x_offset: pos.x_offset as f32 * scale,
-                                y_offset: pos.y_offset as f32 * scale,
-                                advance: pos.x_advance as f32 * scale + st.letter_spacing,
-                                space: chars.get(index as usize).is_some_and(|c| c.is_whitespace()),
-                            });
-                        }
+                        let Some(seg) = segs.get(si) else { continue };
+                        let list = shape(face, &job_for(seg, seg.bytes, seg.chars.0, &m));
                         if let Some(slot) = shaped.get_mut(si) {
                             *slot = list;
                         }
                     }
                 }
-                Some(())
             });
-            if ok.flatten().is_none() {
+            if ok.is_none() {
                 return Err(TextError::NoFonts);
             }
         }
+
+        // Fallback faces (ADR 0130): a cluster its run's face has no glyph for goes, whole, to
+        // the first fallback face that has all of it, and is shaped again there.
+        let mut missing = 0usize;
+        let mut fallback_ids: Vec<fontdb::ID> = Vec::new();
+        let mut holes: Vec<Hole> = Vec::new();
+        if shaped.iter().flatten().any(|g| g.notdef) {
+            let mut cover = Coverage::new(self);
+            let mut lists: HashMap<(bool, bool), Vec<fontdb::ID>> = HashMap::new();
+            let mut searches = 0usize;
+            for (si, seg) in segs.iter().enumerate() {
+                let Some(list) = shaped.get(si).filter(|l| l.iter().any(|g| g.notdef)) else { continue };
+                let Some((_, _, st)) = runs.get(seg.run) else { continue };
+                let Some(own) = face_of_run.get(seg.run).and_then(|f| faces.get(*f)).map(|f| f.0) else { continue };
+                let mut open: Option<Hole> = None;
+                for (g, c0, c1) in clusters_of(list, seg.chars.1) {
+                    let lacking = list.get(g.clone()).is_some_and(|gs| gs.iter().any(|x| x.notdef));
+                    let drawn: Vec<char> = if lacking { chars.get(c0 as usize..c1 as usize).unwrap_or(&[]).iter().copied().filter(|c| needs_glyph(*c)).collect() } else { Vec::new() };
+                    let had = drawn.iter().filter(|c| cover.has(own, **c)).count();
+                    let mut chosen: Option<usize> = None;
+                    if had < drawn.len() {
+                        let candidates = lists.entry((st.bold, st.italic)).or_insert_with(|| self.fallback_list(st.bold, st.italic).iter().copied().filter(|id| *id != own).collect());
+                        let mut pick = pick_face(&drawn, had, candidates.len(), &mut |f, c| candidates.get(f).is_some_and(|id| cover.has(*id, c)));
+                        let lacks = |id: Option<fontdb::ID>, cover: &mut Coverage| drawn.iter().copied().find(|c| !cover.has(id.unwrap_or(own), *c));
+                        // No listed face has all of it: any installed face with the letter.
+                        if let Some(c) = lacks(pick.and_then(|f| candidates.get(f).copied()), &mut cover)
+                            && searches < MAX_WIDE_SEARCHES
+                        {
+                            searches += 1;
+                            if let Some(id) = self.any_face_with(c).filter(|id| *id != own && !candidates.contains(id)) {
+                                candidates.push(id);
+                                pick = pick_face(&drawn, had, candidates.len(), &mut |f, c| candidates.get(f).is_some_and(|id| cover.has(*id, c)));
+                            }
+                        }
+                        chosen = pick.and_then(|f| candidates.get(f).copied()).and_then(|id| match fallback_ids.iter().position(|known| *known == id) {
+                            Some(k) => Some(k),
+                            None if fallback_ids.len() < MAX_FALLBACK_FACES => {
+                                fallback_ids.push(id);
+                                Some(fallback_ids.len() - 1)
+                            }
+                            None => None,
+                        });
+                        let face = chosen.and_then(|k| fallback_ids.get(k).copied()).unwrap_or(own);
+                        missing += drawn.iter().filter(|c| !cover.has(face, **c)).count();
+                    }
+                    match (&mut open, chosen) {
+                        (Some(h), Some(f)) if h.face == f && h.chars.1 == c0 => {
+                            h.chars.1 = c1;
+                            h.glyphs = h.glyphs.start.min(g.start)..h.glyphs.end.max(g.end);
+                        }
+                        _ => {
+                            holes.extend(open.take());
+                            open = chosen.map(|face| Hole { seg: si, glyphs: g, chars: (c0, c1), face });
+                        }
+                    }
+                }
+                holes.extend(open);
+            }
+        }
+        let mut patches: Vec<(usize, Range<usize>, Vec<Shaped>)> = Vec::new();
+        for (k, id) in fallback_ids.iter().enumerate() {
+            let done = self.with_face(*id, |face| {
+                let mut out = Vec::new();
+                for h in holes.iter().filter(|h| h.face == k) {
+                    let (Some(seg), Some(m)) = (segs.get(h.seg), segs.get(h.seg).and_then(|s| metrics.get(s.run))) else { continue };
+                    out.push((h.seg, h.glyphs.clone(), shape(face, &job_for(seg, (byte_at(h.chars.0), byte_at(h.chars.1)), h.chars.0, m))));
+                }
+                out
+            });
+            // A face that can't be read after all leaves its clusters as boxes.
+            patches.extend(done.unwrap_or_default());
+        }
+        // Last glyphs first, so the ranges before them stay where they are.
+        patches.sort_by_key(|p| std::cmp::Reverse((p.0, p.1.start)));
+        for (si, range, list) in patches {
+            if let Some(slot) = shaped.get_mut(si)
+                && range.start <= range.end
+                && range.end <= slot.len()
+            {
+                slot.splice(range, list);
+            }
+        }
+        let fallbacks: Vec<String> = fallback_ids.iter().map(|id| self.family_of(*id)).collect();
 
         // Paragraph styles, sanitized; missing ones take the last one's.
         let para_style = |pi: usize| -> ParaStyle { rich.paragraphs.get(pi).or(rich.paragraphs.last()).map(sanitize_para).unwrap_or_default() };
         let width = rich.width.filter(|w| w.is_finite() && *w > 0.0).map(|w| w.min(100_000.0));
 
-        // Lines: each paragraph's glyphs, wrapped at spaces to its room if there is a width.
+        // Lines: each paragraph's clusters in reading order, wrapped at spaces to its room if
+        // there is a width; then each line in the order it is displayed.
         let mut lines: Vec<Line> = Vec::new();
-        let mut seg_iter = segs.into_iter().zip(shaped).peekable();
-        for (pi, _) in paras.iter().enumerate() {
+        let mut seg_iter = segs.iter().zip(shaped).peekable();
+        for (pi, p) in paras.iter().enumerate() {
             let ps = para_style(pi);
-            let mut run_glyphs: Vec<Shaped> = Vec::new();
-            while let Some(((p, _), _)) = seg_iter.peek() {
-                if *p != pi {
-                    break;
+            let mut para_glyphs: Vec<Shaped> = Vec::new();
+            let mut clusters: Vec<Cluster> = Vec::new();
+            while seg_iter.peek().is_some_and(|(seg, _)| seg.para == pi) {
+                let Some((seg, list)) = seg_iter.next() else { break };
+                let base = para_glyphs.len();
+                for (g, start, end) in clusters_of(&list, seg.chars.1) {
+                    let advance = list.get(g.clone()).map_or(0.0, |gs| gs.iter().map(|x| x.advance).sum());
+                    let first = chars.get(start as usize).copied().unwrap_or(' ');
+                    clusters.push(Cluster { glyphs: base + g.start..base + g.end, start, end, first, space: first.is_whitespace(), advance, level: seg.level });
                 }
-                if let Some((_, g)) = seg_iter.next() {
-                    run_glyphs.extend(g);
-                }
+                para_glyphs.extend(list);
             }
             let room = |first: bool| width.map(|w| w - ps.left_margin - ps.right_margin - if first { ps.indent } else { 0.0 });
-            let mut first = true;
-            let mut line: Vec<(Shaped, f32)> = Vec::new();
-            let mut x = 0.0f32;
-            // Where the current line could break: after its last space.
-            let mut break_at: Option<usize> = None;
-            for g in run_glyphs {
-                if let Some(w) = room(first)
-                    && !g.space
-                    && x + g.advance > w
-                    && !line.is_empty()
-                {
-                    // Wrap: at the last space if there is one (dropping trailing spaces), else here.
-                    let rest = match break_at {
-                        Some(b) => line.split_off(b),
-                        None => Vec::new(),
-                    };
-                    while line.last().is_some_and(|(g, _)| g.space) {
-                        line.pop();
+            for (n, range) in break_lines(&clusters, &room).into_iter().enumerate() {
+                let mut line = Line { para: pi, first: n == 0, width: 0.0, glyphs: Vec::new(), rtl: p.level % 2 == 1, boxes: Vec::new() };
+                for (k, at) in place(&clusters, range, p.level) {
+                    let mut x = at.x0;
+                    for g in clusters.get(k).and_then(|c| para_glyphs.get(c.glyphs.clone())).unwrap_or(&[]) {
+                        line.glyphs.push((g.clone(), x));
+                        x += g.advance;
                     }
-                    let lw = line.last().map_or(0.0, |(g, gx)| gx + g.advance);
-                    lines.push(Line { para: pi, first, width: lw, glyphs: std::mem::take(&mut line) });
-                    first = false;
-                    let shift = rest.first().map_or(0.0, |(_, gx)| *gx);
-                    line = rest.into_iter().map(|(g, gx)| (g, gx - shift)).collect();
-                    x = line.last().map_or(0.0, |(g, gx)| gx + g.advance);
-                    break_at = None;
+                    line.width = at.x1;
+                    line.boxes.push(at);
                 }
-                line.push((g, x));
-                x += line.last().map_or(0.0, |(g, _)| g.advance);
-                if line.last().is_some_and(|(g, _)| g.space) {
-                    break_at = Some(line.len());
-                }
+                lines.push(line);
             }
-            while line.last().is_some_and(|(g, _)| g.space) {
-                line.pop();
-            }
-            let lw = line.last().map_or(0.0, |(g, gx)| gx + g.advance);
-            lines.push(Line { para: pi, first, width: lw, glyphs: line });
         }
 
         // Each line's room above and below its baseline: the most any run on it needs (an
         // empty line: the run its paragraph starts in). `(ascent, descent, line height)`, the
-        // height with the paragraph's line spacing.
+        // height with the paragraph's line spacing. A fallback face's letters sit on the line
+        // their run's face makes.
         let run_at = |c: u32| runs.partition_point(|r| r.0 <= c).saturating_sub(1);
         let line_metrics = |l: &Line| -> (f32, f32, f32) {
             let mut list: Vec<usize> = l.glyphs.iter().map(|(g, _)| g.run as usize).collect();
@@ -536,6 +721,7 @@ impl Fonts {
             glyphs: placed,
             pieces,
             families,
+            fallbacks,
         })
     }
 }
@@ -592,21 +778,18 @@ fn caret_lines(lines: &[Line], paras: &[Para], tops: &[f32], lm: &[(f32, f32, f3
         let shift = shift_of(l);
         let (pstart, plen) = paras.get(l.para).map_or((0, 0), |p| (p.start, p.len));
         let ch = |i: u32| i.clamp(pstart, pstart + plen);
-        let start = if l.first { pstart } else { l.glyphs.first().map_or(pstart, |(g, _)| ch(g.index)) };
-        let mut stops: Vec<(u32, f32)> = l.glyphs.iter().map(|(g, gx)| (ch(g.index), shift + gx)).collect();
-        stops.sort_by_key(|s| s.0);
-        stops.dedup_by_key(|s| s.0);
+        let boxes: Vec<CaretBox> = l.boxes.iter().map(|b| CaretBox { start: ch(b.start), end: ch(b.end), x0: shift + b.x0, x1: shift + b.x1, rtl: b.rtl }).collect();
+        let start = if l.first { pstart } else { boxes.iter().map(|b| b.start).min().unwrap_or(pstart) };
+        // Where the line starts: its left end, or its right end in a right-to-left paragraph.
+        let edge = shift + if l.rtl { l.width } else { 0.0 };
+        let mut stops = stops(&boxes, (start, edge));
         if l.first && stops.first().is_none_or(|s| s.0 > start) {
-            stops.insert(0, (start, shift));
-        }
-        // The boundary after the last glyph (its trailing spaces, if any, follow it).
-        if let Some(&(c, _)) = stops.last() {
-            stops.push((c + 1, shift + l.width));
+            stops.insert(0, (start, edge));
         }
         let m = lm.get(row).copied().unwrap_or_default();
         let top = tops.get(row).copied().unwrap_or(0.0);
         let baseline = if uniform { first_ascent + top } else { top + m.0 };
-        out.push(CaretLine { start, end: start, stops, top, height: m.2, baseline });
+        out.push(CaretLine { start, end: start, stops, top, height: m.2, baseline, rtl: l.rtl, boxes });
         // The previous line of the same paragraph ends where this one starts.
         if !l.first && let Some(prev) = out.len().checked_sub(2).and_then(|i| out.get_mut(i)) {
             prev.end = start;

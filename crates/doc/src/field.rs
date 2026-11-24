@@ -12,18 +12,80 @@ use crate::{FIELD_GUTTER, LineType, MAX_FIELD_CHARS, Rgba, TextBlock, TextField,
 use anicraft_geom::{Path, Vec2};
 use std::sync::Arc;
 
+/// Where one cluster (a letter with its marks, or a ligature) stands on its line (ADR 0130).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CaretBox {
+    /// The characters it covers: from `start` up to `end`.
+    pub start: u32,
+    pub end: u32,
+    /// Its left and right edges, from the text's left edge.
+    pub x0: f32,
+    pub x1: f32,
+    /// It reads right to left.
+    pub rtl: bool,
+}
+
 /// One laid-out line's characters and caret places (indices count `char`s of the shown text).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CaretLine {
     /// The first character on the line and the boundary after its last.
     pub start: u32,
     pub end: u32,
-    /// `(index, x)` of the boundaries glyphs start at and of the line's end, ascending; `x` from
-    /// the text's left edge (the box's, less the gutter).
+    /// `(index, x)` of the boundaries clusters start at and of the line's end, ascending by
+    /// index; `x` from the text's left edge (the box's, less the gutter). A boundary is at the
+    /// edge its cluster is read from, so in text that mixes directions `x` does not rise with
+    /// the index.
     pub stops: Vec<(u32, f32)>,
+    /// The paragraph reads right to left: the line starts at its right end (ADR 0130).
+    pub rtl: bool,
+    /// The line's clusters as they are displayed, left to right. Empty: every character reads
+    /// left to right, one after another, as `stops` has them.
+    pub boxes: Vec<CaretBox>,
 }
 
 impl CaretLine {
+    /// Whether anything on the line reads right to left.
+    pub fn mixed(&self) -> bool {
+        self.rtl || self.boxes.iter().any(|b| b.rtl)
+    }
+
+    /// The stretches of the line a selection from boundary `a` to `b` highlights, as left and
+    /// right x, left to right. Text in one direction is one stretch; a selection across a change
+    /// of direction is several (ADR 0130). A cluster is highlighted whole.
+    pub fn spans(&self, a: u32, b: u32) -> Vec<(f32, f32)> {
+        let (a, b) = (a.max(self.start), b.min(self.end));
+        if a >= b {
+            return Vec::new();
+        }
+        if self.boxes.is_empty() {
+            let x0 = self.x_at(a);
+            return vec![(x0, self.x_at(b).max(x0))];
+        }
+        let mut out: Vec<(f32, f32)> = Vec::new();
+        for c in self.boxes.iter().filter(|c| c.start < b && c.end > a) {
+            match out.last_mut() {
+                Some(last) if (last.1 - c.x0).abs() < 1e-3 => last.1 = c.x1,
+                _ => out.push((c.x0, c.x1)),
+            }
+        }
+        out
+    }
+
+    /// The boundary the Left or Right key takes a caret at `i` to: the next place a caret can
+    /// stand in that direction on this line, by where it is displayed. `None` at the line's
+    /// edge. `open`: the line's end is shown on the next line (a wrapped line), so the caret
+    /// doesn't stand there.
+    pub fn step(&self, i: u32, right: bool, open: bool) -> Option<u32> {
+        let mut places: Vec<(u32, f32)> = self.stops.iter().copied().filter(|s| (self.start..=self.end).contains(&s.0) && !(open && s.0 == self.end && s.0 > self.start)).collect();
+        // Left to right; places at one x in the order the paragraph reads.
+        places.sort_by(|p, q| p.1.total_cmp(&q.1).then(if self.rtl { q.0.cmp(&p.0) } else { p.0.cmp(&q.0) }));
+        // Inside a cluster, the caret is at the cluster's start.
+        let here = places.iter().map(|p| p.0).filter(|c| *c <= i).max()?;
+        let at = places.iter().position(|p| p.0 == here)?;
+        let next = if right { at.checked_add(1)? } else { at.checked_sub(1)? };
+        places.get(next).map(|p| p.0)
+    }
+
     /// The caret's x at boundary `i`.
     pub fn x_at(&self, i: u32) -> f32 {
         let mut x = self.stops.first().map_or(0.0, |s| s.1);
@@ -85,6 +147,25 @@ impl FieldLook {
         let n = self.line_of(i);
         let x = self.lines.get(n).map_or(0.0, |l| l.x_at(i));
         Vec2::new(x, n as f32 * self.line_height)
+    }
+
+    /// Where the Left or Right key takes a caret at boundary `i` in text that mixes directions
+    /// (ADR 0130): the next place to that side as displayed, and at a line's edge the line
+    /// before or after it, whichever lies that way in its paragraph's direction. `None` on a
+    /// line that reads left to right throughout: the key moves one character.
+    pub fn step(&self, i: u32, right: bool) -> Option<u32> {
+        let n = self.line_of(i);
+        let line = self.lines.get(n).filter(|l| l.mixed())?;
+        let next = self.lines.get(n + 1);
+        if let Some(to) = line.step(i, right, next.is_some_and(|m| m.start == line.end)) {
+            return Some(to);
+        }
+        // The line's edge: back to the line before, or on to the line after.
+        Some(if right == line.rtl {
+            if n == 0 { i } else { line.start.saturating_sub(1) }
+        } else {
+            next.map_or(i, |m| m.start)
+        })
     }
 
     /// The boundary nearest a point in the text's space.
@@ -316,12 +397,14 @@ impl Editor<'_> {
             }
             Edit::Left if !shift && a != b => moved(self.st, a, false),
             Edit::Right if !shift && a != b => moved(self.st, b, false),
+            // In text that mixes directions the caret moves the way the key points, as the
+            // text is displayed (ADR 0130); elsewhere one character back or on.
             Edit::Left => {
-                let to = self.st.caret.saturating_sub(1);
+                let to = look.and_then(|l| l.step(self.st.caret, false)).unwrap_or_else(|| self.st.caret.saturating_sub(1));
                 moved(self.st, to, shift)
             }
             Edit::Right => {
-                let to = self.st.caret.saturating_add(1);
+                let to = look.and_then(|l| l.step(self.st.caret, true)).unwrap_or_else(|| self.st.caret.saturating_add(1));
                 moved(self.st, to, shift)
             }
             Edit::Home | Edit::End | Edit::Up | Edit::Down => {
@@ -422,14 +505,14 @@ pub(crate) fn mono_look(text: &str, cw: f32, lh: f32, wrap: Option<f32>) -> Fiel
     let mut i = 0u32;
     for c in text.chars() {
         if c == '\n' {
-            lines.push(CaretLine { start, end: i, stops: std::mem::take(&mut stops) });
+            lines.push(CaretLine { start, end: i, stops: std::mem::take(&mut stops), ..CaretLine::default() });
             i += 1;
             (start, col) = (i, 0);
             stops.push((i, 0.0));
             continue;
         }
         if per.is_some_and(|p| col == p) {
-            lines.push(CaretLine { start, end: i, stops: std::mem::take(&mut stops) });
+            lines.push(CaretLine { start, end: i, stops: std::mem::take(&mut stops), ..CaretLine::default() });
             (start, col) = (i, 0);
             stops.push((i, 0.0));
         }
@@ -442,7 +525,7 @@ pub(crate) fn mono_look(text: &str, cw: f32, lh: f32, wrap: Option<f32>) -> Fiel
         stops.push((i, col as f32 * cw));
         width = width.max(col as f32 * cw);
     }
-    lines.push(CaretLine { start, end: i, stops });
+    lines.push(CaretLine { start, end: i, stops, ..CaretLine::default() });
     let n = lines.len();
     FieldLook { outline: Arc::new(outline), pieces: Arc::from(Vec::new()), lines: lines.into(), line_height: lh, width, height: n as f32 * lh }
 }

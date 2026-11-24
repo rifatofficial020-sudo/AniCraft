@@ -117,6 +117,15 @@ saved command's file) or `{"steps": [{"cmd", "params"}]}` runs the steps as one 
 unlike `anicraft_run_script` a failing step leaves the document as it was. `macro.history` and
 `macro.save` turn the session's undo steps into a saved command.
 
+## A frame with artwork left out
+
+A document can hold more than AniCraft draws in one frame (symbols nested many times over, as
+in a damaged file): the frame is then drawn in part
+([ADR 0128](adr/0128-one-work-allowance-and-frames-that-say-what-they-left-out.md)). The commands
+that write frames still write it, and their result has `"left_out": true` and a `"warning"`;
+`anicraft_render` says so in the picture's caption, and the document's state has the two keys
+for the frame shown. A result without them is a whole frame.
+
 ## Safety
 
 * Everything runs through the engine's commands, so params are checked and every edit can be

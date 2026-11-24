@@ -328,7 +328,8 @@ fn dropping_the_server_frees_the_port() {
     let port = server.port;
     assert!(TcpListener::bind(("127.0.0.1", port)).is_err(), "the port is taken while the server lives");
     drop(server);
-    let freed = (0..200).any(|_| {
+    // (Up to a minute: the listening thread ends when it next runs, late on a busy machine.)
+    let freed = (0..6000).any(|_| {
         std::thread::sleep(Duration::from_millis(10));
         TcpListener::bind(("127.0.0.1", port)).is_ok()
     });

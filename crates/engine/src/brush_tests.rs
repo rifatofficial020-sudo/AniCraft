@@ -421,3 +421,35 @@ fn crossing_brush_strokes_keep_what_was_drawn() {
         }
     }
 }
+
+/// ADR 0129: an outline traced ahead (on the editor's other thread) is painted by the
+/// `draw.brush` that asks for exactly that stroke, and by no other. Either way it is gone
+/// afterwards, so it can never be painted by a later stroke.
+#[test]
+fn an_outline_traced_ahead_is_taken_by_its_own_stroke_only() {
+    let stroke = json!({"points": [[100, 100], [220, 130], [300, 90]], "size": 12, "color": "#000000"});
+    let other = json!({"points": [[100, 100], [220, 130], [300, 95]], "size": 12, "color": "#000000"});
+    // A marker no trace would give: a square far from the stroke.
+    let marker = anicraft_geom::Path::rect(600.0, 400.0, 50.0, 50.0);
+    let painted_at = |staged: &Value, painted: &Value| {
+        let mut s = blank(true);
+        let ahead = crate::cmds_brush::stroke_request(&s, staged).unwrap().prepare();
+        s.staged_stroke = Some(ahead.with_path(marker.clone()));
+        run(&mut s, "draw.brush", painted.clone());
+        assert!(s.staged_stroke.is_none(), "it doesn't linger");
+        (top_at(&s, Vec2::new(625.0, 425.0)).is_some(), top_at(&s, Vec2::new(220.0, 130.0)).is_some())
+    };
+    assert_eq!(painted_at(&stroke, &stroke), (true, false), "its own stroke takes the outline as it is");
+    assert_eq!(painted_at(&stroke, &other), (false, true), "another stroke traces its own");
+    // Traced ahead or by the command: the same document.
+    let mut plain = blank(true);
+    run(&mut plain, "draw.brush", stroke.clone());
+    let mut ahead = blank(true);
+    ahead.staged_stroke = Some(crate::cmds_brush::stroke_request(&ahead, &stroke).unwrap().prepare());
+    run(&mut ahead, "draw.brush", stroke.clone());
+    assert_eq!(shapes(&plain), shapes(&ahead));
+    // A stroke that fails leaves nothing staged either.
+    plain.staged_stroke = Some(crate::cmds_brush::stroke_request(&plain, &stroke).unwrap().prepare());
+    assert!(plain.execute("draw.brush", &json!({"points": []})).is_err());
+    assert!(plain.staged_stroke.is_none());
+}

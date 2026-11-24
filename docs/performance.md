@@ -9,6 +9,8 @@ oracle; its output must stay bit-identical).
 ```sh
 cargo run --release -p anicraft-cli -- bench                      # 50 layers × 200 shapes × 240 frames
 cargo run --release -p anicraft-cli -- bench --layers 200 --shapes 500 --frames 600
+cargo run --release -p anicraft-cli -- bench --stroke 6000        # one long Brush stroke (ADR 0129)
+cargo run --release -p anicraft-cli -- bench --stroke-file drawing.anicraft   # the same steps on a file
 ```
 
 `bench` builds a deterministic stress document (`doc::sample::stress`) and reports file size,
@@ -37,6 +39,8 @@ The default `bench` scenario: 50 layers × 200 shapes × 240 frames, 200k elemen
 | UI frame while rendering | never blocked | worker thread ✅ | design (ADR 0002) |
 | Autosave: time on the editing thread | < 1 ms | 7–15 µs ✅ | `bench --check` |
 | Autosave of the 65 MB file, in the background | < 2 s | 183–184 ms ✅ | `bench --check` |
+| A long Brush stroke: tracing its outline (ADR 0129) | bounded: `MAX_STAMP_WORK` cells visited, whatever the stroke | 45 to 310 ms for 1,500 to 100,000 samples, sizes 3 to 60 (2026-11-21; 1,500 ms and growing before) | test, every PR (the budget, not the time) |
+| A long Brush stroke in the editor | the trace is never on the window's thread | worker thread ✅; the merge (75 to 220 ms at the largest) still is | test, every PR |
 | GPU stage, 1,000 shapes at 4K, stage tiles (M3 exit) | < 16.7 ms | 4.5–4.7 ms ✅ (2026-11-10, RTX 5090) | `gpu_bench --check` |
 | GPU stage, 10k shapes at 4K, stage tiles | < 16.7 ms | 10.1–10.4 ms ✅ | `gpu_bench --check` |
 | GPU stage, 50k shapes at 1080p, stage tiles | < 33.3 ms (30 fps) | 24.8–26.3 ms ✅ | `gpu_bench --check` |

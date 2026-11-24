@@ -1073,7 +1073,7 @@ fn selection_list(s: &Session) -> anicraft_doc::DisplayList {
             i
         })
         .collect();
-    anicraft_doc::DisplayList { items, clip_parents, clip_modes: full.clip_modes.clone(), groups, links: Vec::new() }
+    anicraft_doc::DisplayList { items, clip_parents, clip_modes: full.clip_modes.clone(), groups, links: Vec::new(), left_out: full.left_out }
 }
 
 /// Convert to Bitmap (#463): the selection, drawn by the CPU renderer on whole pixels of the

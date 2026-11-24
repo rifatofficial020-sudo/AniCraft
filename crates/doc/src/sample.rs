@@ -242,6 +242,36 @@ pub fn interactive() -> Document {
     d
 }
 
+/// A document whose symbols double at every level: `levels` symbols in a chain, each holding
+/// two instances of the next and the last one a square, so the one instance on the stage is
+/// 2^(`levels` - 1) squares, with no cycle anywhere and nothing nested deeper than
+/// [`crate::MAX_SYMBOL_DEPTH`]. Past twenty levels it is more than a frame's allowance of work
+/// ([`crate::MAX_EVAL_ELEMENTS`], ADR 0128): what tests and benchmarks use for a document too
+/// large to draw.
+pub fn doubling(levels: u32) -> Document {
+    let levels = u64::from(levels.clamp(1, 31));
+    let mut d = Document::default();
+    let at = |id: u64, x: f32, kind: ElementKind| Arc::new(Element { id: ElementId(id), name: String::new(), transform: Affine::translate(x, 0.0), color: ColorEffect::default(), kind });
+    let on_one_layer = |id: u64, elements: Vec<Arc<Element>>| {
+        let mut l = Layer::new(LayerId(id), "l");
+        l.keyframes = vec![Arc::new(key(0, 1, elements, None))];
+        Timeline { layers: vec![Arc::new(l)] }
+    };
+    for level in 0..levels {
+        let elements = if level + 1 == levels {
+            vec![at(5000, 0.0, ElementKind::Shape(Shape::filled(Path::rect(0.0, 0.0, 10.0, 10.0), Paint::Solid(Rgba::BLACK))))]
+        } else {
+            vec![at(2000 + level, 0.0, instance(SymbolId(101 + level))), at(3000 + level, 1.0, instance(SymbolId(101 + level)))]
+        };
+        let timeline = on_one_layer(1000 + level, elements);
+        d.library.push(Arc::new(Symbol { id: SymbolId(100 + level), name: format!("s{level}"), kind: SymbolKind::Graphic, linkage: None, scale_grid_kept: None, scale_grid: None, timeline }));
+    }
+    let root = on_one_layer(1, vec![at(1, 0.0, instance(SymbolId(100)))]);
+    d.timeline_mut(0).layers = root.layers;
+    d.next_id = 10_000;
+    d
+}
+
 /// Deterministic stress document for benchmarks and scaling tests: `layers` layers with
 /// `shapes` shapes each, keyed every 12 frames over `frames` frames with classic tweens.
 /// Every element keeps one `Arc<Path>` across its keyframes, as a real tweened shape does.

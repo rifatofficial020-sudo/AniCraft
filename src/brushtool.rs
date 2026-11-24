@@ -323,7 +323,9 @@ pub fn sample(app: &mut App, p: Vec2, pressure: Option<f32>, xf: Xf, now: f64) {
 }
 
 /// Sends the stroke (one command, one undo step). Smoothing and accuracy follow the screen.
-pub fn commit(app: &mut App, xf: Xf) {
+/// A long Brush stroke's outline is traced on another thread first, the stroke staying on the
+/// stage as drawn until it is painted (ADR 0129, `crate::ink`).
+pub fn commit(app: &mut App, ctx: &egui::Context, xf: Xf) {
     let samples = std::mem::take(&mut app.brush_samples);
     if samples.is_empty() {
         return;
@@ -344,12 +346,19 @@ pub fn commit(app: &mut App, xf: Xf) {
         }
         return;
     }
+    if !crate::ink::defer(app, ctx, &samples, &params, o.mode) {
+        paint(app, params, o.mode);
+    }
+}
+
+/// Paints a Brush stroke: `draw.brush` with `params`, and what to say when nothing was painted.
+pub fn paint(app: &mut App, params: serde_json::Value, mode: PaintMode) {
     // Paint Selection keeps the selection it paints in, for the next stroke (ADR 0080).
-    let v = if o.mode == PaintMode::Selection { app.run("draw.brush", params) } else { app.draw("draw.brush", params) };
+    let v = if mode == PaintMode::Selection { app.run("draw.brush", params) } else { app.draw("draw.brush", params) };
     if let Some(v) = v
         && v["elements"].as_array().is_some_and(Vec::is_empty)
     {
-        match o.mode {
+        match mode {
             PaintMode::Selection => app.status_ok(tr!("Nothing painted: Paint Selection paints only inside the selected fills. Select them with the Selection tool first.")),
             PaintMode::Inside => app.status_ok(tr!("Nothing painted: Paint Inside paints only inside the fill where the stroke starts.")),
             _ => app.status_ok(tr!("Nothing to paint behind there: Paint Behind only paints empty areas.")),
@@ -394,7 +403,7 @@ const MASK_MAX: usize = 2048;
 /// The alpha the finished stroke will have: the fill (or the stroke colour) times, when
 /// pressure drives opacity, the average mapped pressure so far. That average is what the
 /// command stores for the whole stroke (ADR 0068).
-fn intended_alpha(o: &BrushOptions, paint_a: f32, samples: &[(Vec2, Option<f32>)]) -> f32 {
+pub(crate) fn intended_alpha(o: &BrushOptions, paint_a: f32, samples: &[(Vec2, Option<f32>)]) -> f32 {
     let paint_a = if paint_a.is_finite() { paint_a.clamp(0.0, 1.0) } else { 1.0 };
     if !o.pressure_opacity || samples.is_empty() {
         return paint_a;
@@ -430,19 +439,24 @@ pub fn draw_overlay(app: &App, painter: &egui::Painter, xf: Xf, hover: Option<Po
     let (paint, tip) = if app.tool == Tool::PaintBrush { (app.s.style.stroke, BrushOptions { shape: TipShape::Round, roundness: 100.0, ..*o }) } else { (app.s.style.fill, *o) };
     if app.drag == Drag::Brush {
         let alpha = intended_alpha(&tip, paint.a, &app.brush_samples);
-        // Opaque ink stays the convex sweep the Eraser shares. A wash is one coverage image
-        // at the alpha the stroke will keep, so the pen-down ink matches the ink after you
-        // lift (ADR 0102).
-        if (alpha * 255.0).round() >= 255.0 {
-            let color = to_color32(anicraft_engine::doc::Rgba { a: 1.0, ..paint });
-            draw_sweep(painter, xf, &tip, &app.brush_samples, color);
-        } else {
-            draw_sweep_alpha(painter, xf, &tip, &app.brush_samples, paint, alpha);
-        }
+        draw_ink(painter, xf, &tip, &app.brush_samples, paint, alpha, 0);
     }
     if let Some(h) = hover {
         // The tip's size and shape at the pointer, as Animate shows it.
         draw_tip(painter, xf, &tip, xf.to_stage(h));
+    }
+}
+
+/// A stroke's ink as it is drawn: `paint` at `alpha`, the alpha the finished stroke will have.
+/// Opaque ink is the convex sweep the Eraser shares. A wash is one coverage image at that
+/// alpha, so the pen-down ink matches the ink after you lift (ADR 0102); `slot` names its
+/// texture (the stroke in hand is 0, strokes waiting to be painted come after, ADR 0129).
+pub(crate) fn draw_ink(painter: &egui::Painter, xf: Xf, tip: &BrushOptions, samples: &[(Vec2, Option<f32>)], paint: anicraft_engine::doc::Rgba, alpha: f32, slot: usize) {
+    if (alpha * 255.0).round() >= 255.0 {
+        let color = to_color32(anicraft_engine::doc::Rgba { a: 1.0, ..paint });
+        draw_sweep(painter, xf, tip, samples, color);
+    } else {
+        draw_sweep_alpha(painter, xf, tip, samples, paint, alpha, slot);
     }
 }
 
@@ -502,7 +516,7 @@ fn sweep_hulls(xf: Xf, o: &BrushOptions, samples: &[(Vec2, Option<f32>)]) -> Vec
 
 /// The same sweep as one coverage image, tinted at `alpha`. Overlapping pieces keep the
 /// greater coverage, so a crossing in one stroke stays one alpha.
-fn draw_sweep_alpha(painter: &egui::Painter, xf: Xf, o: &BrushOptions, samples: &[(Vec2, Option<f32>)], paint: anicraft_engine::doc::Rgba, alpha: f32) {
+fn draw_sweep_alpha(painter: &egui::Painter, xf: Xf, o: &BrushOptions, samples: &[(Vec2, Option<f32>)], paint: anicraft_engine::doc::Rgba, alpha: f32, slot: usize) {
     if alpha <= 0.0 {
         return;
     }
@@ -540,14 +554,15 @@ fn draw_sweep_alpha(painter: &egui::Painter, xf: Xf, o: &BrushOptions, samples: 
         pixels.push(egui::Color32::from_white_alpha(a));
     }
     let image = egui::ColorImage::new([w, h], pixels);
-    let tex = sweep_texture(painter.ctx(), image);
+    let tex = sweep_texture(painter.ctx(), image, slot);
     let tint = to_color32(anicraft_engine::doc::Rgba { a: alpha, ..paint });
     painter.image(tex.id(), view, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), tint);
 }
 
-/// One reused texture for the live wash, so a stroke does not leak a texture every frame.
-fn sweep_texture(ctx: &egui::Context, image: egui::ColorImage) -> egui::TextureHandle {
-    let id = egui::Id::new("anicraft.brush.sweep");
+/// One reused texture for the live wash, so a stroke does not leak a texture every frame (and
+/// one for each stroke that waits to be painted: a few at most).
+fn sweep_texture(ctx: &egui::Context, image: egui::ColorImage, slot: usize) -> egui::TextureHandle {
+    let id = if slot == 0 { egui::Id::new("anicraft.brush.sweep") } else { egui::Id::new(("anicraft.brush.sweep", slot)) };
     let options = egui::TextureOptions::LINEAR;
     if let Some(mut tex) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
         tex.set(image, options);

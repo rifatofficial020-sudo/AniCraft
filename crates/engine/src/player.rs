@@ -12,7 +12,7 @@
 use anicraft_doc::actions::as3::Problem;
 use anicraft_doc::actions::{Action, CompileResult, FrameScript, MAX_ACTIONS, PluginScript, check_actions};
 use anicraft_doc::player::{Event, Node, NodeKind, PlayerState, ScriptContext, ScriptHost, ScriptRun, Step, TimelineRef};
-use anicraft_doc::field::{CaretLine, FieldLook};
+use anicraft_doc::field::{CaretBox, CaretLine, FieldLook};
 use anicraft_doc::{Document, LayerKind, SymbolKind, TextBlock, Timeline, player};
 use anicraft_geom::Vec2;
 use anicraft_plugins::{Host, Kind, Limits, Registry};
@@ -110,9 +110,10 @@ pub fn field_look(block: &TextBlock, shown: &str, rich: Option<&anicraft_doc::ht
         None => (crate::cmds_text::field_layout(fonts, &crate::cmds_text::style_of(block), f, block.box_width, shown).ok()?, Vec::new()),
     };
     let pieces: Vec<(anicraft_doc::Rgba, std::sync::Arc<anicraft_geom::Path>)> = if colors.len() > 1 || colors.first().is_some_and(|c| *c != block.color) { l.pieces.iter().filter_map(|(k, p)| Some((*colors.get(*k as usize)?, std::sync::Arc::new(p.clone())))).collect() } else { Vec::new() };
-    let mut lines: Vec<CaretLine> = l.carets.into_iter().map(|c| CaretLine { start: c.start, end: c.end, stops: c.stops }).collect();
+    let boxes = |c: &anicraft_text::CaretLine| c.boxes.iter().map(|b| CaretBox { start: b.start, end: b.end, x0: b.x0, x1: b.x1, rtl: b.rtl }).collect();
+    let mut lines: Vec<CaretLine> = l.carets.into_iter().map(|c| CaretLine { start: c.start, end: c.end, rtl: c.rtl, boxes: boxes(&c), stops: c.stops }).collect();
     if lines.is_empty() {
-        lines.push(CaretLine { start: 0, end: 0, stops: vec![(0, 0.0)] });
+        lines.push(CaretLine { start: 0, end: 0, stops: vec![(0, 0.0)], ..CaretLine::default() });
     }
     Some(FieldLook { outline: std::sync::Arc::new(l.outline), pieces: pieces.into(), lines: lines.into(), line_height: l.line_height, width: l.width, height: l.height })
 }

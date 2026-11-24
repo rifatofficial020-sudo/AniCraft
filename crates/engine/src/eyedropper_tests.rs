@@ -45,6 +45,11 @@ fn picking_a_solid_fill_sets_the_fill_colour_and_records_no_step() {
     let r = run(&mut s, "paint.pick", json!({"x": 150, "y": 150, "other": true}));
     assert_eq!(r["into"], "stroke");
     assert_eq!((s.style.stroke, s.style.fill), (Rgba::hex(0xff0000), Rgba::hex(0x00ff00)));
+    // The report names the colour that was picked, its opacity included.
+    rect(&mut s, 300.0, "#0000ff80");
+    let r = run(&mut s, "paint.pick", json!({"x": 350, "y": 150}));
+    assert_eq!(Rgba::parse_hex(r["color"].as_str().unwrap()), Some(s.style.fill));
+    assert!(s.style.fill.a < 0.6);
 }
 
 #[test]

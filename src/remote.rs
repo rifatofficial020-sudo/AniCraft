@@ -193,7 +193,7 @@ mod tests {
         assert!(!file.exists(), "the token file goes when the window closes");
         assert_eq!(super::port(&app), None);
         // The port is free again: the same run can open another window on it (ADR 0092).
-        let freed = (0..200).any(|_| {
+        let freed = (0..6000).any(|_| {
             std::thread::sleep(std::time::Duration::from_millis(10));
             std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
         });

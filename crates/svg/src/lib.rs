@@ -297,81 +297,31 @@ fn numbers(s: &str) -> Vec<f32> {
 
 /// A length in user units. `%` is relative to `reference`; `em`/`ex` assume a 16 px font.
 fn length(v: &str, reference: f32) -> Option<f32> {
-    let v = v.trim();
-    // The unit is a known suffix, so exponents ("1e2px") still parse.
-    let units: [(&str, f32); 9] = [
-        ("%", reference / 100.0),
-        ("px", 1.0),
-        ("pt", 96.0 / 72.0),
-        ("pc", 16.0),
-        ("mm", 96.0 / 25.4),
-        ("cm", 96.0 / 2.54),
-        ("in", 96.0),
-        ("em", 16.0),
-        ("ex", 8.0),
-    ];
-    let (num, k) = units.iter().find_map(|(u, k)| v.strip_suffix(u).map(|n| (n, *k))).unwrap_or((v, 1.0));
-    let n: f32 = num.trim().parse().ok().filter(|n: &f32| n.is_finite())?;
-    Some(n * k).filter(|x| x.is_finite())
+    craft_svg::doc_style::length_strict(v, f64::from(reference)).map(|x| x as f32).filter(|x| x.is_finite())
 }
 
 fn view_box(s: &str) -> Option<Rect> {
-    let n = numbers(s);
-    let (x, y, w, h) = (*n.first()?, *n.get(1)?, *n.get(2)?, *n.get(3)?);
-    (w > 0.0 && h > 0.0).then(|| Rect::new(x, y, x + w, y + h))
+    let ([x, y], w, h) = craft_svg::doc_style::parse_viewbox(s)?;
+    Some(Rect::new(x as f32, y as f32, (x + w) as f32, (y + h) as f32))
 }
 
 /// The viewBox → viewport mapping for `preserveAspectRatio` (default `xMidYMid meet`).
 fn view_box_transform(vb: Rect, w: f32, h: f32, par: &str) -> Affine {
-    let (sx, sy) = (w / vb.width(), h / vb.height());
-    let mut words = par.split_whitespace();
-    let align = words.next().unwrap_or("xMidYMid");
-    if align == "none" {
-        return Affine::scale(sx, sy).mul(&Affine::translate(-vb.min.x, -vb.min.y));
-    }
-    let slice = words.next() == Some("slice");
-    let s = if slice { sx.max(sy) } else { sx.min(sy) };
-    let frac = |key: &str| {
-        if align.contains(&format!("{key}Min")) {
-            0.0
-        } else if align.contains(&format!("{key}Max")) {
-            1.0
-        } else {
-            0.5
-        }
-    };
-    let tx = (w - vb.width() * s) * frac("x");
-    let ty = (h - vb.height() * s) * frac("Y");
-    Affine::translate(tx, ty).mul(&Affine::scale(s, s)).mul(&Affine::translate(-vb.min.x, -vb.min.y))
+    let c = craft_svg::doc_style::viewbox_transform_with(
+        ([f64::from(vb.min.x), f64::from(vb.min.y)], f64::from(vb.width()), f64::from(vb.height())),
+        f64::from(w),
+        f64::from(h),
+        par,
+    )
+    .as_coeffs();
+    let m = Affine { m: [c[0] as f32, c[1] as f32, c[2] as f32, c[3] as f32, c[4] as f32, c[5] as f32] };
+    if m.is_finite() { m } else { Affine::IDENTITY }
 }
 
 /// An SVG transform list.
 fn transform(s: &str) -> Affine {
-    let mut m = Affine::IDENTITY;
-    let mut rest = s;
-    while let Some(open) = rest.find('(') {
-        let name = rest.get(..open).unwrap_or("").trim().trim_start_matches(',').trim();
-        let Some(close) = rest.get(open..).and_then(|r| r.find(')')).map(|c| c + open) else { break };
-        let a = numbers(rest.get(open + 1..close).unwrap_or(""));
-        let g = |i: usize| a.get(i).copied();
-        let t = match (name, a.len()) {
-            ("matrix", 6..) => Affine { m: [a[0], a[1], a[2], a[3], a[4], a[5]] },
-            ("translate", 1..) => Affine::translate(a[0], g(1).unwrap_or(0.0)),
-            ("scale", 1..) => Affine::scale(a[0], g(1).unwrap_or(a[0])),
-            ("rotate", 1..) => {
-                let r = Affine::rotate(a[0].to_radians());
-                match (g(1), g(2)) {
-                    (Some(cx), Some(cy)) => Affine::translate(cx, cy).mul(&r).mul(&Affine::translate(-cx, -cy)),
-                    _ => r,
-                }
-            }
-            ("skewX", 1..) => Affine { m: [1.0, 0.0, a[0].to_radians().tan(), 1.0, 0.0, 0.0] },
-            ("skewY", 1..) => Affine { m: [1.0, a[0].to_radians().tan(), 0.0, 1.0, 0.0, 0.0] },
-            _ => Affine::IDENTITY,
-        };
-        m = m.mul(&t);
-        rest = rest.get(close + 1..).unwrap_or("");
-    }
+    let c = craft_svg::transform_compat::parse_transform(s).as_coeffs();
+    let m = Affine { m: [c[0] as f32, c[1] as f32, c[2] as f32, c[3] as f32, c[4] as f32, c[5] as f32] };
     if m.is_finite() { m } else { Affine::IDENTITY }
 }
 
@@ -591,12 +541,9 @@ fn declarations(el: &X) -> Vec<(String, String)> {
     ];
     let mut out: Vec<(String, String)> = KEYS.iter().filter_map(|k| el.attr(k).map(|v| (k.to_string(), v.trim().to_string()))).collect();
     if let Some(style) = el.attr("style") {
-        for decl in style.split(';') {
-            if let Some((k, v)) = decl.split_once(':') {
-                let v = v.trim().trim_end_matches("!important").trim();
-                out.retain(|(key, _)| key != k.trim());
-                out.push((k.trim().to_ascii_lowercase(), v.to_string()));
-            }
+        for (k, v) in craft_svg::simple_css::declarations(style) {
+            out.retain(|(key, _)| key != &k);
+            out.push((k, v));
         }
     }
     out
@@ -605,18 +552,7 @@ fn declarations(el: &X) -> Vec<(String, String)> {
 /// A `stroke-dasharray`: lengths separated by commas or spaces. `none`, an empty list, a
 /// negative or unreadable length all draw solid (SVG renders an invalid array as none).
 fn dash_array(v: &str) -> Option<Vec<f32>> {
-    if v.trim() == "none" {
-        return None;
-    }
-    let mut out = Vec::new();
-    for part in v.split(|c: char| c == ',' || c.is_whitespace()).filter(|p| !p.trim().is_empty()).take(1024) {
-        let x = length(part, 100.0)?;
-        if x < 0.0 {
-            return None;
-        }
-        out.push(x);
-    }
-    (!out.is_empty()).then_some(out)
+    craft_svg::doc_style::parse_dash_array(v, 100.0).map(|xs| xs.into_iter().map(|x| x as f32).collect())
 }
 
 fn get<'a>(d: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -624,36 +560,12 @@ fn get<'a>(d: &'a [(String, String)], key: &str) -> Option<&'a str> {
 }
 
 fn opacity(v: &str) -> Option<f32> {
-    let v = v.trim();
-    let x = match v.strip_suffix('%') {
-        Some(p) => p.parse::<f32>().ok()? / 100.0,
-        None => v.parse::<f32>().ok()?,
-    };
-    x.is_finite().then(|| x.clamp(0.0, 1.0))
+    craft_svg::doc_style::parse_opacity(v).map(|x| x as f32)
 }
 
 /// A `font-size`: a keyword, a length, or relative to the parent's size (`em`, `ex`, `%`).
 fn font_size(v: &str, parent: f32) -> Option<f32> {
-    let v = v.trim();
-    let keyword = match v {
-        "xx-small" => Some(9.0),
-        "x-small" => Some(10.0),
-        "small" => Some(13.0),
-        "medium" => Some(16.0),
-        "large" => Some(18.0),
-        "x-large" => Some(24.0),
-        "xx-large" => Some(32.0),
-        "larger" => Some(parent * 1.2),
-        "smaller" => Some(parent / 1.2),
-        _ => None,
-    };
-    let rel = |suffix: &str, k: f32| v.strip_suffix(suffix).and_then(|n| n.trim().parse::<f32>().ok()).map(|n| n * k);
-    let size = keyword
-        .or_else(|| rel("em", parent))
-        .or_else(|| rel("ex", parent * 0.5))
-        .or_else(|| rel("%", parent / 100.0))
-        .or_else(|| length(v, parent))?;
-    size.is_finite().then(|| size.clamp(0.0, 2000.0))
+    craft_svg::doc_style::parse_font_size(v, f64::from(parent), f64::from(parent)).map(|x| x as f32)
 }
 
 impl Style {

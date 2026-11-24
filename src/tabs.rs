@@ -272,6 +272,8 @@ fn busy(app: &App) -> Option<&'static str> {
 /// Finishes what is in progress on the shown document, before it is put aside or closed: text
 /// being typed and a pen path are kept, playback stops, an open drag ends its undo step.
 fn settle(app: &mut App) {
+    // Brush strokes on their way into this document (ADR 0129).
+    crate::ink::flush(app);
     if app.playing {
         app.toggle_play();
     }
@@ -306,6 +308,10 @@ fn settle(app: &mut App) {
     app.ease = None;
     app.layer_props = None;
     app.aids_dialogs = Default::default();
+    // The History panel's picks and Save As Command number this document's undo steps: in
+    // another document the same numbers are other steps.
+    crate::macros_ui::clear_picks(app);
+    app.macros.save = None;
 }
 
 /// The document in `app` is another one from here on: nothing drawn for the last one is kept

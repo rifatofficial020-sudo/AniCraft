@@ -2,6 +2,99 @@
 
 ## Unreleased
 
+* **Text reads right: mixed directions, and letters from a fallback face** (M5, backlog P-008,
+  ADR 0130). With outside pull requests #39 and #40 by SoldierPePe, whose commits are merged
+  here and rebuilt on styled text.
+  * **Hebrew and Arabic with Latin words and numbers read the right way round.** Text follows
+    the Unicode bidi algorithm: a number or a Latin word inside right-to-left text keeps its
+    order ("2026" was drawn as "6202"), a right-to-left paragraph runs from the right, and a
+    wrapped one starts with its first words. Styled runs keep their style, colour and underline
+    through the reordering. It is the same in static text, text on a path and text fields, and
+    so in every export.
+  * **Letters your font doesn't have come from another font** instead of showing as boxes:
+    Arabic in Consolas, Japanese in Arial. The rest of the block keeps your font, a letter
+    takes its marks along, and the line keeps its height. `text.create` and `text.edit` say
+    which font lent the letters, and how many characters no installed font has.
+  * **In a text field in Test Movie, Left and Right move the caret the way they point** through
+    text that mixes directions, and a selection across a change of direction is highlighted in
+    its separate stretches.
+  * Arabic letters join across a change of style inside a word. Letter spacing follows a
+    letter with its marks instead of each glyph. A stretch of text in another script is shaped
+    with that script's rules.
+  * Not yet: a direction setting for a paragraph (it is the first letter's) and alignment to
+    its start; the typing field beside the stage still shows right-to-left text unordered
+    while the block on the stage is right; right-to-left text a script sets in the HTML page.
+* **A long Brush stroke no longer freezes the window** (M8, ADR 0129, #519, backlog P-003).
+  * A stroke drawn for a long time, over itself again and again, took longer to turn into a
+    shape the longer it was, and a part of it selected over the rest cost seconds on every
+    frame. The outline's tracing is now bounded however long the stroke is (a fast scribble of
+    60 000 samples: 1.5 s before, 0.4 s now, of which the trace is at most 0.3 s), and the
+    selection's stipple is cut row by row (seconds a frame before, a few milliseconds now).
+  * In the editor a long stroke's outline is traced off the window's thread: the stroke stays
+    on the stage as you drew it, you can go on painting at once, and it becomes a shape, in
+    one undo step, a moment later. Anything else you do waits for it first, so strokes and
+    edits always happen in the order you made them.
+  * `anicraft-cli bench --stroke <samples>` measures a long stroke (painting, picking, moving,
+    the merge on deselect), and `bench --stroke-file <file>` a document's own artwork.
+  * Not yet: the Subselection tool, the Paint Bucket and the shape tools' snapping are still
+    slow on a single shape of ten thousand points and more.
+* **Free Transform on a skewed symbol** (M8, #117, backlog P-005): scaling from a corner,
+  turning from outside it and skewing from an edge are now covered end to end by a test on a
+  slanted instance (the fix itself came with ADR 0111). The guide says what a handle scales
+  from (#193). Rotation on Windows and FreeBSD (#479) could not be reproduced on Windows 10
+  and stays open.
+* **Documents too large to draw, shape-tween outlines on a guide, and small fixes from outside**
+  (M8, backlog P-002, P-011 and P-012; ADR 0128).
+  * **Security: no nesting of symbols hangs AniCraft.** The allowance of work one frame has
+    (a million elements) now also counts the layers looked at, the size of each outline and
+    how far into a long library a symbol is, so a file can multiply none of them by nesting.
+    **Test Movie** has an allowance for each step: it used to look at every element of up to
+    10,000 instances after every change, and give every button a whole frame's allowance at
+    every move of the pointer (ideas from Agapenor's #13).
+  * **A frame with artwork left out says so.** The status bar tells you once ("Some artwork
+    on this frame is left out…"), Test Movie's Output panel says why a
+    step stopped, and the commands that write frames (PNG, SVG, sequences, sprite sheet, GIF,
+    animated PNG and WebP, video) add `"left_out": true` and a `"warning"` to their result
+    instead of passing a partial picture off as the whole one. `anicraft-cli info` and the MCP
+    `anicraft_render` caption say it too.
+  * **Shape tweens along a motion guide keep their outlines** (jayzed80, #238). A raw shape's
+    line pieces used to follow the guide one by one and cross the fill. Each piece now rides
+    with the fill it edges, also when both keyframes have as many pieces; an edge two fills
+    share goes with the lower fill. Outlines are no longer joined through a point where three
+    or more lines meet, dashed and variable-width outlines keep their pieces, and a piece
+    selected on a keyframe stays selected through the tween.
+  * **Colours:** the Eyedropper's result names the colour it picked with its opacity
+    (`#rrggbbaa`); `Rgba::to_hex_alpha` is the hex form that reads back as the same colour,
+    and `to_hex` stays six digits for the exporters (NetterSilver, #233).
+  * **Never crash:** the length of a vector with components past 1.8e19 is no longer infinite,
+    so its direction is no longer lost (NetterSilver, #142; taken only out of range, so drawing
+    costs the same); a private-use language tag such as `x-Arab` is not read as right-to-left
+    (Hagai Baram, #486).
+  * **Tests:** SVG path numbers past `f32` are refused (NetterSilver, #130); linked artwork
+    survives SVG export and re-import with its link sanitised (FredApps, #500).
+* **Reliability pass on the tests** (M8). Twelve runs of the whole suite after the review's
+  fixes (the picture cache race and the split command fuzz) found no further flaky test. Tests
+  that wait for another thread (a save, a freed port, a GPU start) now give it a minute instead
+  of two seconds before failing on a busy machine; none of them asserts a time.
+
+* **Reliability fixes from the November principal-engineer review** (M8,
+  `docs/reviews/2026-11-principal-review.md`).
+  * **Save is flushed to the disk** before the new file replaces the old one, as the
+    crash-recovery copy already was: a power cut right after a save can no longer leave an
+    empty document.
+  * **History picks and Save As Command stay with their document.** Showing another tab used
+    to keep the picked steps (and an open Save As Command) and apply them to that document's
+    history.
+  * **A document put aside keeps no pictures**, also when one was still being drawn as you
+    switched.
+* **The roadmap is now a guideline, with a parity matrix** (M8, ADR 0125). Docs only.
+  `docs/parity.md` compares AniCraft with the reference app feature by feature (done, partial,
+  missing, won't do), checked against the code and the guide. `docs/roadmap.md` replaces the
+  milestone timeline with a prioritised backlog (stable ids, sizes, what can run in parallel),
+  bugs and reliability first, and gives every open outside pull request a backlog id and a
+  state: planned, superseded, declined or held. Every pull request, ours included, gets a
+  principal-engineer review before it merges.
+
 * **Text: paths you can reshape, lines on a path, and the rest of the text-field API** (M5,
   ADR 0107).
   * **Edit the path of text on a path in place.** With the Subselection tool (or Properties ›
